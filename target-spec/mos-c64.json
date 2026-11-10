@@ -1,0 +1,22 @@
+{
+  "llvm-target": "mos-unknown-none",
+  "arch": "msp430",
+  "os": "c64",
+  "vendor": "commodore",
+  "target-endian": "little",
+  "target-pointer-width": 16,
+  "target-c-int-width": 16,
+  "data-layout": "e-m:e-p:16:8-i16:8-i32:8-i64:8-f32:8-f64:8-a:8-n8-S8",
+  "max-atomic-width": 0,
+  "atomic-cas": false,
+  "panic-strategy": "immediate-abort",
+  "relocation-model": "static",
+  "default-codegen-units": 1,
+  "trap-unreachable": false,
+  "emit-debug-gdb-scripts": false,
+  "eh-frame-header": false,
+  "executables": true,
+  "exe-suffix": ".prg",
+  "linker": "rust64-no-linker",
+  "metadata": { "description": "Commodore 64 (6510), rust64 backend", "tier": 3, "std": false, "host_tools": false }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "rustc_codegen_rust64"
+description = "rustc codegen backend: MIR -> 6510 (rat assembly) for the Commodore 64"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+rat-asm = { path = "../../../rat/crates/rat-asm" }
+
+[package.metadata.rust-analyzer]
+rustc_private = true

@@ -1,0 +1,10 @@
+[package]
+name = "core-test"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 2

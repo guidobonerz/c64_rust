@@ -1,0 +1,5 @@
+[toolchain]
+# rustc-private APIs: bump on purpose, run the e2e tests after each bump.
+channel = "nightly-2026-11-10"
+components = ["rustc-dev", "rust-src", "llvm-tools"]
+profile = "minimal"

@@ -1,0 +1,13 @@
+[package]
+name = "cargo-c64"
+description = "cargo c64: build Rust programs for the Commodore 64"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cargo-c64"
+path = "src/main.rs"
+
+[dev-dependencies]
+png = "0.17"

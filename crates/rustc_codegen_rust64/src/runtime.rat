@@ -1,0 +1,268 @@
+; rust64 runtime: program start/exit, panic, memory and arithmetic helpers.
+;
+; Registers (normal RAM, not zero page): rt_a, rt_b, rt_r, rt_t (4 bytes each),
+; rt_n (operand size in bytes for the arithmetic helpers, byte count for
+; rt_memcpy/rt_memset). Pointer registers in zero page: zp_p0, zp_p1, zp_p2.
+
+zp_p0 = $fb
+zp_p1 = $fd
+zp_p2 = $f9
+
+rt_start:
+        tsx
+        stx rt_sp
+        jsr rt_main
+rt_exit:
+        ldx rt_sp
+        txs
+        rts                     ; back to BASIC
+
+; A panic (failed assert, unreachable code, abort): red border, return to BASIC.
+rt_panic:
+        lda #2
+        sta $d020
+        jmp rt_exit
+
+; Copy rt_n bytes from (zp_p0) to (zp_p1), front to back.
+rt_memcpy:
+        ldy #0
+        ldx rt_n+1
+        beq @rest
+@page:  lda (zp_p0),y
+        sta (zp_p1),y
+        iny
+        bne @page
+        inc zp_p0+1
+        inc zp_p1+1
+        dex
+        bne @page
+@rest:  ldx rt_n
+        beq @done
+@byte:  lda (zp_p0),y
+        sta (zp_p1),y
+        iny
+        dex
+        bne @byte
+@done:  rts
+
+; Set rt_n bytes at (zp_p1) to A.
+rt_memset:
+        ldy #0
+        ldx rt_n+1
+        beq @rest
+@page:  sta (zp_p1),y
+        iny
+        bne @page
+        inc zp_p1+1
+        dex
+        bne @page
+@rest:  ldx rt_n
+        beq @done
+@byte:  sta (zp_p1),y
+        iny
+        dex
+        bne @byte
+@done:  rts
+
+; rt_r = rt_a * rt_b (rt_n bytes, wrapping).
+rt_mul:
+        ldx rt_n
+        lda #0
+@clr:   sta rt_r-1,x
+        dex
+        bne @clr
+        lda rt_n
+        asl
+        asl
+        asl
+        sta rt_cnt
+@bit:   ldx #0                  ; r <<= 1
+        ldy rt_n
+        clc
+@shr:   rol rt_r,x
+        inx
+        dey
+        bne @shr
+        ldx #0                  ; b <<= 1, top bit into carry
+        ldy rt_n
+        clc
+@shb:   rol rt_b,x
+        inx
+        dey
+        bne @shb
+        bcc @next
+        ldx #0                  ; r += a
+        ldy rt_n
+        clc
+@add:   lda rt_r,x
+        adc rt_a,x
+        sta rt_r,x
+        inx
+        dey
+        bne @add
+@next:  dec rt_cnt
+        bne @bit
+        rts
+
+; Unsigned rt_a / rt_b: quotient in rt_a, remainder in rt_r (rt_n bytes).
+rt_udiv:
+        ldx rt_n
+        lda #0
+@clr:   sta rt_r-1,x
+        dex
+        bne @clr
+        lda rt_n
+        asl
+        asl
+        asl
+        sta rt_cnt
+@bit:   ldx #0                  ; (r:a) <<= 1
+        ldy rt_n
+        clc
+@sha:   rol rt_a,x
+        inx
+        dey
+        bne @sha
+        ldx #0
+        ldy rt_n
+@shr:   rol rt_r,x
+        inx
+        dey
+        bne @shr
+        ldx #0                  ; t = r - b
+        ldy rt_n
+        sec
+@sub:   lda rt_r,x
+        sbc rt_b,x
+        sta rt_t,x
+        inx
+        dey
+        bne @sub
+        bcc @next               ; r < b
+        ldx rt_n
+@cpy:   lda rt_t-1,x
+        sta rt_r-1,x
+        dex
+        bne @cpy
+        inc rt_a                ; quotient bit (bit 0 is 0 after the shift)
+@next:  dec rt_cnt
+        bne @bit
+        rts
+
+; Signed rt_a / rt_b: quotient in rt_a, remainder in rt_r (sign of rt_a).
+rt_sdiv:
+        ldx rt_n
+        lda rt_a-1,x
+        sta rt_sgn              ; bit 7: sign of the remainder
+        eor rt_b-1,x
+        sta rt_sgnq             ; bit 7: sign of the quotient
+        lda rt_a-1,x
+        bpl @apos
+        jsr rt_nega
+@apos:  ldx rt_n
+        lda rt_b-1,x
+        bpl @bpos
+        ldx #0
+        ldy rt_n
+        sec
+@negb:  lda #0
+        sbc rt_b,x
+        sta rt_b,x
+        inx
+        dey
+        bne @negb
+@bpos:  jsr rt_udiv
+        bit rt_sgnq
+        bpl @qpos
+        jsr rt_nega
+@qpos:  bit rt_sgn
+        bpl @done
+        ldx #0
+        ldy rt_n
+        sec
+@negr:  lda #0
+        sbc rt_r,x
+        sta rt_r,x
+        inx
+        dey
+        bne @negr
+@done:  rts
+
+rt_nega:
+        ldx #0
+        ldy rt_n
+        sec
+@neg:   lda #0
+        sbc rt_a,x
+        sta rt_a,x
+        inx
+        dey
+        bne @neg
+        rts
+
+; Bit counts of rt_a (rt_n bytes), result in A.
+rt_ctpop:
+        lda #0
+        sta rt_cnt
+        ldx rt_n
+@byte:  lda rt_a-1,x
+@bit:   asl
+        bcc @nz
+        inc rt_cnt
+@nz:    cmp #0
+        bne @bit
+        dex
+        bne @byte
+        lda rt_cnt
+        rts
+
+rt_ctlz:
+        ldy #0
+        ldx rt_n
+@byte:  lda rt_a-1,x
+        bne @found
+        tya
+        clc
+        adc #8
+        tay
+        dex
+        bne @byte
+        tya
+        rts
+@found: asl
+        bcs @done
+        iny
+        jmp @found
+@done:  tya
+        rts
+
+rt_cttz:
+        ldy #0
+        ldx #0
+@byte:  lda rt_a,x
+        bne @found
+        tya
+        clc
+        adc #8
+        tay
+        inx
+        cpx rt_n
+        bne @byte
+        tya
+        rts
+@found: lsr
+        bcs @done
+        iny
+        jmp @found
+@done:  tya
+        rts
+
+rt_sp:   .byte 0
+rt_cnt:  .byte 0
+rt_sgn:  .byte 0
+rt_sgnq: .byte 0
+rt_n:    .word 0
+rt_a:    .res 8
+rt_b:    .res 8
+rt_r:    .res 8
+rt_t:    .res 8
