@@ -1,0 +1,194 @@
+name: Release
+
+# Runs only when a version tag such as v0.1.0 is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The backend is a rustc plugin (dylib linked against rustc_driver), so
+        # every target is built natively on a runner of that architecture.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            upx: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            upx: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            upx: true
+    steps:
+      - name: Checkout c64_rust
+        uses: actions/checkout@v4
+        with:
+          path: c64_rust
+
+      # rustc_codegen_rust64 depends on ../../../rat/crates/rat-asm.
+      - name: Checkout rat
+        uses: actions/checkout@v4
+        with:
+          repository: guidobonerz/rat
+          path: rat
+
+      # Installs the pinned nightly and its components from rust-toolchain.toml.
+      - name: Install toolchain
+        working-directory: c64_rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: c64_rust
+          key: ${{ matrix.target }}
+
+      - name: Build
+        working-directory: c64_rust
+        run: cargo build --release -p cargo-c64 -p rustc_codegen_rust64
+
+      # UPX packs the cargo-c64 executable on Linux and Windows only. macOS is
+      # skipped (packed binaries break Apple Silicon signing), and the backend
+      # stays unpacked: it is a shared library that rustc loads at run time.
+      - name: Install UPX (Linux)
+        if: matrix.upx && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Install UPX (Windows)
+        if: matrix.upx && runner.os == 'Windows'
+        run: choco install upx --no-progress -y
+
+      - name: Pack with UPX
+        if: matrix.upx
+        shell: bash
+        working-directory: c64_rust
+        run: |
+          bin="target/release/cargo-c64"
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          upx --version | head -1
+          upx --best --lzma "$bin"
+          upx -t "$bin"
+
+      # cargo-c64 looks for the backend next to its own executable; lib/ and
+      # examples/ keep their relative layout (examples use ../../lib/c64).
+      - name: Package
+        shell: bash
+        working-directory: c64_rust
+        run: |
+          name="rust64-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          case "$RUNNER_OS" in
+            Windows) bin="cargo-c64.exe"; backend="rustc_codegen_rust64.dll" ;;
+            macOS)   bin="cargo-c64";     backend="librustc_codegen_rust64.dylib" ;;
+            *)       bin="cargo-c64";     backend="librustc_codegen_rust64.so" ;;
+          esac
+          mkdir -p "dist/$name/docs"
+          cp "target/release/$bin" "target/release/$backend" rust-toolchain.toml "dist/$name/"
+          cp -r lib examples "dist/$name/"
+          cp docs/rust64-guide.md docs/rust64-guide.pdf "dist/$name/docs/"
+          find "dist/$name" -name 'rustc-ice-*.txt' -delete
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+          else
+            chmod +x "dist/$name/$bin"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          fi
+          echo "ASSET=c64_rust/dist/$name.${{ matrix.archive }}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust64-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: rust-toolchain.toml
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          toolchain=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          cat > notes.md <<EOF
+          ## Installation
+
+          The backend is tied to one nightly. Install it first:
+          \`\`\`
+          rustup toolchain install $toolchain --component rust-src
+          \`\`\`
+          Then unpack the archive for your platform and put its folder on your \`PATH\`
+          (\`cargo-c64\` and the backend library must stay in the same folder).
+
+          ## Running the executable
+
+          **Linux**: unpack, make \`cargo-c64\` executable and put the folder on your \`PATH\`:
+          \`\`\`
+          tar -xzf rust64-*-linux-gnu.tar.gz && cd rust64-*/
+          chmod +x cargo-c64
+          export PATH="\$PWD:\$PATH"
+          \`\`\`
+          **macOS**: same steps, but the files are not notarized, so Gatekeeper blocks
+          them until the quarantine flag is removed (executable and backend library):
+          \`\`\`
+          tar -xzf rust64-*-apple-darwin.tar.gz && cd rust64-*/
+          chmod +x cargo-c64
+          xattr -dr com.apple.quarantine .
+          export PATH="\$PWD:\$PATH"
+          \`\`\`
+          **Windows**: unpack the zip, then unblock the files and add the folder to your
+          \`PATH\` in PowerShell (open a new terminal afterwards):
+          \`\`\`
+          cd rust64-*
+          Get-ChildItem -Recurse | Unblock-File
+          \$user = [Environment]::GetEnvironmentVariable("Path", "User")
+          [Environment]::SetEnvironmentVariable("Path", "\$user;\$PWD", "User")
+          \`\`\`
+          If SmartScreen warns, choose *More info > Run anyway*.
+
+          To keep the \`PATH\` entry on Linux / macOS, add the \`export\` line to your shell
+          profile (\`~/.bashrc\`, \`~/.zshrc\`). Check the setup with \`cargo c64 --help\`.
+
+          Try it with \`cargo c64 build\` in \`examples/hello\`. The archive also contains
+          the \`c64\` library (\`lib/\`) and the documentation (\`docs/rust64-guide.pdf\`, also as Markdown).
+
+          Verify downloads against \`SHA256SUMS.txt\`.
+          EOF
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: notes.md
+          generate_release_notes: true
