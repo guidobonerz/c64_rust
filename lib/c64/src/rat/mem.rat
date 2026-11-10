@@ -1,0 +1,30 @@
+; c64::mem: copy and fill (calling convention: see c64::rat_source!)
+
+; c64_mem_copy(dst: u16, src: u16, n: u16)
+c64_mem_copy:
+        lda c64_mem_copy__args
+        sta zp_p1
+        lda c64_mem_copy__args+1
+        sta zp_p1+1
+        lda c64_mem_copy__args+2
+        sta zp_p0
+        lda c64_mem_copy__args+3
+        sta zp_p0+1
+        lda c64_mem_copy__args+4
+        sta rt_n
+        lda c64_mem_copy__args+5
+        sta rt_n+1
+        jmp rt_memcpy
+
+; c64_mem_fill(dst: u16, n: u16, v: u8)
+c64_mem_fill:
+        lda c64_mem_fill__args
+        sta zp_p1
+        lda c64_mem_fill__args+1
+        sta zp_p1+1
+        lda c64_mem_fill__args+2
+        sta rt_n
+        lda c64_mem_fill__args+3
+        sta rt_n+1
+        lda c64_mem_fill__args+4
+        jmp rt_memset

@@ -4,15 +4,16 @@ use rat_asm::{MemVfs, Options};
 
 pub const RUNTIME: &str = include_str!("runtime.rat");
 
-/// Assembles a complete program (rat dialect, C64 platform) to a `.prg`.
-pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
+/// Assembles a complete program (rat dialect, C64 platform) to a `.prg`
+/// (`format` "prg") or a disk image with the program as `name` ("d64").
+pub fn assemble(source: &str, format: &str, name: &str) -> Result<Vec<u8>, String> {
     let mut vfs = MemVfs::new();
     vfs.add("main.rat", source.as_bytes().to_vec());
     let opts = Options {
         main: "main.rat".into(),
         platform: Some("c64".into()),
-        format: Some("prg".into()),
-        output: Some("main.prg".into()),
+        format: Some(format.into()),
+        output: Some(format!("{name}.{format}")),
         ..Options::default()
     };
     let res = rat_asm::assemble(&opts, &vfs);

@@ -1,27 +1,123 @@
 ; rust64 runtime: program start/exit, panic, memory and arithmetic helpers.
 ;
-; Registers (normal RAM, not zero page): rt_a, rt_b, rt_r, rt_t (4 bytes each),
+; Registers (normal RAM, not zero page): rt_a, rt_b, rt_r, rt_t (8 bytes each),
 ; rt_n (operand size in bytes for the arithmetic helpers, byte count for
-; rt_memcpy/rt_memset). Pointer registers in zero page: zp_p0, zp_p1, zp_p2.
+; rt_memcpy/rt_memset), rt_jvec, rt_args/rt_ret (calls through pointers).
+; Pointer registers in zero page: zp_p0, zp_p1, zp_p2 ($f9-$fe).
+; Zero page $02-$8f: zp statics (saved at start, restored at exit).
 
 zp_p0 = $fb
 zp_p1 = $fd
 zp_p2 = $f9
 
+; BSS of the runtime (RT_BSS = 160 + 87 bytes in the backend)
+rt_zpsave  = __bss          ; 142 bytes: $02-$8f
+rt_sp      = __bss + 142
+rt_irqsave = __bss + 143    ; 2 bytes
+rt_port    = __bss + 145
+rt_d018    = __bss + 146
+rt_d011    = __bss + 147
+rt_d016    = __bss + 148
+rt_dd00    = __bss + 149
+rt_d020    = __bss + 150
+rt_d021    = __bss + 151
+rt_d015    = __bss + 152
+
+; Save the zero page $02-$8f (BASIC's; the program may use it for zp
+; statics), the IRQ vector and the VIC state, run main, restore.
 rt_start:
+        ldx #0
+@save:  lda $02,x
+        sta rt_zpsave,x
+        lda #0
+        sta $02,x
+        inx
+        cpx #$8e
+        bne @save
         tsx
         stx rt_sp
+        lda $0314
+        sta rt_irqsave
+        lda $0315
+        sta rt_irqsave+1
+        lda $01
+        sta rt_port
+        lda $d018
+        sta rt_d018
+        lda $d011
+        sta rt_d011
+        lda $d016
+        sta rt_d016
+        lda $dd00
+        sta rt_dd00
+        lda $d020
+        sta rt_d020
+        lda $d021
+        sta rt_d021
+        lda $d015
+        sta rt_d015
+        cld
+        jsr rt_zpinit
         jsr rt_main
+; Back to BASIC from anywhere: restore the IRQ vector, the CIA interrupt,
+; the memory configuration, the VIC (except the colours, so the program's
+; output stays readable), silence the SID, restore the zero page.
 rt_exit:
+        sei
         ldx rt_sp
         txs
-        rts                     ; back to BASIC
+        lda rt_irqsave
+        sta $0314
+        lda rt_irqsave+1
+        sta $0315
+        lda #0
+        sta $d01a
+        lda #$ff
+        sta $d019
+        lda #$81
+        sta $dc0d
+        lda rt_port
+        sta $01
+        lda rt_dd00
+        sta $dd00
+        lda rt_d018
+        sta $d018
+        lda rt_d011
+        sta $d011
+        lda rt_d016
+        sta $d016
+        lda rt_d015
+        sta $d015
+        lda #0
+        sta $d404
+        sta $d40b
+        sta $d412
+        sta $d418
+        cli
+        ldx #0
+@rest:  lda rt_zpsave,x
+        sta $02,x
+        inx
+        cpx #$8e
+        bne @rest
+        rts
 
 ; A panic (failed assert, unreachable code, abort): red border, return to BASIC.
 rt_panic:
         lda #2
         sta $d020
         jmp rt_exit
+
+; Call the routine whose address is in rt_jvec (calls through pointers).
+; The vector is the operand of the jmp: an indirect jmp would read a wrong
+; high byte if the vector happened to lie across a page boundary.
+rt_jsrind:
+        jmp $ffff
+rt_jvec = rt_jsrind + 1
+
+; rt_ctx_save / rt_ctx_restore (for interrupt dispatchers) are generated
+; by the backend: they save what code reached through function pointers
+; can change (see ctx_save in codegen.rs).
 
 ; Copy rt_n bytes from (zp_p0) to (zp_p1), front to back.
 rt_memcpy:
@@ -63,6 +159,37 @@ rt_memset:
         dex
         bne @byte
 @done:  rts
+
+; Compare rt_n bytes at (zp_p0) and (zp_p1) unsigned: A = 0 if equal,
+; $ff if the first differing byte is smaller in (zp_p0), 1 if larger.
+rt_memcmp:
+        ldy #0
+        ldx rt_n+1
+        beq @rest
+@page:  lda (zp_p0),y
+        cmp (zp_p1),y
+        bne @diff
+        iny
+        bne @page
+        inc zp_p0+1
+        inc zp_p1+1
+        dex
+        bne @page
+@rest:  ldx rt_n
+        beq @eq
+@byte:  lda (zp_p0),y
+        cmp (zp_p1),y
+        bne @diff
+        iny
+        dex
+        bne @byte
+@eq:    lda #0
+        rts
+@diff:  bcc @lt
+        lda #1
+        rts
+@lt:    lda #$ff
+        rts
 
 ; rt_r = rt_a * rt_b (rt_n bytes, wrapping).
 rt_mul:
@@ -257,12 +384,16 @@ rt_cttz:
 @done:  tya
         rts
 
-rt_sp:   .byte 0
-rt_cnt:  .byte 0
-rt_sgn:  .byte 0
-rt_sgnq: .byte 0
-rt_n:    .word 0
-rt_a:    .res 8
-rt_b:    .res 8
-rt_r:    .res 8
-rt_t:    .res 8
+; Runtime registers (in the BSS after the buffers above; saved by rt_ctx_save)
+rt_save     = __bss + 160
+rt_cnt      = rt_save
+rt_sgn      = rt_save + 1
+rt_sgnq     = rt_save + 2
+rt_n        = rt_save + 3
+rt_a        = rt_save + 7
+rt_b        = rt_save + 15
+rt_r        = rt_save + 23
+rt_t        = rt_save + 31
+rt_args     = rt_save + 39
+rt_ret      = rt_save + 71
+rt_save_end = rt_save + 87

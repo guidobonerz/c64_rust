@@ -1,0 +1,16 @@
+[package]
+name = "gfx-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+c64 = { path = "../../../lib/c64" }
+
+[profile.dev]
+# The program must end below $4000 (the bitmap's colour matrix); with
+# debug assertions the unoptimized code does not fit yet (Phase 5).
+opt-level = "s"
+debug-assertions = false
+
+[profile.release]
+opt-level = 2

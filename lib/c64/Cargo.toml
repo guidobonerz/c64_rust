@@ -1,0 +1,12 @@
+[package]
+name = "c64"
+description = "The Commodore 64 library for rust64: hardware, KERNAL, text, formatting, input"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("c64"))'] }
+
+[dependencies]
+c64-macros = { path = "../c64-macros" }

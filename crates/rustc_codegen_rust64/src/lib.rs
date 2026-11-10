@@ -43,6 +43,7 @@ use rustc_session::{EarlySession, IncrCompSession, Session};
 struct Built {
     asm: String,
     prg: Vec<u8>,
+    d64: Vec<u8>,
 }
 
 pub struct Rust64Backend {
@@ -76,8 +77,11 @@ impl CodegenBackend for Rust64Backend {
     fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
         if tcx.crate_types().contains(&CrateType::Executable) {
             let asm = codegen::build_program(tcx);
-            match runtime::assemble(&asm) {
-                Ok(prg) => *self.built.lock().unwrap() = Some(Built { asm, prg }),
+            let name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str().replace('_', "-");
+            let res = runtime::assemble(&asm, "prg", &name)
+                .and_then(|prg| Ok((prg, runtime::assemble(&asm, "d64", &name)?)));
+            match res {
+                Ok((prg, d64)) => *self.built.lock().unwrap() = Some(Built { asm, prg, d64 }),
                 Err(msg) => {
                     // Keep the assembly for inspection.
                     let out = tcx.output_filenames(());
@@ -126,6 +130,9 @@ impl CodegenBackend for Rust64Backend {
                 sess.dcx().fatal(format!("cannot write {}: {e}", path.display()));
             }
             let _ = std::fs::write(path.with_extension("rat"), &built.asm);
+            if let Err(e) = std::fs::write(path.with_extension("d64"), &built.d64) {
+                sess.dcx().fatal(format!("cannot write the disk image: {e}"));
+            }
             if outputs.outputs.contains_key(&OutputType::Assembly) {
                 let asm_path = outputs.path(OutputType::Assembly);
                 let _ = std::fs::write(asm_path.as_path(), &built.asm);

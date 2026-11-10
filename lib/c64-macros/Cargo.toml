@@ -1,0 +1,9 @@
+[package]
+name = "c64-macros"
+description = "Proc macros of the c64 library: #[c64::main], #[c64::at], #[c64::zp], c64::sid!"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+proc-macro = true

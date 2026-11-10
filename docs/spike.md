@@ -30,11 +30,27 @@ mul/div/shift, loops, arrays, slices, iterators, closures, structs, enums,
 
 ## Not done yet (next phases)
 
-* Code quality: every value goes through memory, constant pointers go
-  through a frame slot instead of `sta $d020` (Phase 5: constant
-  propagation, zero page, frame overlay).
+* Code quality, Phase 5: mostly done (known addresses, views instead of
+  copies also across branches, compare-and-branch, X-indexed tables, frame
+  overlay with zero-page frames, block layout, branch relaxation, peephole,
+  pruning of unused runtime: the examples are 48-76% smaller and up to
+  2.75x as fast). Open: values in registers across statements, X/Y loop
+  counters, inlining at program level. More aggressive rustc inlining
+  (`-Zinline-mir-threshold`) was tried: mixed sizes, no speed gain.
+* `jmp (vector)` must not be used with a vector that can lie across a page
+  boundary (6502 bug): `rt_jsrind` is a self-modified `jmp`.
 * `MulWithOverflow` never reports overflow (debug builds only).
-* Function pointers / `dyn` calls, `extern "rat"` assembly functions,
-  `ptr::copy` (memmove), floats, 128-bit mul/div, recursion (error).
+* `dyn` calls (vtables), `ptr::copy` (memmove), floats, 128-bit mul/div.
+  (Assembly functions work since Phase 3: `extern "C"` declarations +
+  `c64::rat_source!`; calls through function pointers since Phase 4:
+  arguments in `rt_args`, result in `rt_ret`, at most 32/16 bytes.)
+* Recursion through function pointers is not detected.
+* Unoptimized code is large and slow: a debug build that uses `c64::gfx`
+  must end below `$4000` and only fits without debug assertions
+  (`tests/e2e/gfx`). Busy-wait loops must not compare the raster line for
+  equality (one check takes longer than a line; see `hw::wait_raster`).
+* `panic!` with format arguments in user code still pulls in `core::fmt`
+  (dyn calls, not supported). Diverging `core` functions (`panic_fmt`,
+  `slice_index_fail`, ...) are compiled as `jmp rt_panic`.
 * Real `Location`s for `#[track_caller]` (a zeroed dummy is passed).
-* The `c64` library (Phase 3/4).
+* Phase 5 (optimization) and later.

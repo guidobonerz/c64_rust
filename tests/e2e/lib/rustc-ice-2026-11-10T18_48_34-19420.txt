@@ -1,0 +1,51 @@
+thread 'rustc' panicked at /rustc-dev/ac8310ba643a3796cbe77d2e06944d7c8513999f/compiler/rustc_middle\src\query\query_api.rs:371:5:
+Box<dyn Any>
+stack backtrace:
+   0:     0x7ffbb20a02af - std::backtrace_rs::backtrace::win64::trace
+                               at /rustc/ac8310ba643a3796cbe77d2e06944d7c8513999f/library/std\src\..\..\backtrace\src\backtrace\win64.rs:85
+   1:     0x7ffbb20a02af - std::backtrace_rs::backtrace::trace_unsynchronized
+                               at /rustc/ac8310ba643a3796cbe77d2e06944d7c8513999f/library/std\src\..\..\backtrace\src\backtrace\mod.rs:66
+   2:     0x7ffbb20a02af - std::backtrace::Backtrace::create
+                               at /rustc/ac8310ba643a3796cbe77d2e06944d7c8513999f/library/std\src\backtrace.rs:331
+   3:     0x7ffbb20a01fa - std::backtrace::Backtrace::force_capture
+                               at /rustc/ac8310ba643a3796cbe77d2e06944d7c8513999f/library/std\src\backtrace.rs:312
+   4:     0x7ffbb3d7740b - core[8d7a7fe5f2a8d678]::slice::sort::unstable::heapsort::heapsort::<((rustc_lint_defs[7d0d23f76bcaeb37]::Level, &str), usize), <((rustc_lint_defs[7d0d23f76bcaeb37]::Level, &str), usize) as core[8d7a7fe5f2a8d678]::cmp::PartialOrd>::lt>
+   5:     0x7ffbb20b4b34 - std::panicking::panic_with_hook
+                               at /rustc/ac8310ba643a3796cbe77d2e06944d7c8513999f/library/std\src\panicking.rs:819
+   6:     0x7ffbb63f229b - <rustc_stable_hash[e2e0317e47fe770c]::stable_hasher::StableHasher<_> as core[8d7a7fe5f2a8d678]::hash::Hasher>::write_isize::hash_value::<rustc_stable_hash[e2e0317e47fe770c]::sip128::SipHasher128>
+   7:     0x7ffbb63f0269 - std[1f33c49fc8e3af3b]::sys::backtrace::__rust_end_short_backtrace::<std[1f33c49fc8e3af3b]::panicking::begin_panic<rustc_span[8532c658bb054ff4]::macros::ExplicitBug>::{closure#0}, !>
+   8:     0x7ffbb63ef9a1 - std[1f33c49fc8e3af3b]::panicking::begin_panic::<rustc_span[8532c658bb054ff4]::macros::ExplicitBug>
+   9:     0x7ffbb63fbeb7 - rustc_span[8532c658bb054ff4]::macros::bug_impl
+  10:     0x7ffbb6033291 - rustc_middle[7c0f8f87a06c0c42]::util::bug::trigger_delayed_bug
+  11:     0x7ffbb60a07a4 - <rustc_middle[7c0f8f87a06c0c42]::ty::print::pretty::CratePrefixGuard as core[8d7a7fe5f2a8d678]::ops::drop::Drop>::drop
+  12:     0x7ffbb1b90b30 - rustc_query_impl[60e26b49877fa8bc]::self_profile::alloc_self_profile_query_strings
+  13:     0x7ffbb31269fd - RINvMs6_NtCsdVNfMDvUSqr_9hashbrown3rawINtB6_8RawTableTNtCshmpDbINRi41_12rustc_hir_id11ItemLocalIdINtNtCsc95nHoLF7D0_4core6result6ResultTNtNtCs2VV5Oy6KZHR_9rustc_hir3def7DefKindNtNtCsbr0IIvlRs78_10rustc_span6def_id5DefIdENtB2S_15ErrorGuaranteedEEE14reserve_
+  14:     0x7ffbb1b90a57 - rustc_query_impl[60e26b49877fa8bc]::self_profile::alloc_self_profile_query_strings
+  15:     0x7ffbd6ead339 - rustc_middle::query::calls::query_get_at
+                               at C:\Users\guido\.rustup\toolchains\nightly-2026-11-10-x86_64-pc-windows-msvc\lib\rustlib\rustc-src\rust\compiler\rustc_middle\src\query\calls.rs:154
+  16:     0x7ffbd6ead339 - rustc_middle::query::calls::TyCtxtAt::module_children
+                               at C:\Users\guido\.rustup\toolchains\nightly-2026-11-10-x86_64-pc-windows-msvc\lib\rustlib\rustc-src\rust\compiler\rustc_middle\src\query\query_api.rs:289
+  17:     0x7ffbd6ead339 - rustc_middle::ty::context::TyCtxt::module_children
+                               at C:\Users\guido\.rustup\toolchains\nightly-2026-11-10-x86_64-pc-windows-msvc\lib\rustlib\rustc-src\rust\compiler\rustc_middle\src\query\query_api.rs:279
+  18:     0x7ffbd6ead339 - rustc_codegen_rust64::codegen::rat_sources
+                               at C:\Users\guido\git\c64_rust\crates\rustc_codegen_rust64\src\codegen.rs:258
+  19:     0x7ffbd6eb0d75 - rustc_codegen_rust64::codegen::build_program
+                               at C:\Users\guido\git\c64_rust\crates\rustc_codegen_rust64\src\codegen.rs:216
+  20:     0x7ffbd6ed0f4b - rustc_codegen_rust64::impl$0::codegen_crate
+                               at C:\Users\guido\git\c64_rust\crates\rustc_codegen_rust64\src\lib.rs:78
+  21:     0x7ffbae81a154 - <rustc_interface[362af8b83cacc7c4]::queries::Linker>::codegen_and_build_linker
+  22:     0x7ffbae7ed9cd - std[1f33c49fc8e3af3b]::sys::backtrace::__rust_begin_short_backtrace::<std[1f33c49fc8e3af3b]::thread::lifecycle::spawn_unchecked<ctrlc[edb49dfb3da21c9c]::set_handler_inner<rustc_driver_impl[3ae9707c4302074c]::install_ctrlc_handler::{closure#0}>::{closure#0}, !>::{closure#1}::{closure#0}::{closure#0}, ()>
+  23:     0x7ffbae7e50c5 - RINvNtNtCs2G5uSOX0NHr_3std3sys9backtrace28___rust_begin_short_backtraceNCNCINvNtCs4EkINCOgmSS_15rustc_interface4util26run_in_thread_with_globalsNCINvB1e_31run_in_thread_pool_with_globalsNCINvNtB1g_9interface12run_compileruNCNvCs53Amz73vmVc_17rustc_driver_i
+  24:     0x7ffbae7f2dc7 - std[1f33c49fc8e3af3b]::sys::backtrace::__rust_begin_short_backtrace::<std[1f33c49fc8e3af3b]::thread::lifecycle::spawn_unchecked<ctrlc[edb49dfb3da21c9c]::set_handler_inner<rustc_driver_impl[3ae9707c4302074c]::install_ctrlc_handler::{closure#0}>::{closure#0}, !>::{closure#1}::{closure#0}::{closure#0}, ()>
+  25:     0x7ffbb20c073f - std::sys::thread::windows::impl$0::new::thread_start
+                               at /rustc/ac8310ba643a3796cbe77d2e06944d7c8513999f/library/std\src\sys\thread\windows.rs:58
+  26:     0x7ffc8c73dda7 - BaseThreadInitThunk
+  27:     0x7ffc8dcbee4c - RtlUserThreadStart
+
+
+rustc version: 1.102.0-nightly (ac8310ba6 2026-11-09)
+platform: x86_64-pc-windows-msvc
+
+query stack during panic:
+#0 [module_children] collecting child items of module ``
+end of query stack

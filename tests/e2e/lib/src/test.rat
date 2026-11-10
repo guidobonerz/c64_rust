@@ -1,0 +1,19 @@
+; Assembly functions of the lib e2e test.
+
+; test_add3(a: u8, b: u8, c: u8) -> u8: A + X + Y
+test_add3:
+        clc
+        adc test_add3__args+1
+        adc test_add3__args+2
+        rts
+
+; test_swap(v: u32) -> u32: the bytes reversed (result in test_swap__res)
+test_swap:
+        ldx #3
+        ldy #0
+@loop:  lda test_swap__args,x
+        sta test_swap__res,y
+        iny
+        dex
+        bpl @loop
+        rts

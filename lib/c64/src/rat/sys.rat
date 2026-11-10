@@ -1,0 +1,46 @@
+; c64::sys (calling convention: see c64::rat_source!)
+
+c64_sys_exit = rt_exit
+c64_sys_panic = rt_panic
+
+c64_sys_sei:
+        sei
+        rts
+
+c64_sys_cli:
+        cli
+        rts
+
+; returns the status register (bit 2: interrupts were disabled)
+c64_sys_irq_save:
+        php
+        pla
+        sei
+        rts
+
+; A = status register from c64_sys_irq_save
+c64_sys_irq_restore:
+        and #$04
+        bne @off
+        cli
+@off:   rts
+
+; c64_sys_jsr(addr: u16, a: u8, x: u8, y: u8) -> Regs { a, x, y, p }
+c64_sys_jsr:
+        lda c64_sys_jsr__args
+        sta c64_sys_jsr_vec+1
+        lda c64_sys_jsr__args+1
+        sta c64_sys_jsr_vec+2
+        lda c64_sys_jsr__args+2
+        ldx c64_sys_jsr__args+3
+        ldy c64_sys_jsr__args+4
+        jsr c64_sys_jsr_vec
+        php
+        sta c64_sys_jsr__res
+        stx c64_sys_jsr__res+1
+        sty c64_sys_jsr__res+2
+        pla
+        sta c64_sys_jsr__res+3
+        rts
+c64_sys_jsr_vec:
+        jmp $0000

@@ -2,7 +2,7 @@
 //! codegen backend.
 //!
 //! ```text
-//! cargo c64 build [--release] [-o FILE] [cargo args...]
+//! cargo c64 build [--release] [-o FILE.prg|FILE.d64] [cargo args...]
 //! cargo c64 run   [--release] [cargo args...]     build and start mimic
 //! cargo c64 asm   [--release] [cargo args...]     build and print the assembly
 //! ```
@@ -142,7 +142,13 @@ fn build(cmd: &str, mut args: Vec<String>) -> Result<(), String> {
     let prg = out_dir.join(format!("{name}.prg"));
     let prg = match output {
         Some(o) => {
-            std::fs::copy(&prg, &o).map_err(|e| format!("cannot copy {}: {e}", prg.display()))?;
+            let is_d64 = o.extension().is_some_and(|e| e.eq_ignore_ascii_case("d64"));
+            let src = if is_d64 {
+                find_output(&out_dir, &name, "d64").ok_or("no disk image found")?
+            } else {
+                prg
+            };
+            std::fs::copy(&src, &o).map_err(|e| format!("cannot copy {}: {e}", src.display()))?;
             o
         }
         None => prg,
@@ -151,13 +157,14 @@ fn build(cmd: &str, mut args: Vec<String>) -> Result<(), String> {
 
     match cmd {
         "asm" => {
-            let asm = find_asm(&out_dir, &name).ok_or("no assembly listing found")?;
+            let asm = find_output(&out_dir, &name, "rat").ok_or("no assembly listing found")?;
             print!("{}", std::fs::read_to_string(asm).map_err(|e| e.to_string())?);
         }
         "run" => {
             let mimic = env::var("RUST64_MIMIC").unwrap_or_else(|_| "mimic".into());
+            let is_d64 = prg.extension().is_some_and(|e| e.eq_ignore_ascii_case("d64"));
             Command::new(&mimic)
-                .args(["--machine", "c64", "--autostart", "--prg"])
+                .args(["--machine", "c64", "--autostart", if is_d64 { "--disk" } else { "--prg" }])
                 .arg(&prg)
                 .status()
                 .map_err(|e| format!("cannot start {mimic}: {e} (set RUST64_MIMIC)"))?;
@@ -189,7 +196,10 @@ fn rebuild_if_backend_changed(
         return Ok(());
     }
     let mut c = Command::new("cargo");
+    // cargo asks rustc about the target first; without our backend rustc
+    // would try LLVM, which does not know the target.
     c.env("RUSTUP_TOOLCHAIN", TOOLCHAIN)
+        .env("RUSTFLAGS", format!("-Zcodegen-backend={}", backend.display()))
         .current_dir(root)
         .args(["clean", "-q", "-Zjson-target-spec", "-p", name, "--target"])
         .arg(spec);
@@ -200,8 +210,11 @@ fn rebuild_if_backend_changed(
     std::fs::write(&stamp, id).map_err(|e| e.to_string())
 }
 
-/// The newest `<name>.rat` the backend wrote below `dir`.
-fn find_asm(dir: &Path, name: &str) -> Option<PathBuf> {
+/// The newest `<crate name>.<ext>` the backend wrote below `dir` (the
+/// listing and the disk image are next to the program in cargo's build
+/// directories).
+fn find_output(dir: &Path, name: &str, ext: &str) -> Option<PathBuf> {
+    let file = format!("{}.{ext}", name.replace('-', "_"));
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -209,7 +222,7 @@ fn find_asm(dir: &Path, name: &str) -> Option<PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if p.file_name().and_then(|f| f.to_str()) == Some(&format!("{name}.rat")) {
+            } else if p.file_name().and_then(|f| f.to_str()) == Some(file.as_str()) {
                 let t = e.metadata().ok()?.modified().ok()?;
                 if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
                     best = Some((t, p));

@@ -1,0 +1,92 @@
+; c64::kernal: KERNAL wrappers (calling convention: see c64::rat_source!)
+
+c64_chrout = $ffd2
+c64_chrin  = $ffcf
+c64_getin  = $ffe4
+c64_scnkey = $ff9f
+c64_setlfs = $ffba
+c64_close  = $ffc3
+c64_clrchn = $ffcc
+c64_clall  = $ffe7
+c64_readst = $ffb7
+c64_rdtim  = $ffde
+c64_settim = $ffdb
+
+; returns 1 if RUN/STOP is pressed
+c64_stop:
+        jsr $ffe1
+        beq @stop
+        lda #0
+        rts
+@stop:  lda #1
+        rts
+
+; A = row, X = col
+c64_plot:
+        pha
+        txa
+        tay
+        pla
+        tax
+        clc
+        jmp $fff0
+
+; returns A = row, X = col
+c64_cursor:
+        sec
+        jsr $fff0
+        txa
+        pha
+        tya
+        tax
+        pla
+        rts
+
+; c64_setnam(name: *const u8, len: u8)
+c64_setnam:
+        lda c64_setnam__args+2
+        ldx c64_setnam__args
+        ldy c64_setnam__args+1
+        jmp $ffbd
+
+; error code in A (0 = ok)
+c64_open:
+        jsr $ffc0
+        bcs @err
+        lda #0
+@err:   rts
+
+c64_chkin:
+        tax
+        jsr $ffc6
+        bcs @err
+        lda #0
+@err:   rts
+
+c64_chkout:
+        tax
+        jsr $ffc9
+        bcs @err
+        lda #0
+@err:   rts
+
+; A = verify, X/Y = address; returns A = error, X/Y = end address
+c64_load:
+        jsr $ffd5
+        bcs @err
+        lda #0
+@err:   rts
+
+; c64_save(start: u16, end: u16) -> error
+c64_save:
+        lda c64_save__args
+        sta zp_p0
+        lda c64_save__args+1
+        sta zp_p0+1
+        lda #zp_p0
+        ldx c64_save__args+2
+        ldy c64_save__args+3
+        jsr $ffd8
+        bcs @err
+        lda #0
+@err:   rts

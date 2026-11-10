@@ -1,0 +1,78 @@
+; c64::irq: raster interrupt dispatcher (calling convention: see
+; c64::rat_source!). The statics c64_irq_* are exported from irq.rs.
+; The KERNAL entry at $FF48 has pushed A, X, Y.
+
+c64_irq_dispatch:
+        lda $d019
+        sta $d019               ; acknowledge
+        and #1
+        bne @raster
+        jmp $ea31               ; not ours
+@raster:
+        jsr rt_ctx_save
+        ; set up the next handler's line first: if this handler runs past
+        ; it, the VIC latches the interrupt and it follows right after.
+        lda c64_irq_cur
+        sta c64_irq_this
+        tay
+        iny
+        cpy c64_irq_count
+        bcc @next
+        ldy #0
+@next:  sty c64_irq_cur
+        lda c64_irq_lines,y
+        sta $d012
+        ; call handlers[this] (a pointer entry: no arguments)
+        lda c64_irq_this
+        asl a
+        tax
+        lda c64_irq_handlers,x
+        sta rt_jvec
+        lda c64_irq_handlers+1,x
+        sta rt_jvec+1
+        jsr rt_jsrind
+        jsr rt_ctx_restore
+        ; after the last handler of the frame: keyboard scan and clock
+        lda c64_irq_cur
+        bne @short
+        jmp $ea31
+@short: jmp $ea81
+
+c64_irq_this: .byte 0
+
+c64_irq_install:
+        sei
+        lda #$7f
+        sta $dc0d               ; CIA1 interrupts off
+        lda $dc0d
+        lda #<c64_irq_dispatch
+        sta $0314
+        lda #>c64_irq_dispatch
+        sta $0315
+        lda #0
+        sta c64_irq_cur
+        lda c64_irq_lines
+        sta $d012
+        lda $d011
+        and #$7f
+        sta $d011
+        lda #1
+        sta $d01a
+        sta $d019
+        cli
+        rts
+
+c64_irq_uninstall:
+        sei
+        lda #0
+        sta $d01a
+        lda #$ff
+        sta $d019
+        lda #$31
+        sta $0314
+        lda #$ea
+        sta $0315
+        lda #$81
+        sta $dc0d
+        cli
+        rts

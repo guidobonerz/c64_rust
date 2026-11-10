@@ -1,0 +1,4 @@
+; test_get_value() -> u8: reads the exported static test_value
+test_get_value:
+        lda test_value
+        rts

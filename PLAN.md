@@ -164,7 +164,7 @@ rustc rejects unknown attributes. Stable ways around that are
 | `//go64:align 64` | `#[repr(align(64))]` (native Rust) |
 | `//go:embed` | `include_bytes!` (native), placed at an address with `#[c64::at(0x2000)]` |
 | `//go64:sid f.sid` | `c64::sid!(TUNE, "f.sid")`: a proc macro reads the PSID header and places the data at its load address |
-| bodiless function + `.rat` | `extern "rat" { fn mem_copy(d: u16, s: u16, n: u16); }` + `c64::rat_source!("mem.rat")` (static in section `rat`, which the linker includes). Calling convention as in go64: 3 bytes in A/X/Y, the rest in `name__args`/`name__res` |
+| bodiless function + `.rat` | `unsafe extern "C" { fn mem_copy(d: u16, s: u16, n: u16); }` + `c64::rat_source!(MEM, "mem.rat")` (a byte-array static in section `rat`; the backend includes those of the program and of every crate that declares a called assembly function). `extern "rat"` is impossible: rustc rejects unknown ABIs. Calling convention as in go64: all argument bytes in `name__args`, the first 3 also in A/X/Y; results up to 3 bytes in A/X/Y, larger ones in `name__res` |
 
 `asm!` does not work on custom arches, so for inline code a macro
 `c64::asm!("…")` passes rat text through an intrinsic (Phase 6).
@@ -223,9 +223,9 @@ as usual. Library logic (fmt, math, line drawing) gets unit tests on the host.
 | **0. Spike** ✅ done 2026-11-10 (docs/spike.md) | Pin nightly, `mos-c64.json` with 16-bit pointers, empty `CodegenBackend`, `-Zbuild-std=core` builds. Check the risks: does rustc accept an unknown `arch` (otherwise use `msp430` as the 16-bit little-endian base)? Does `link()` get all LIR objects? | `fn main(){}` gives a `.prg` that returns cleanly to BASIC |
 | **1. Core backend** | MIR → LIR for u8/u16/bool, locals, assignments, `if`/`loop`/`while`, direct calls, static frames, `runtime.rat` start/exit, linking rat-asm in | `poke(0xd020, 5)` and a 16-bit Fibonacci run in mimic |
 | **2. Language breadth** | u32/i8/i16/i32, `match`, enums (discriminant + niche layout from `layout_of`), structs/tuples/arrays, references, slices, `&str`, statics/consts as data, generics/traits (already mono), closures, iterator chains, panic/bounds checks, recursion error | E2E core suite green (like `go64/testdata/core`) |
-| **3. Library I** | `hw`, `mem`, `sys`, `kernal`, `text`, `fmt`, `input`; `extern "rat"` + `rat_source!`; `at`/`zp` attributes; PETSCII literals | `hello`, keyboard/joystick examples |
-| **4. Library II** | `sprite`, `gfx`, `sound` (+ `sid!`), `irq` (fn pointers, uniform argument area, IRQ context analysis), `dos` (+ D64 output) | Port of every go64 example: hello, sprites, drawing, music, dir |
-| **5. Optimization** | Frame overlay, ZP allocator (hot variables/pointers into `$16-$8F`), 8-bit narrowing, X/Y as loop registers, peephole, tail calls → `jmp`, inlining small leaf functions in the link step | Code size ≤ go64 for the same examples; benchmarks recorded |
+| **3. Library I** ✅ done 2026-11-10 (`lib/c64`, `lib/c64-macros`, `tests/e2e/lib`) | `hw`, `mem`, `sys`, `kernal`, `text`, `fmt`, `input`; `extern "C"` + `rat_source!`; `#[c64::at]`/`#[c64::zp]`; PETSCII literals (`c64::p!`/`pm!`); `#[c64::main]` | `hello`, keyboard/joystick examples |
+| **4. Library II** ✅ done 2026-11-10 (`tests/e2e/lib2`, `tests/e2e/gfx`, `examples/{hello,sprites,drawing,music,dir}`) | `sprite`, `gfx`, `sound` (+ `sid!`), `irq` (fn pointers, uniform argument area, IRQ context: functions reached through pointers are compiled as separate copies), `dos` (+ D64 output) | Port of every go64 example: hello, sprites, drawing, music, dir |
+| **5. Optimization** (mostly done 2026-11-10: known addresses, views, compare-and-branch, X-indexed tables, frame overlay + ZP frames, block layout, peephole/relaxation, runtime pruning; examples 48-76% smaller, up to 2.75x faster. Open: X/Y loop registers, values in registers, tail calls, link-step inlining) | Frame overlay, ZP allocator (hot variables/pointers into `$16-$8F`), 8-bit narrowing, X/Y as loop registers, peephole, tail calls → `jmp`, inlining small leaf functions in the link step | Code size ≤ go64 for the same examples; benchmarks recorded |
 | **6. Tooling** | `cargo c64 new/run/asm/test`, error messages with Rust spans for rat/link errors, memory map report (`--map`), source-level labels for mimic's debugger, `c64::asm!` | A new project works without reading docs |
 | **7. Extensions** | Software stack for recursive SCCs, `c64::alloc` + `alloc::Vec/String`, `dyn Trait` everywhere, soft float `f32`, cloning functions shared between IRQ and main instead of warning, cartridge/`.crt` output | Optional, by priority |
 
@@ -242,7 +242,7 @@ parallel with optimization (5).
 | Custom target / unknown arch is rejected | **Happened** (no C ABI lowering for unknown arches): using `arch: "msp430"` (16-bit LE) as the base, C64 = `target_os = "c64"` |
 | Code bloat from `core` (iterators, bounds checks, `fmt`) | MIR opt level 3, our own inlining, no `core::fmt`, measure with benchmarks early |
 | Recursion inside `core` (e.g. `sort`) | Compile error with a path to the cycle; `c64` provides non-recursive alternatives; later the software stack |
-| IRQ and main share static frames | Context analysis in the linker: error or automatic cloning (Phase 7) |
+| IRQ and main share static frames | **Done in Phase 4:** functions reached through a function pointer (handlers) are compiled a second time with their own frames; the dispatcher saves the runtime registers (only the zero-page pointers if the handler code uses no runtime helpers). Remaining: a pointer copy running in main while an interrupt runs the same copy |
 | 6510 performance of 16/32-bit code | Narrowing passes, encourage `u8` in the API, use ZP pointers for `(zp),y` |
 | RAM: program + BSS must stay below `$A000` | Frame overlay, map report, linker check like go64 (also against `at` blocks) |
 
