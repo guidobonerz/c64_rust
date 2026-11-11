@@ -1,0 +1,59 @@
+; c64::sprite (calling convention: see c64::rat_source!). c64_sprite_bits
+; is a static of sprite.rs: the bit of each sprite.
+
+; c64_sprite_move(n: u8, x: u16, y: u8)
+c64_sprite_move:
+        and #7
+        tay
+        asl
+        tax
+        lda c64_sprite_move__args+1
+        sta $d000,x
+        lda c64_sprite_move__args+3
+        sta $d001,x
+        lda c64_sprite_bits,y
+        ldx c64_sprite_move__args+2
+        bne @msb
+        eor #$ff
+        and $d010
+        sta $d010
+        rts
+@msb:   ora $d010
+        sta $d010
+        rts
+
+; c64_sprite_flag(reg: u8, n: u8, on: u8): sets or clears the sprite's bit
+; in the VIC register $d000 + reg
+c64_sprite_flag:
+        tay
+        txa
+        and #7
+        tax
+        lda c64_sprite_bits,x
+        ldx c64_sprite_flag__args+2
+        beq @off
+        ora $d000,y
+        sta $d000,y
+        rts
+@off:   eor #$ff
+        and $d000,y
+        sta $d000,y
+        rts
+
+; c64_sprite_x(n: u8) -> u16
+c64_sprite_x:
+        and #7
+        tay
+        asl
+        tax
+        lda $d010
+        and c64_sprite_bits,y
+        beq @low
+        lda #1
+@low:   pha
+        lda $d000,x
+        tay
+        pla
+        tax
+        tya
+        rts

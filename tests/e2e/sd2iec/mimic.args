@@ -1,0 +1,5 @@
+# an SD2IEC as drive 8, with the folder card as its SD card
+--option
+drive8=sd2iec
+--sd2iec-dir
+{dir}/card

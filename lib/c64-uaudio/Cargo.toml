@@ -1,0 +1,9 @@
+[package]
+name = "c64-uaudio"
+description = "Ultimate Audio for rust64: the sampler of the 1541 Ultimate-II+ and Ultimate 64"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+c64 = { path = "../c64" }

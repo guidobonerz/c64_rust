@@ -1,0 +1,55 @@
+; c64::hw: the raster beam (results in A, X as in c64::rat_source!).
+
+; The raster line, 0-311: A = $D012, X = bit 7 of $D011. Read again if the
+; beam crossed line 255/256 or the end of the frame meanwhile.
+c64_hw_raster_line:
+@read:  lda $d011
+        and #$80
+        sta rt_t
+        ldy $d012
+        lda $d011
+        and #$80
+        cmp rt_t
+        bne @read
+        ldx #0
+        asl
+        bcc @low
+        inx
+@low:   tya
+        rts
+
+; A = line: wait until the beam reaches it in the next frame. First for
+; the beam to be above the line (if it is not, for the next frame to
+; start), then for it to be at or below the line, or for the frame to end.
+; Comparing for equality would miss the line when an interrupt handler
+; takes longer than a raster line.
+;
+; rt_t+1: the line, rt_t+2/+3: the line before.
+c64_hw_wait_raster:
+        sta rt_t+1
+        jsr c64_hw_raster_line
+        cpx #0
+        bne @below
+        cmp rt_t+1
+        bcc @above
+@below: sta rt_t+2              ; at or below the line: the next frame
+        stx rt_t+3
+        jsr c64_hw_raster_line
+        tay
+        cmp rt_t+2
+        txa
+        sbc rt_t+3
+        tya
+        bcs @below
+@above: sta rt_t+2
+        stx rt_t+3
+        jsr c64_hw_raster_line
+        cpx #0
+        bne @done
+        cmp rt_t+1
+        bcs @done
+        ldy rt_t+3
+        bne @done               ; a new frame
+        cmp rt_t+2
+        bcs @above
+@done:  rts

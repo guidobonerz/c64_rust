@@ -42,7 +42,7 @@ fn result(err: u8) -> Result<(), Error> {
 pub fn chrout(c: u8) {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_chrout(c)
+        crate::asm!("lda {c}", "jsr $ffd2", c = in(reg) c)
     }
     #[cfg(not(target_os = "c64"))]
     host::chrout(c)
@@ -51,8 +51,10 @@ pub fn chrout(c: u8) {
 /// Reads a character from the current input channel (CHRIN, `$FFCF`).
 pub fn chrin() -> u8 {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_chrin()
+    {
+        let c: u8;
+        unsafe { crate::asm!("jsr $ffcf", "sta {c}", c = out(reg) c) };
+        c
     }
     #[cfg(not(target_os = "c64"))]
     RETURN
@@ -61,8 +63,10 @@ pub fn chrin() -> u8 {
 /// Reads a key from the keyboard buffer, 0 if there is none (GETIN, `$FFE4`).
 pub fn getin() -> u8 {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_getin()
+    {
+        let c: u8;
+        unsafe { crate::asm!("jsr $ffe4", "sta {c}", c = out(reg) c) };
+        c
     }
     #[cfg(not(target_os = "c64"))]
     0
@@ -72,15 +76,28 @@ pub fn getin() -> u8 {
 pub fn scnkey() {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_scnkey()
+        crate::asm!("jsr $ff9f")
     }
 }
 
 /// Whether RUN/STOP is pressed (STOP, `$FFE1`).
 pub fn stop() -> bool {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_stop() != 0
+    {
+        // STOP returns with the zero flag set if the key is pressed.
+        let pressed: u8;
+        unsafe {
+            crate::asm!(
+                "jsr $ffe1",
+                "beq @stop",
+                "lda #0",
+                "beq @done",
+                "@stop: lda #1",
+                "@done: sta {p}",
+                p = out(reg) pressed,
+            )
+        };
+        pressed != 0
     }
     #[cfg(not(target_os = "c64"))]
     false
@@ -179,7 +196,7 @@ pub fn chkout(lfn: u8) -> Result<(), Error> {
 pub fn clrchn() {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_clrchn()
+        crate::asm!("jsr $ffcc")
     }
 }
 
@@ -194,8 +211,10 @@ pub fn clall() {
 /// The I/O status byte (READST, `$FFB7`).
 pub fn readst() -> u8 {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_readst()
+    {
+        let st: u8;
+        unsafe { crate::asm!("jsr $ffb7", "sta {st}", st = out(reg) st) };
+        st
     }
     #[cfg(not(target_os = "c64"))]
     0x40
@@ -235,8 +254,20 @@ pub fn save(start: u16, end: u16) -> Result<(), Error> {
 pub fn rdtim() -> u32 {
     #[cfg(target_os = "c64")]
     {
-        let t = unsafe { c64_rdtim() };
-        t.lo as u32 | (t.mid as u32) << 8 | (t.hi as u32) << 16
+        // RDTIM returns the three bytes in A, X, Y (low byte first).
+        let (lo, mid, hi): (u8, u8, u8);
+        unsafe {
+            crate::asm!(
+                "jsr $ffde",
+                "sta {lo}",
+                "stx {mid}",
+                "sty {hi}",
+                lo = out(reg) lo,
+                mid = out(reg) mid,
+                hi = out(reg) hi,
+            )
+        };
+        u32::from_le_bytes([lo, mid, hi, 0])
     }
     #[cfg(not(target_os = "c64"))]
     0
@@ -245,8 +276,19 @@ pub fn rdtim() -> u32 {
 /// Sets the jiffy clock (SETTIM, `$FFDB`).
 pub fn settim(t: u32) {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_settim(t as u8, (t >> 8) as u8, (t >> 16) as u8)
+    {
+        let [lo, mid, hi, _] = t.to_le_bytes();
+        unsafe {
+            crate::asm!(
+                "lda {lo}",
+                "ldx {mid}",
+                "ldy {hi}",
+                "jsr $ffdb",
+                lo = in(reg) lo,
+                mid = in(reg) mid,
+                hi = in(reg) hi,
+            )
+        }
     }
     #[cfg(not(target_os = "c64"))]
     let _ = t;
@@ -254,7 +296,16 @@ pub fn settim(t: u32) {
 
 /// The low 16 bits of the jiffy clock.
 pub fn jiffies() -> u16 {
-    rdtim() as u16
+    #[cfg(target_os = "c64")]
+    {
+        let t: u16;
+        unsafe { crate::asm!("jsr $ffde", "sta {t}", "stx {t}+1", t = out(reg) t) };
+        t
+    }
+    #[cfg(not(target_os = "c64"))]
+    {
+        rdtim() as u16
+    }
 }
 
 #[cfg(target_os = "c64")]
@@ -262,14 +313,6 @@ pub fn jiffies() -> u16 {
 struct Pos {
     row: u8,
     col: u8,
-}
-
-#[cfg(target_os = "c64")]
-#[repr(C)]
-struct Time {
-    lo: u8,
-    mid: u8,
-    hi: u8,
 }
 
 #[cfg(target_os = "c64")]
@@ -284,11 +327,6 @@ crate::rat_source!(KERNAL_RAT, "rat/kernal.rat");
 
 #[cfg(target_os = "c64")]
 unsafe extern "C" {
-    fn c64_chrout(c: u8);
-    fn c64_chrin() -> u8;
-    fn c64_getin() -> u8;
-    fn c64_scnkey();
-    fn c64_stop() -> u8;
     fn c64_plot(row: u8, col: u8);
     fn c64_cursor() -> Pos;
     fn c64_setlfs(lfn: u8, dev: u8, sa: u8);
@@ -297,13 +335,9 @@ unsafe extern "C" {
     fn c64_close(lfn: u8);
     fn c64_chkin(lfn: u8) -> u8;
     fn c64_chkout(lfn: u8) -> u8;
-    fn c64_clrchn();
     fn c64_clall();
-    fn c64_readst() -> u8;
     fn c64_load(verify: u8, addr: u16) -> LoadResult;
     fn c64_save(start: u16, end: u16) -> u8;
-    fn c64_rdtim() -> Time;
-    fn c64_settim(lo: u8, mid: u8, hi: u8);
 }
 
 #[cfg(not(target_os = "c64"))]

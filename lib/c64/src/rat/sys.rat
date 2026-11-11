@@ -3,28 +3,6 @@
 c64_sys_exit = rt_exit
 c64_sys_panic = rt_panic
 
-c64_sys_sei:
-        sei
-        rts
-
-c64_sys_cli:
-        cli
-        rts
-
-; returns the status register (bit 2: interrupts were disabled)
-c64_sys_irq_save:
-        php
-        pla
-        sei
-        rts
-
-; A = status register from c64_sys_irq_save
-c64_sys_irq_restore:
-        and #$04
-        bne @off
-        cli
-@off:   rts
-
 ; c64_sys_jsr(addr: u16, a: u8, x: u8, y: u8) -> Regs { a, x, y, p }
 c64_sys_jsr:
         lda c64_sys_jsr__args

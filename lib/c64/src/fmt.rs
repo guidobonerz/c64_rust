@@ -58,7 +58,9 @@ impl Display for char {
     }
 }
 
+#[cfg(not(target_os = "c64"))]
 const POW10_16: [u16; 4] = [10000, 1000, 100, 10];
+#[cfg(not(target_os = "c64"))]
 const POW10_32: [u32; 9] = [
     1_000_000_000,
     100_000_000,
@@ -71,7 +73,40 @@ const POW10_32: [u32; 9] = [
     10,
 ];
 
+// On the C64 the digits come from one assembly routine (rat/text.rat) for
+// all sizes and all sinks.
+#[cfg(target_os = "c64")]
+unsafe extern "C" {
+    fn c64_fmt_dec(n: u32) -> u8;
+}
+
+#[cfg(target_os = "c64")]
+fn write_dec<W: Write>(w: &mut W, n: u32) {
+    unsafe {
+        // The digits are in the runtime registers rt_b..: copy them, the
+        // sink may use those registers.
+        let len = c64_fmt_dec(n);
+        let at: u16;
+        crate::asm!("lda #<rt_b", "sta {p}", "lda #>rt_b", "sta {p}+1", p = out(reg) at);
+        let digits: [u8; 10] = *(at as *const [u8; 10]);
+        w.write_bytes(core::slice::from_raw_parts(digits.as_ptr(), len as usize));
+    }
+}
+
 /// Writes `n` in decimal.
+#[cfg(target_os = "c64")]
+pub fn write_u16<W: Write>(w: &mut W, n: u16) {
+    write_dec(w, n as u32)
+}
+
+/// Writes `n` in decimal.
+#[cfg(target_os = "c64")]
+pub fn write_u32<W: Write>(w: &mut W, n: u32) {
+    write_dec(w, n)
+}
+
+/// Writes `n` in decimal.
+#[cfg(not(target_os = "c64"))]
 pub fn write_u16<W: Write>(w: &mut W, mut n: u16) {
     let mut started = false;
     for &p in &POW10_16 {
@@ -89,6 +124,7 @@ pub fn write_u16<W: Write>(w: &mut W, mut n: u16) {
 }
 
 /// Writes `n` in decimal.
+#[cfg(not(target_os = "c64"))]
 pub fn write_u32<W: Write>(w: &mut W, mut n: u32) {
     if n <= 0xffff {
         return write_u16(w, n as u16);

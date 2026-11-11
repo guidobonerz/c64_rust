@@ -1,0 +1,5 @@
+# a WiC64 on the user port, without a network
+--option
+userport=wic64
+--net
+off

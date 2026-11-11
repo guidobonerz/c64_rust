@@ -1,0 +1,7 @@
+# the command interface, with the folder root as the storage; no network
+--option
+uci=on
+--uci-dir
+{dir}/root
+--net
+off

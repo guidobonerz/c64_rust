@@ -1,0 +1,9 @@
+[package]
+name = "c64-uci"
+description = "The Ultimate command interface (1541 Ultimate, Ultimate 64) for rust64: files, network, control"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+c64 = { path = "../c64" }

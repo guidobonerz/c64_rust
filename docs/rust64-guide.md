@@ -194,7 +194,8 @@ The repository has more examples in `examples/`: `hello`, `sprites`,
 text row), `rasterbars` (colour bars over the whole width of the screen: a
 stable raster interrupt in assembly, the colour table from Rust),
 `diagonal` (the whole screen scrolls diagonally over a pattern in
-a custom character set, with two screens that are swapped) and `border`
+a custom character set, with two screens that are swapped), `sd2iec`,
+`uci` and `wic64` (the extension crates of chapter 8) and `border`
 (the smallest program, without the library).
 
 ---
@@ -305,7 +306,7 @@ assembly).
 | `core::fmt` with arguments (`write!(f, "{}", x)`, `panic!("{}", x)`) | `c64::print!`, `c64::write!`, `panic!("text")` |
 | `ptr::copy` (overlapping copies, memmove) | `c64::mem::copy` (copies upwards) |
 | `u128` multiplication/division | |
-| `asm!` | assembly functions (chapter 7) |
+| `asm!` with registers as operands | `c64::asm!`: operands are memory locations (chapter 7) |
 | threads, atomics | interrupts with `c64::irq`; `sys::without_interrupts` |
 
 Recursion is not possible because every function has a static frame (see
@@ -598,6 +599,53 @@ with `rts` (or `jmp` to another routine). Useful runtime labels:
 | `rt_panic` | red border, return to BASIC |
 | `rt_jsrind` | `jmp (rt_jvec)` |
 
+### Inline assembly
+
+`c64::asm!` puts assembly lines into a function, without a call:
+
+```rust
+fn add(a: u16, b: u8) -> u16 {
+    let sum: u16;
+    unsafe {
+        c64::asm!(
+            "clc",
+            "lda {a}",
+            "adc {b}",
+            "sta {sum}",
+            "lda {a}+1",
+            "adc #0",
+            "sta {sum}+1",
+            a = in(reg) a,
+            b = in(reg) b,
+            sum = out(reg) sum,
+        );
+    }
+    sum
+}
+```
+
+It is `core::arch::asm!` (the macro spares the program the feature gate)
+with 6510 code in rat syntax. rust64 keeps values in memory, not in
+registers, so a placeholder stands for the **memory location** of its
+operand: an address, used like a label (`lda {x}`, `sta {x}+1`).
+
+| Operand | `{name}` is |
+|---|---|
+| `in(reg) value` | where the value is (8 or 16 bits; a constant or a value behind a pointer is copied to a temporary first) |
+| `out(reg) place`, `lateout(reg) place` | where the result goes |
+| `inout(reg) var` | a copy of `var` that is stored back afterwards |
+| `const N` | the number: `lda #{n}` |
+| `sym STATIC` | the label of the static |
+
+A, X, Y and the flags are free inside the block and undefined after it.
+Local labels start with `@` and belong to the block (`"@loop: dex"`,
+`"bne @loop"`). The runtime's labels and the routines of rat sources can
+be used (`jsr rt_memcpy`, `sta zp_p0`). The library uses this for its small
+wrappers: `kernal::chrout(c)` is `lda c`, `jsr $ffd2`.
+
+Use a rat source instead when the code is long, is called from several
+places (inline code is repeated at every use) or needs data tables.
+
 A KERNAL routine can be declared directly when its registers fit the
 convention (`c64_chrout = $ffd2` in the library's `kernal.rat`). Look at
 `lib/c64/src/rat/*.rat` for more examples.
@@ -871,6 +919,124 @@ File names are ASCII and converted to PETSCII capitals.
 | `panic() -> !` | red border, back to BASIC |
 | `sei()`, `cli()`, `without_interrupts(f)` | the interrupt flag |
 | `unsafe jsr(addr, Regs) -> Regs` | call machine code with A/X/Y, get A/X/Y/P back (`carry()`) |
+
+---
+
+### More hardware: separate crates
+
+Four crates next to `c64` (in `lib/`) support hardware that not every
+C64 has; a fifth, `c64-ui`, draws boxes on the text screen. A program names the ones it needs in its `Cargo.toml`
+(`c64-uci = { path = "../../lib/c64-uci" }`); what it does not call is not
+in the program. Each has an example in `examples/` (except the sampler)
+and a test in `tests/e2e/`.
+
+**`c64-sd2iec`** — directories, disk images and settings of an SD2IEC,
+sent on the command channel; files are read with `c64::dos` as usual.
+
+```rust
+use c64_sd2iec as sd;
+if sd::detect(8) {
+    sd::cd(8, "games")?;                 // or "/games/arcade"
+    sd::mount(8, "disk1.d64")?;          // the image is now the disk
+    let end = c64::dos::load("intro", 8, 0xc000)?;
+    sd::unmount(8)?;
+}
+```
+
+| Item | Description |
+|---|---|
+| `detect(dev)` | whether the drive is an SD2IEC |
+| `cd`, `cd_parent`, `cd_root`, `mkdir`, `rmdir` | directories |
+| `mount(dev, image)`, `unmount(dev)` | disk images (D64, D71, D81) |
+| `check(dev)`, `status(dev, buf)` | the error number / status text of the last command (39 = path not found) |
+| `set_device`, `hide_extensions`, `images_as`, `save_settings`, `version`, `command` | settings and anything else |
+
+**`c64-uci`** — the Ultimate command interface of the 1541 Ultimate-II(+)
+and Ultimate 64 (`$DF1C`; enable it in the Ultimate's menu): files on its
+storage, TCP/UDP sockets, control.
+
+```rust
+use c64_uci::{self as uci, dos, net};
+if uci::present() {
+    dos::open("/Usb0/scores.txt", dos::READ)?;
+    let n = dos::read(&mut buf)?;
+    dos::close()?;
+    let s = net::tcp_connect("example.org", 80)?;
+    net::write(s, b"GET / HTTP/1.0\r\n\r\n")?;
+    let n = net::read(s, &mut buf)?;
+    net::close(s)?;
+}
+```
+
+| Item | Description |
+|---|---|
+| `present()` | check first: the other functions wait for the Ultimate's answer |
+| `dos::` | `identify`, `open(name, flags)`, `close`, `read`, `write`, `seek`, `file_size`, `file_info`, `delete`, `cd`, `path`, `mkdir`, `open_dir`/`read_dir`, `mount`/`unmount`, `time` |
+| `net::` | `identify`, `interface_count`, `ip_address`, `tcp_connect`, `udp_connect`, `read`, `write`, `close` |
+| `control::` | `identify`, `hardware`, `reboot` |
+| `begin`, `put`, `put_u16`, `put_bytes`, `push`, `read`, `status`, `code`, `accept`, `finish`, `request` | the steps of a command, for commands without a function |
+| `Error(n)` | the number of the status text (`82,FILE NOT FOUND`) |
+
+**`c64-wic64`** — the WiC64 WiFi module on the user port: one request,
+one response.
+
+```rust
+use c64_wic64 as wic;
+if wic::present() {
+    let n = wic::http_get("http://example.org/hello.txt", &mut buf)?;
+    // larger than the buffer: request, then read piece by piece
+    let len = wic::request(wic::cmd::HTTP_GET, url.as_bytes())?;
+    while wic::remaining() > 0 { let n = wic::read(&mut buf); ... }
+}
+```
+
+| Item | Description |
+|---|---|
+| `present()`, `is_connected()`, `version`, `ip`, `mac`, `ssid`, `rssi`, `local_time` | the module and its network |
+| `http_get`, `http_post`, `server`, `set_server` | HTTP (`http://` only) |
+| `tcp_open("host:port")`, `tcp_available`, `tcp_read`, `tcp_write`, `tcp_close` | one TCP connection |
+| `command`, `request`, `read`, `remaining`, `cmd::*` | any command |
+| `set_wait`, `set_remote_timeout`, `status_message`, `echo` | time-outs, the text of the last error, a connection test |
+| `Error(n)` | 1 internal, 2 client, 3 no WiFi, 4 network, 5 server, 255 no WiC64 |
+
+**`c64-uaudio`** — Ultimate Audio, the sampler of the Ultimate-II+ and
+Ultimate 64 (`$DF20`; needs the REU and "Map Ultimate Audio" switched on):
+seven voices play samples from REU memory.
+
+```rust
+use c64_uaudio::{self as ua, Voice};
+if ua::present() {
+    let v = Voice(0);
+    v.sample(0, 8000);                   // REU address, length
+    v.rate(ua::rate(11025));
+    v.volume(40);
+    v.pan(ua::CENTER);
+    v.play(0);                           // or REPEAT, IRQ, BITS_16
+}
+```
+
+**`c64-ui`** — boxes on the text screen, drawn with the PETSCII line
+characters; no extra hardware. See `examples/ui`.
+
+```rust
+use c64_ui::{self as ui, Border};
+ui::frame(2, 2, 20, 8, Border::Round, Color::White);
+ui::titled_panel(10, 6, 24, 10, Border::Square, Color::Yellow, " OPTIONS ");
+```
+
+| Item | Description |
+|---|---|
+| `frame(col, row, w, h, border, color)` | the lines of a box; what is inside stays |
+| `panel(...)` | a box with the inside cleared (a window on top of other text) |
+| `titled_frame(..., title)`, `titled_panel(..., title)` | with a title in the top line, from the third column, cut off at `w - 4` characters |
+| `Border::Square`, `Border::Round` | the corners; round ones need the upper case / graphics character set |
+
+`w` and `h` include the lines. A box smaller than 2 x 2 or not completely
+on the screen is not drawn.
+
+mimic emulates the SD2IEC, the command interface and the WiC64, and the
+tests run against it. It does not emulate the sampler: `c64-uaudio` follows
+the Ultimate's FPGA source and has not been run against hardware.
 
 ---
 

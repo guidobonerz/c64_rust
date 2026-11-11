@@ -21,10 +21,11 @@ use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::mir::interpret::{AllocId, Allocation, GlobalAlloc, InitChunk, Scalar, alloc_range};
 use rustc_middle::mono::MonoItem;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
+use rustc_ast::InlineAsmTemplatePiece;
 use rustc_middle::mir::{
-    AggregateKind, BasicBlock, BinOp, Body, CastKind, ConstOperand, ConstValue, Local, Location,
-    NonDivergingIntrinsic, Operand, Place, ProjectionElem, Rvalue, StatementKind, Terminator,
-    TerminatorKind, UnOp,
+    AggregateKind, BasicBlock, BinOp, Body, CastKind, ConstOperand, ConstValue, InlineAsmOperand,
+    Local, Location, NonDivergingIntrinsic, Operand, Place, ProjectionElem, Rvalue, StatementKind,
+    Terminator, TerminatorKind, UnOp,
 };
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::layout::{
@@ -115,6 +116,9 @@ struct Program<'tcx> {
     addr_taken: FxIndexMap<usize, bool>,
     /// Argument types and result size of each compiled function.
     sigs: FxIndexMap<usize, (Vec<Ty<'tcx>>, u64)>,
+    /// Per function: where the names of its frame are, and where the
+    /// result and the arguments end (see `asm::forward`).
+    layouts: FxIndexMap<usize, (crate::asm::FrameLayout, u64)>,
     asm: Asm,
     /// Frame symbol definitions, emitted after the `__bss` label.
     defs: String,
@@ -232,6 +236,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         calls: Vec::new(),
         addr_taken: FxIndexMap::default(),
         sigs: FxIndexMap::default(),
+        layouts: FxIndexMap::default(),
         asm: Asm::default(),
         defs: String::new(),
         bss: RT_BSS,
@@ -277,12 +282,15 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     // more (pointers in data), so loop until both lists are done.
     let mut data = Asm::default();
     let mut exported_data = Asm::default();
+    // Constant allocations go through `asm::prune`: those the code only
+    // used as immediates are not in the program.
+    let mut const_data = Asm::default();
     let (mut na, mut ns) = (0, 0);
     while na < p.allocs.len() || ns < p.statics.len() {
         while na < p.allocs.len() {
             let id = p.allocs[na];
             let alloc = tcx.global_alloc(id).unwrap_memory();
-            emit_alloc(&mut p, &mut data, &format!("A{na}"), alloc.inner());
+            emit_alloc(&mut p, &mut const_data, &format!("A{na}"), alloc.inner());
             na += 1;
         }
         while ns < p.statics.len() {
@@ -354,21 +362,6 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     }
     p.bss += top;
 
-    // Argument and result areas of the assembly functions: one block, so
-    // that interrupt dispatchers can save it (rt_ctx_save).
-    let _ = writeln!(p.defs, "rt_fsave = __bss + {}", p.bss);
-    for (sym, &(args, res)) in &p.foreign {
-        for (suffix, n) in [("args", args), ("res", res)] {
-            if n > 0 {
-                let _ = writeln!(p.defs, "{sym}__{suffix} = __bss + {}", p.bss);
-                p.bss += n;
-            }
-        }
-    }
-    let _ = writeln!(p.defs, "rt_fsave_end = __bss + {}", p.bss);
-    let _ = writeln!(p.defs, "rt_ctxbuf = __bss + {}", p.bss);
-    p.bss += 256 + 8;
-
     // The library assembly: the runtime, the rat sources and the generated
     // helpers. Only what the program refers to is kept (asm::prune).
     let mut lib = String::new();
@@ -378,7 +371,84 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     lib.push_str("\n; ---- exported to assembly ----\n");
     lib.push_str(&p.exports);
     lib.push_str(&exported_data.text);
+    lib.push_str("\n; ---- constants ----\n");
+    lib.push_str(&const_data.text);
     lib.push_str(&ctx_save(p.ptr_ctx));
+
+    // Arguments nobody reads are not passed; what that frees in the
+    // callers is cleaned up function by function.
+    {
+        let program = format!("{}{}{}", p.asm.text, wrappers, data.text);
+        let kept = crate::asm::prune(&lib, &program);
+        let code = crate::asm::drop_dead_args(&p.asm.text, &[&wrappers, &data.text, &kept], &|name| {
+            // F<id>v<n>, F<id>t, L<id>_<n>
+            let id = name
+                .strip_prefix('F')
+                .and_then(|r| r.split_once(['v', 't']))
+                .or_else(|| name.strip_prefix('L').and_then(|r| r.split_once('_')))
+                .and_then(|(id, _)| id.parse::<usize>().ok())?;
+            let &(o, n) = p.layouts.get(&id)?.0.get(name)?;
+            Some((id, o, n))
+        });
+        let mut text = String::with_capacity(code.len());
+        let mut chunk = String::new();
+        let mut cur: Option<usize> = None;
+        let flush = |p: &mut Program<'_>, chunk: &mut String, cur: Option<usize>, text: &mut String| {
+            match cur {
+                Some(id) => text.push_str(&optimize_fn(p, chunk, id)),
+                None => text.push_str(chunk),
+            }
+            chunk.clear();
+        };
+        for line in code.lines() {
+            if let Some(id) = line
+                .strip_prefix('F')
+                .and_then(|r| r.strip_suffix(':'))
+                .and_then(|r| r.parse::<usize>().ok())
+            {
+                flush(&mut p, &mut chunk, cur, &mut text);
+                cur = Some(id);
+            }
+            chunk.push_str(line);
+            chunk.push('\n');
+        }
+        flush(&mut p, &mut chunk, cur, &mut text);
+        p.asm.text = text;
+    }
+
+    // Argument and result areas of the assembly functions: one block, so
+    // that interrupt dispatchers can save it (rt_ctx_save). Only for the
+    // functions the program uses: the code calls them, or assembly that is
+    // kept refers to their areas.
+    let used_areas: FxIndexSet<String> = {
+        let program = format!("{}{}{}", p.asm.text, wrappers, data.text);
+        let kept = crate::asm::prune(&lib, &program);
+        let mut used = FxIndexSet::default();
+        for text in [&program, &kept] {
+            for line in text.lines() {
+                let line = line.split(';').next().unwrap_or("");
+                for w in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if w.ends_with("__args") || w.ends_with("__res") {
+                        used.insert(w.to_owned());
+                    }
+                }
+            }
+        }
+        used
+    };
+    let _ = writeln!(p.defs, "rt_fsave = __bss + {}", p.bss);
+    for (sym, &(args, res)) in &p.foreign {
+        for (suffix, n) in [("args", args), ("res", res)] {
+            if n > 0 && used_areas.contains(&format!("{sym}__{suffix}")) {
+                let _ = writeln!(p.defs, "{sym}__{suffix} = __bss + {}", p.bss);
+                p.bss += n;
+            }
+        }
+    }
+    let _ = writeln!(p.defs, "rt_fsave_end = __bss + {}", p.bss);
+    let _ = writeln!(p.defs, "rt_ctxbuf = __bss + {}", p.bss);
+    p.bss += 256 + 8;
+
 
     let mut out = String::new();
     let _ = writeln!(out, "\nrt_main = F{main_id}");
@@ -396,6 +466,23 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
             .and_then(|(id, _)| id.parse::<usize>().ok())
             .is_some_and(|id| zp_ids.contains(&id))
     });
+    // Branch distances with the real sizes: frames in the zero page are
+    // known now.
+    let code = crate::asm::relax_with(
+        &code,
+        &|op, arg| {
+            crate::asm::line_size(op, arg, &|name| {
+                name.starts_with("zp_")
+                    || name
+                        .strip_prefix('F')
+                        .and_then(|r| r.split_once(['v', 't']))
+                        .or_else(|| name.strip_prefix('L').and_then(|r| r.split_once('_')))
+                        .and_then(|(id, _)| id.parse::<usize>().ok())
+                        .is_some_and(|id| zp_ids.contains(&id))
+            })
+        },
+        120,
+    );
     out.push_str(&code);
     out.push_str(&wrappers);
     out.push_str("\n; ---- data ----\n");
@@ -1186,7 +1273,7 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
     f.lazy_cand = f.lazy_locals();
     f.body();
     f.finish();
-    let opt = crate::asm::peephole(&crate::asm::relax(&f.p.asm.text[start..]));
+    let opt = optimize_fn(f.p, &f.p.asm.text[start..].to_owned(), id);
     f.p.asm.text.truncate(start);
     f.p.asm.text.push_str(&opt);
     if ctx == CTX_PTR {
@@ -1203,6 +1290,42 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
         }
         f.p.ptr_ctx = c;
     }
+}
+
+/// The byte at `off` of the constant allocation `label` (`A<n>`) as an
+/// immediate operand, if the allocation is immutable.
+fn const_byte(p: &mut Program<'_>, label: &str, off: u64) -> Option<String> {
+    let tcx = p.tcx;
+    let n: usize = label[1..].parse().ok()?;
+    let aid = *p.allocs.get_index(n)?;
+    let GlobalAlloc::Memory(m) = tcx.global_alloc(aid) else { return None };
+    let alloc = m.inner();
+    if alloc.mutability.is_mut() || off >= alloc.len() as u64 {
+        return None;
+    }
+    for &(o, prov) in alloc.provenance().ptrs().iter() {
+        let o = o.bytes();
+        if off == o || off == o + 1 {
+            let target = prov.alloc_id();
+            if !matches!(tcx.global_alloc(target), GlobalAlloc::Memory(_) | GlobalAlloc::Static(_)) {
+                return None;
+            }
+            let b = alloc.inspect_with_uninit_and_ptr_outside_interpreter(o as usize..o as usize + 2);
+            let rel = u16::from_le_bytes([b[0], b[1]]);
+            let l = p.alloc_label(target, rustc_span::DUMMY_SP);
+            return Some(format!("#{}({l}+{rel})", if off == o { '<' } else { '>' }));
+        }
+    }
+    let b = alloc.inspect_with_uninit_and_ptr_outside_interpreter(off as usize..off as usize + 1);
+    Some(format!("#${:02x}", b[0]))
+}
+
+/// The assembly-level passes over the text of one function.
+fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize) -> String {
+    let opt = crate::asm::relax(text);
+    let Some((layout, args_end)) = p.layouts.get(&id).cloned() else { return opt };
+    let opt = crate::asm::forward(&opt, id, &layout, args_end, &mut |l, o| const_byte(p, l, o));
+    crate::asm::peephole(&crate::asm::relax(&opt))
 }
 
 /// `rt_ctx_save` / `rt_ctx_restore` for interrupt dispatchers: copy what
@@ -1329,19 +1452,27 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let frame = self.frame();
         let mut defs = String::new();
         let mut off = 0;
+        let mut layout = crate::asm::FrameLayout::new();
+        let mut args_end = 0;
         let touched = self.touched.borrow().clone();
         for (l, _) in self.mir.local_decls.iter_enumerated() {
             let i = l.as_usize();
             if i > self.mir.arg_count && !touched[i] {
                 continue;
             }
+            let size = self.layout(self.local_ty(l)).size.bytes();
             let _ = writeln!(defs, "F{id}v{i} = {frame}+{off}");
+            layout.insert(format!("F{id}v{i}"), (off, size));
             if i <= self.mir.arg_count {
                 let _ = writeln!(defs, "L{id}_{i} = {frame}+{off}");
+                layout.insert(format!("L{id}_{i}"), (off, size));
+                args_end = off + size;
             }
-            off += self.layout(self.local_ty(l)).size.bytes();
+            off += size;
         }
         let _ = writeln!(defs, "F{id}t = {frame}+{off}");
+        layout.insert(format!("F{id}t"), (off, self.temp_max));
+        self.p.layouts.insert(id, (layout, args_end));
         self.p.frames.push((id, off + self.temp_max, defs));
         let args = (1..=self.mir.arg_count).map(|l| self.local_ty(Local::from_usize(l))).collect();
         let ret = self.layout(self.local_ty(Local::from_usize(0))).size.bytes();
@@ -3350,7 +3481,126 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.call(func, &args, Place::return_place());
                 self.a().ins("rts");
             }
+            TerminatorKind::InlineAsm { template, operands, targets, .. } => {
+                self.inline_asm(template, operands);
+                match targets.first() {
+                    Some(t) => self.goto(*t, next),
+                    // options(noreturn): the code does not come back
+                    None => {}
+                }
+            }
             other => self.fatal(format!("{other:?} is not supported")),
+        }
+    }
+
+    /// `asm!`: the lines of the template become part of the function.
+    ///
+    /// Values live in memory here, not in registers, so a placeholder
+    /// stands for the memory location of its operand (an address
+    /// expression: `lda {x}`, `sta {x}+1`), whatever register class the
+    /// operand names:
+    ///
+    /// * `in(reg) value`: where the value is; a constant or a value behind
+    ///   a pointer is copied to a temporary first.
+    /// * `out(reg) place`, `inout`, `lateout`: where the result goes; a
+    ///   place behind a pointer gets a temporary that is copied afterwards.
+    /// * `const N`: the number. `sym STATIC`: the label of the static.
+    ///
+    /// A, X, Y and the flags are free inside the block and undefined
+    /// after it. The block gets labels of its own before and after: local
+    /// `@labels` of the template stay inside it, and the peephole pass
+    /// forgets what it knew about the registers.
+    fn inline_asm(&mut self, template: &[InlineAsmTemplatePiece], operands: &[InlineAsmOperand<'tcx>]) {
+        let mut names: Vec<String> = Vec::with_capacity(operands.len());
+        // (place, temporary, size) to copy after the block
+        let mut after: Vec<(Place<'tcx>, String, u64)> = Vec::new();
+        for op in operands {
+            let name = match op {
+                InlineAsmOperand::In { value, .. } => {
+                    let (v, l) = self.operand(value);
+                    match v {
+                        Val::Mem(Addr::Abs(e)) => e,
+                        v => {
+                            let n = l.size.bytes();
+                            let t = self.temp(n.max(1));
+                            self.a().copy(&Addr::Abs(t.clone()), &v, n);
+                            t
+                        }
+                    }
+                }
+                InlineAsmOperand::Out { place, .. } => match place {
+                    Some(p) => {
+                        let (a, l, _) = self.place(*p);
+                        match a {
+                            Addr::Abs(e) => e,
+                            _ => {
+                                let n = l.size.bytes();
+                                let t = self.temp(n.max(1));
+                                after.push((*p, t.clone(), n));
+                                t
+                            }
+                        }
+                    }
+                    None => self.temp(2),
+                },
+                InlineAsmOperand::InOut { in_value, out_place, .. } => {
+                    let (v, l) = self.operand(in_value);
+                    let n = l.size.bytes();
+                    let t = self.temp(n.max(1));
+                    self.a().copy(&Addr::Abs(t.clone()), &v, n);
+                    if let Some(p) = out_place {
+                        after.push((*p, t.clone(), n));
+                    }
+                    t
+                }
+                InlineAsmOperand::Const { value } => {
+                    let op = Operand::Constant(value.clone());
+                    match self.const_bits(&op) {
+                        Some(c) => format!("{c}"),
+                        None => self.fatal("asm!: the `const` operand is not an integer"),
+                    }
+                }
+                InlineAsmOperand::SymStatic { def_id } => {
+                    if self.tcx().is_foreign_item(*def_id) {
+                        self.fatal("asm!: extern statics are not supported yet")
+                    }
+                    format!("S{}", self.p.statics.insert_full(*def_id).0)
+                }
+                InlineAsmOperand::SymFn { .. } | InlineAsmOperand::Label { .. } => {
+                    self.fatal("asm!: `sym` of a function and `label` operands are not supported yet")
+                }
+            };
+            names.push(name);
+        }
+        let mut text = String::new();
+        for piece in template {
+            match piece {
+                InlineAsmTemplatePiece::String(s) => text.push_str(s),
+                InlineAsmTemplatePiece::Placeholder { operand_idx, .. } => text.push_str(&names[*operand_idx]),
+            }
+        }
+        let id = self.id;
+        let a = &mut self.p.asm;
+        let n = a.new_label();
+        let n = n.trim_start_matches("_L");
+        a.label(&format!("F{id}_i{n}"));
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            // `label:` or `label: instruction` starts in the first column
+            let first = t.split_whitespace().next().unwrap_or("");
+            if first.ends_with(':') {
+                a.raw(t);
+            } else {
+                a.ins(t);
+            }
+        }
+        a.label(&format!("F{id}_e{n}"));
+        for (place, t, n) in after {
+            let (d, _, _) = self.place(place);
+            self.a().copy(&d, &Val::Mem(Addr::Abs(t)), n);
         }
     }
 
@@ -3437,29 +3687,50 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     fn foreign_call(&mut self, inst: Instance<'tcx>, args: &[Operand<'tcx>], dest: Place<'tcx>) {
         let sym = self.tcx().symbol_name(inst).name.to_owned();
         let mut off = 0;
+        let mut first: Vec<Option<String>> = Vec::new();
         for arg in args {
             let (v, l) = self.operand(arg);
             let n = l.size.bytes();
             self.a().copy(&Addr::Abs(format!("{sym}__args+{off}")), &v, n);
+            for i in 0..n {
+                // not a numeric address: an I/O register is read once
+                first.push(v.byte(i).filter(|b| b.starts_with('#') || !b.contains('$')));
+            }
             off += n;
         }
+        first.resize(3, None);
         let rsize = self.layout(self.monomorphize(dest.ty(self.mir, self.tcx()).ty)).size.bytes();
         let e = self.p.foreign.entry(sym.clone()).or_default();
         e.0 = e.0.max(off);
         e.1 = e.1.max(rsize);
+        // The first three bytes go into A, X and Y: straight from where
+        // they are, if that needs no code (the copies in the argument area
+        // are removed later if the routine does not read them).
         let a = &mut self.p.asm;
         for (i, r) in ["lda", "ldx", "ldy"].iter().enumerate().take(off.min(3) as usize) {
-            a.ins(format!("{r} {sym}__args+{i}"));
+            match &first[i] {
+                Some(b) => a.ins(format!("{r} {b}")),
+                None => a.ins(format!("{r} {sym}__args+{i}")),
+            }
         }
         a.ins(format!("jsr {sym}"));
         if rsize > 0 {
-            if rsize <= 3 {
-                for (i, r) in ["sta", "stx", "sty"].iter().enumerate().take(rsize as usize) {
-                    a.ins(format!("{r} {sym}__res+{i}"));
+            let (d, _, _) = self.place(dest);
+            match &d {
+                Addr::Abs(e) if rsize <= 3 => {
+                    for (i, r) in ["sta", "stx", "sty"].iter().enumerate().take(rsize as usize) {
+                        self.a().ins(format!("{r} {e}+{i}"));
+                    }
+                }
+                _ => {
+                    if rsize <= 3 {
+                        for (i, r) in ["sta", "stx", "sty"].iter().enumerate().take(rsize as usize) {
+                            self.a().ins(format!("{r} {sym}__res+{i}"));
+                        }
+                    }
+                    self.a().copy(&d, &Val::Mem(Addr::Abs(format!("{sym}__res"))), rsize);
                 }
             }
-            let (d, _, _) = self.place(dest);
-            self.a().copy(&d, &Val::Mem(Addr::Abs(format!("{sym}__res"))), rsize);
         }
     }
 
@@ -3618,6 +3889,36 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 a.ins("sta rt_r");
                 let r = Val::Mem(Addr::Abs("rt_r".into()));
                 self.extend(&d, &r, 1, dl.size.bytes(), false);
+            }
+            "saturating_add" | "saturating_sub" => {
+                // Unsigned: on a carry (a borrow) the result is all ones
+                // (zero).
+                let (va, l) = self.operand(&args[0]);
+                let (vb, _) = self.operand(&args[1]);
+                if Self::is_signed(l.ty) {
+                    self.fatal(format!("intrinsic `{name}` is not supported yet for signed integers"))
+                }
+                let n = l.size.bytes();
+                let add = name.as_str() == "saturating_add";
+                let (d, _, _) = self.place(dest);
+                let t = self.temp(n);
+                let a = &mut self.p.asm;
+                a.setup_val(&va, 0);
+                a.setup_val(&vb, 1);
+                a.ins(if add { "clc" } else { "sec" });
+                for i in 0..n {
+                    a.lda(&va, i, 0);
+                    a.op_byte(if add { "adc" } else { "sbc" }, &vb, i, 1);
+                    a.ins(format!("sta {t}+{i}"));
+                }
+                let ok = a.new_label();
+                a.ins(format!("{} {ok}", if add { "bcc" } else { "bcs" }));
+                a.ins(if add { "lda #$ff" } else { "lda #$00" });
+                for i in 0..n {
+                    a.ins(format!("sta {t}+{i}"));
+                }
+                a.label(&ok);
+                a.copy(&d, &Val::Mem(Addr::Abs(t)), n);
             }
             "bswap" => {
                 let (v, l) = self.operand(&args[0]);

@@ -15,10 +15,14 @@ pub const HEIGHT: u8 = 25;
 
 const COLOR_RAM: u16 = 0xd800;
 
+// The statics are exported for the assembly routines (rat/text.rat).
+#[unsafe(export_name = "c64_text_screen")]
 static mut SCREEN: u16 = 0x0400;
+#[unsafe(export_name = "c64_text_lower")]
 static mut LOWER: bool = false;
 
 /// `row * 40`
+#[unsafe(export_name = "c64_text_rows")]
 static ROW_OFFSET: [u16; 25] = [
     0, 40, 80, 120, 160, 200, 240, 280, 320, 360, 400, 440, 480, 520, 560, 600, 640, 680, 720, 760,
     800, 840, 880, 920, 960,
@@ -41,6 +45,13 @@ pub fn screen_addr() -> u16 {
 
 /// Converts an ASCII character to PETSCII for the current character set.
 pub fn petscii(c: u8) -> u8 {
+    #[cfg(target_os = "c64")]
+    {
+        let r: u8;
+        unsafe { crate::asm!("lda {c}", "jsr c64_text_petscii", "sta {r}", c = in(reg) c, r = out(reg) r) };
+        r
+    }
+    #[cfg(not(target_os = "c64"))]
     match c {
         b'\n' => kernal::RETURN,
         b'a'..=b'z' => c - 0x20,
@@ -71,6 +82,11 @@ pub const fn petscii_str<const N: usize>(s: &str, lower: bool) -> [u8; N] {
 /// Prints PETSCII bytes as they are (no conversion), e.g. a [`crate::p!`]
 /// literal or a file name read from disk.
 pub fn print_petscii(s: &[u8]) {
+    #[cfg(target_os = "c64")]
+    unsafe {
+        c64_text_print(s.as_ptr(), s.len() as u16, 0)
+    }
+    #[cfg(not(target_os = "c64"))]
     for &c in s {
         kernal::chrout(c);
     }
@@ -78,6 +94,13 @@ pub fn print_petscii(s: &[u8]) {
 
 /// Converts a PETSCII character to a screen code.
 pub fn petscii_to_screen(c: u8) -> u8 {
+    #[cfg(target_os = "c64")]
+    {
+        let r: u8;
+        unsafe { crate::asm!("lda {c}", "jsr c64_text_p2s", "sta {r}", c = in(reg) c, r = out(reg) r) };
+        r
+    }
+    #[cfg(not(target_os = "c64"))]
     match c {
         0x00..=0x1f => c + 0x80,
         0x20..=0x3f => c,
@@ -93,6 +116,13 @@ pub fn petscii_to_screen(c: u8) -> u8 {
 /// Converts an ASCII character to a screen code for the current character
 /// set.
 pub fn screen_code(c: u8) -> u8 {
+    #[cfg(target_os = "c64")]
+    {
+        let r: u8;
+        unsafe { crate::asm!("lda {c}", "jsr c64_text_screen_code", "sta {r}", c = in(reg) c, r = out(reg) r) };
+        r
+    }
+    #[cfg(not(target_os = "c64"))]
     petscii_to_screen(petscii(c))
 }
 
@@ -101,8 +131,28 @@ pub struct Console;
 
 impl Write for Console {
     fn write_byte(&mut self, b: u8) {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            crate::asm!("lda {b}", "jsr c64_text_petscii", "jsr $ffd2", b = in(reg) b)
+        }
+        #[cfg(not(target_os = "c64"))]
         kernal::chrout(petscii(b));
     }
+
+    #[cfg(target_os = "c64")]
+    fn write_bytes(&mut self, s: &[u8]) {
+        unsafe { c64_text_print(s.as_ptr(), s.len() as u16, 1) }
+    }
+}
+
+#[cfg(target_os = "c64")]
+crate::rat_source!(TEXT_RAT, "rat/text.rat");
+
+#[cfg(target_os = "c64")]
+unsafe extern "C" {
+    fn c64_text_print(s: *const u8, len: u16, convert: u8);
+    fn c64_text_put_char(col: u8, row: u8, code: u8, color: u8);
+    fn c64_text_put_str(col: u8, row: u8, s: *const u8, len: u16, color: u8);
 }
 
 /// Prints `s` at the cursor.
@@ -157,19 +207,33 @@ pub fn offset(col: u8, row: u8) -> u16 {
 
 /// Writes a screen code and its colour.
 pub fn put_char(col: u8, row: u8, code: u8, color: Color) {
-    let off = offset(col, row);
-    mem::poke(screen_addr() + off, code);
-    mem::poke(COLOR_RAM + off, color as u8);
+    #[cfg(target_os = "c64")]
+    unsafe {
+        c64_text_put_char(col, row, code, color as u8)
+    }
+    #[cfg(not(target_os = "c64"))]
+    {
+        let off = offset(col, row);
+        mem::poke(screen_addr() + off, code);
+        mem::poke(COLOR_RAM + off, color as u8);
+    }
 }
 
 /// Writes `s` at a position with a colour, without moving the cursor.
 pub fn put_str(col: u8, row: u8, s: &str, color: Color) {
-    let mut off = offset(col, row);
-    let scr = screen_addr();
-    for &b in s.as_bytes() {
-        mem::poke(scr + off, screen_code(b));
-        mem::poke(COLOR_RAM + off, color as u8);
-        off += 1;
+    #[cfg(target_os = "c64")]
+    unsafe {
+        c64_text_put_str(col, row, s.as_ptr(), s.len() as u16, color as u8)
+    }
+    #[cfg(not(target_os = "c64"))]
+    {
+        let mut off = offset(col, row);
+        let scr = screen_addr();
+        for &b in s.as_bytes() {
+            mem::poke(scr + off, screen_code(b));
+            mem::poke(COLOR_RAM + off, color as u8);
+            off += 1;
+        }
     }
 }
 

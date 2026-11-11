@@ -1,0 +1,112 @@
+; c64::sound: the SID's voices (calling convention: see c64::rat_source!).
+; c64_sound_shadow (the control registers, which cannot be read back) and
+; c64_sound_freq (the note table) are statics of sound.rs.
+
+; A = voice: X = the offset of its registers (0, 7, 14), Y = voice % 3.
+c64_sound_voice:
+@mod:   cmp #3
+        bcc @ok
+        sbc #3
+        bcs @mod
+@ok:    tay
+        ldx @offset,y
+        rts
+@offset:
+        .byte 0, 7, 14
+
+; c64_sound_control(voice: u8, value: u8): the control register
+c64_sound_control:
+        jsr c64_sound_voice
+        lda c64_sound_control__args+1
+        sta c64_sound_shadow,y
+        sta $d404,x
+        rts
+
+; c64_sound_note_off(voice: u8): gate off
+c64_sound_note_off:
+        jsr c64_sound_voice
+        lda c64_sound_shadow,y
+        and #$fe
+        sta c64_sound_shadow,y
+        sta $d404,x
+        rts
+
+; c64_sound_reg16(voice: u8, reg: u8, value: u16): frequency (reg 0) or
+; pulse width (reg 2)
+c64_sound_reg16:
+        jsr c64_sound_voice
+        txa
+        clc
+        adc c64_sound_reg16__args+1
+        tax
+        lda c64_sound_reg16__args+2
+        sta $d400,x
+        lda c64_sound_reg16__args+3
+        sta $d401,x
+        rts
+
+; c64_sound_adsr(voice: u8, attack: u8, decay: u8, sustain: u8, release: u8)
+c64_sound_adsr:
+        jsr c64_sound_voice
+        ldy #0
+@pair:  lda c64_sound_adsr__args+1,y
+        asl
+        asl
+        asl
+        asl
+        sta rt_t
+        lda c64_sound_adsr__args+2,y
+        and #15
+        ora rt_t
+        sta $d405,x
+        inx
+        iny
+        iny
+        cpy #4
+        bne @pair
+        rts
+
+; c64_sound_note_on(voice: u8, note: u8, wave: u8): the note's frequency,
+; then the waveform with the gate on
+c64_sound_note_on:
+        jsr c64_sound_voice
+        sty rt_t
+        lda c64_sound_note_on__args+1
+        cmp #96
+        bcc @note
+        lda #95
+@note:  asl
+        tay
+        lda c64_sound_freq,y
+        sta $d400,x
+        lda c64_sound_freq+1,y
+        sta $d401,x
+        ldy rt_t
+        lda c64_sound_note_on__args+2
+        ora #1
+        sta c64_sound_shadow,y
+        sta $d404,x
+        rts
+
+; c64_sound_reset(): silence
+c64_sound_reset:
+        lda #0
+        ldx #2
+@copy:  sta c64_sound_shadow,x
+        dex
+        bpl @copy
+        ldx #14
+@voice: sta $d404,x
+        sta $d405,x
+        sta $d406,x
+        pha
+        txa
+        sec
+        sbc #7
+        tax
+        pla
+        bcs @voice
+        sta c64_sound_modevol
+        sta $d418
+        sta $d417
+        rts

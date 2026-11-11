@@ -4,6 +4,9 @@
 //! (a check failed or it panicked); the screen shows the number of the
 //! first failing check at the top left.
 //!
+//! A test that needs an emulated device (SD2IEC, the Ultimate's command
+//! interface, a WiC64) lists the options for mimic in a file `mimic.args`.
+//!
 //! Tools: `RUST64_MIMIC_HEADLESS` (default: ../mimic/target/release next to
 //! this repository) and the C64 ROMs (`EMU_ROM_DIR` or ~/.mimic/roms).
 
@@ -48,13 +51,18 @@ fn run_program(dir: &Path, release: bool) -> Result<(), String> {
     let prg = dir.join(format!("target/mos-c64/{profile}/{name}-test.prg"));
     let snap = std::env::temp_dir().join(format!("rust64-e2e-{name}-{profile}.png"));
     let _ = std::fs::remove_file(&snap);
-    let status = Command::new(mimic().unwrap())
-        .args(["--machine", "c64", "--autostart", "--frames", "600", "--prg"])
-        .arg(&prg)
-        .arg("--snapshot")
-        .arg(&snap)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut run = Command::new(mimic().unwrap());
+    run.args(["--machine", "c64", "--autostart", "--frames", "600", "--prg"]).arg(&prg);
+    run.arg("--snapshot").arg(&snap);
+    // Devices the test needs: more options for mimic, one per line in
+    // `mimic.args` (`{dir}` is the directory of the test).
+    if let Ok(extra) = std::fs::read_to_string(dir.join("mimic.args")) {
+        let here = dir.to_str().unwrap().trim_start_matches(r"\\?\");
+        for line in extra.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            run.arg(line.replace("{dir}", here));
+        }
+    }
+    let status = run.status().map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("mimic-headless failed".into());
     }

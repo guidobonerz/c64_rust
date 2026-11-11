@@ -1,0 +1,21 @@
+; c64-uaudio: the Ultimate Audio sampler at $DF20 (calling convention: see
+; c64::rat_source!). Each voice has 32 write-only registers; numbers of
+; more than one byte have the high byte first.
+
+; c64_uaudio_set(voice: u8, reg: u8, value: u32, bytes: u8): the lowest
+; `bytes` bytes of value into the registers from reg on, high byte first.
+c64_uaudio_set:
+        asl
+        asl
+        asl
+        asl
+        asl
+        ora c64_uaudio_set__args+1
+        tax
+        ldy c64_uaudio_set__args+6
+@byte:  lda c64_uaudio_set__args+1,y
+        sta $df20,x
+        inx
+        dey
+        bne @byte
+        rts

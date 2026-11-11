@@ -1,0 +1,212 @@
+; c64::text and c64::fmt: character conversion, text on the screen,
+; numbers (calling convention: see c64::rat_source!; the first three
+; routines take and return the character in A).
+;
+; c64_text_lower, c64_text_screen and c64_text_rows are statics of text.rs:
+; whether the lower/upper case character set is on, the address of the
+; screen, and row * 40 for the 25 rows.
+
+; ASCII in A to PETSCII for the current character set. Leaves Y alone.
+c64_text_petscii:
+        cmp #10
+        bne @char
+        lda #13
+        rts
+@char:  cmp #$61
+        bcc @upper
+        cmp #$7b
+        bcs @done
+        sbc #$1f                ; a-z: - $20 (the carry is clear)
+        rts
+@upper: cmp #$41
+        bcc @done
+        cmp #$5b
+        bcs @done
+        ldx c64_text_lower
+        beq @done
+        ora #$80                ; A-Z with lower case on: + $80
+@done:  rts
+
+; ASCII in A to a screen code. Leaves Y alone.
+c64_text_screen_code:
+        jsr c64_text_petscii
+; PETSCII in A to a screen code. Leaves X and Y alone.
+c64_text_p2s:
+        cmp #$ff
+        bne @range
+        lda #$5e
+        rts
+@range: cmp #$20
+        bcs @r20
+        ora #$80                ; $00-$1f: + $80
+        rts
+@r20:   cmp #$40
+        bcc @done               ; $20-$3f
+        cmp #$60
+        bcs @r60
+        and #$bf                ; $40-$5f: - $40
+        rts
+@r60:   cmp #$80
+        bcs @r80
+        and #$df                ; $60-$7f: - $20
+        rts
+@r80:   cmp #$a0
+        bcs @ra0
+        ora #$40                ; $80-$9f: + $40
+        rts
+@ra0:   cmp #$c0
+        bcs @rc0
+        sbc #$3f                ; $a0-$bf: - $40 (the carry is clear)
+        rts
+@rc0:   and #$7f                ; $c0-$fe: - $80
+@done:  rts
+
+; c64_text_print(s: *const u8, len: u16, convert: u8): the bytes through
+; CHROUT; converted from ASCII first unless convert is 0.
+c64_text_print:
+        lda c64_text_print__args
+        sta zp_p0
+        lda c64_text_print__args+1
+        sta zp_p0+1
+@loop:  lda c64_text_print__args+2
+        bne @count
+        lda c64_text_print__args+3
+        beq @done
+        dec c64_text_print__args+3
+@count: dec c64_text_print__args+2
+        ldy #0
+        lda (zp_p0),y
+        ldx c64_text_print__args+4
+        beq @raw
+        jsr c64_text_petscii
+@raw:   jsr $ffd2
+        inc zp_p0
+        bne @loop
+        inc zp_p0+1
+        bne @loop
+@done:  rts
+
+; A = column, X = row: zp_p1 = the cell in the screen, zp_p2 = the cell in
+; the colour RAM.
+c64_text_cell:
+        sta zp_p2
+        txa
+        asl
+        tax
+        clc
+        lda c64_text_rows,x
+        adc zp_p2
+        sta zp_p2
+        lda c64_text_rows+1,x
+        adc #0
+        tay
+        clc
+        lda zp_p2
+        adc c64_text_screen
+        sta zp_p1
+        tya
+        adc c64_text_screen+1
+        sta zp_p1+1
+        tya
+        clc
+        adc #$d8
+        sta zp_p2+1
+        rts
+
+; c64_text_put_char(col: u8, row: u8, code: u8, color: u8)
+c64_text_put_char:
+        jsr c64_text_cell
+        ldy #0
+        lda c64_text_put_char__args+2
+        sta (zp_p1),y
+        lda c64_text_put_char__args+3
+        sta (zp_p2),y
+        rts
+
+; c64_text_put_str(col: u8, row: u8, s: *const u8, len: u16, color: u8):
+; ASCII text as screen codes, with its colour.
+c64_text_put_str:
+        jsr c64_text_cell
+        lda c64_text_put_str__args+2
+        sta zp_p0
+        lda c64_text_put_str__args+3
+        sta zp_p0+1
+        ldy #0
+@loop:  lda c64_text_put_str__args+4
+        bne @count
+        lda c64_text_put_str__args+5
+        beq @done
+        dec c64_text_put_str__args+5
+@count: dec c64_text_put_str__args+4
+        lda (zp_p0),y
+        jsr c64_text_screen_code
+        sta (zp_p1),y
+        lda c64_text_put_str__args+6
+        sta (zp_p2),y
+        iny
+        bne @loop
+        inc zp_p0+1
+        inc zp_p1+1
+        inc zp_p2+1
+        bne @loop
+@done:  rts
+
+; c64_fmt_dec(n: u32) -> u8: n in decimal (1-10 digits) at rt_b (which
+; runs on into rt_r), returns the number of digits. Powers of ten are
+; subtracted until the number goes below zero; that counts the digit.
+c64_fmt_dec:
+        ldy #0                  ; digits written
+        ldx #0                  ; the power of ten (4 bytes each)
+        lda c64_fmt_dec__args+2
+        ora c64_fmt_dec__args+3
+        bne @power
+        ldx #20                 ; below 65536: start with 10000
+@power: lda #$2f
+        sta rt_t
+@sub:   inc rt_t
+        sec
+        lda c64_fmt_dec__args
+        sbc @pow10,x
+        sta c64_fmt_dec__args
+        lda c64_fmt_dec__args+1
+        sbc @pow10+1,x
+        sta c64_fmt_dec__args+1
+        lda c64_fmt_dec__args+2
+        sbc @pow10+2,x
+        sta c64_fmt_dec__args+2
+        lda c64_fmt_dec__args+3
+        sbc @pow10+3,x
+        sta c64_fmt_dec__args+3
+        bcs @sub
+        lda c64_fmt_dec__args   ; one too many: add it back
+        adc @pow10,x
+        sta c64_fmt_dec__args
+        lda c64_fmt_dec__args+1
+        adc @pow10+1,x
+        sta c64_fmt_dec__args+1
+        lda c64_fmt_dec__args+2
+        adc @pow10+2,x
+        sta c64_fmt_dec__args+2
+        lda c64_fmt_dec__args+3
+        adc @pow10+3,x
+        sta c64_fmt_dec__args+3
+        lda rt_t
+        cmp #$30
+        bne @digit
+        cpy #0
+        beq @next               ; no leading zeros
+@digit: sta rt_b,y
+        iny
+@next:  inx
+        inx
+        inx
+        inx
+        cpx #36
+        bne @power
+        lda c64_fmt_dec__args
+        ora #$30
+        sta rt_b,y
+        iny
+        tya
+        rts
+@pow10: .long 1000000000, 100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10

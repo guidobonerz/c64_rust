@@ -206,12 +206,64 @@ impl Asm {
                 return;
             }
         }
+        if (4..=16).contains(&size)
+            && let Val::Mem(s) = src
+            && self.copy_loop(dst, s, size)
+        {
+            return;
+        }
         self.setup_val(src, 0);
         self.setup(dst, 2);
         for i in 0..size {
             self.lda(src, i, 0);
             self.sta(dst, i, 2);
         }
+    }
+
+    /// A copy through a pointer as a loop (10 to 13 bytes, where one byte
+    /// costs 6 unrolled); false: not for these operands. The label is a
+    /// `_C` label: [`zp_direct`] knows that the pointer registers are the
+    /// same on both sides of it.
+    fn copy_loop(&mut self, dst: &Addr, src: &Addr, size: u64) -> bool {
+        // not an I/O register: those are written once, in order
+        let plain = |e: &str| !e.contains('$');
+        let n = size - 1;
+        let (load, store, y, x) = match (src, dst) {
+            (Addr::Ind { off, .. }, Addr::Abs(d)) if plain(d) && off + size <= 128 => {
+                if *off == 0 {
+                    (format!("lda ({}),y", ZP[0]), format!("sta {d},y"), n, false)
+                } else {
+                    (format!("lda ({}),y", ZP[0]), format!("sta {d},x"), off + n, true)
+                }
+            }
+            (Addr::Abs(e), Addr::Ind { off, .. }) if plain(e) && off + size <= 128 => {
+                if *off == 0 {
+                    (format!("lda {e},y"), format!("sta ({}),y", ZP[2]), n, false)
+                } else {
+                    (format!("lda {e},x"), format!("sta ({}),y", ZP[2]), off + n, true)
+                }
+            }
+            (Addr::Ind { off, .. }, Addr::Ind { off: doff, .. }) if off == doff && off + size <= 128 => {
+                (format!("lda ({}),y", ZP[0]), format!("sta ({}),y", ZP[2]), off + n, *off != 0)
+            }
+            _ => return false,
+        };
+        self.setup(src, 0);
+        self.setup(dst, 2);
+        let l = format!("_C{}", LABELS.fetch_add(1, Ordering::Relaxed) + 1);
+        if x {
+            self.ins(format!("ldx #{n}"));
+        }
+        self.ins(format!("ldy #{y}"));
+        self.label(&l);
+        self.ins(load);
+        self.ins(store);
+        self.ins("dey");
+        if x {
+            self.ins("dex");
+        }
+        self.ins(format!("bpl {l}"));
+        true
     }
 
     /// Stores the address of `a` into the two bytes at `dst` (an absolute
@@ -450,6 +502,12 @@ fn label_follows(lines: &[Line], i: usize, name: &str) -> bool {
 /// * labels nothing refers to any more are removed (the peephole pass then
 ///   sees through them). Only local labels (`_L…`, `F…_b…`) are touched.
 pub fn relax(text: &str) -> String {
+    relax_with(text, &|op, arg| max_size(op, arg), 110)
+}
+
+/// [`relax`] with the sizes of the lines given by `size` (upper bounds)
+/// and branches allowed up to `range` bytes away.
+pub fn relax_with(text: &str, size: &dyn Fn(&str, &str) -> i64, range: i64) -> String {
     let mut lines: Vec<Line> = text
         .lines()
         .map(|l| {
@@ -480,8 +538,21 @@ pub fn relax(text: &str) -> String {
                 Line::Label(n) => {
                     label_pos.insert(n.clone(), (i, at));
                 }
-                Line::Ins(op, arg) => at += max_size(op, arg),
-                Line::Other(_) => {}
+                Line::Ins(op, arg) => at += size(op, arg),
+                Line::Other(s) => {
+                    // a label with code after it, or something unknown
+                    let t = s.split(';').next().unwrap_or("").trim();
+                    if !t.is_empty() && !t.contains('=') {
+                        at += match t.split_once(':') {
+                            Some((_, rest)) if rest.trim().is_empty() => 0,
+                            Some((_, rest)) => {
+                                let (op, arg) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+                                size(op, arg.trim())
+                            }
+                            None => 100_000,
+                        };
+                    }
+                }
             }
         }
         // 1. thread jumps: jmp L where L: jmp T / rts
@@ -532,7 +603,7 @@ pub fn relax(text: &str) -> String {
             }
             let Some(&(_, tpos)) = label_pos.get(target) else { continue };
             let d = tpos - (pos[i] + 2);
-            if (-110..=110).contains(&d) {
+            if (-range..=range).contains(&d) {
                 let target = target.clone();
                 lines[i] = Line::Ins(opp.to_owned(), target);
                 lines[j] = Line::Other(String::new());
@@ -542,13 +613,24 @@ pub fn relax(text: &str) -> String {
         // 4. unreferenced local labels
         let mut used = std::collections::HashSet::new();
         for l in &lines {
-            if let Line::Ins(_, arg) = l {
-                used.insert(arg.clone());
+            if let Line::Ins(_, arg) | Line::Other(arg) = l {
+                for w in arg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    used.insert(w.to_owned());
+                }
             }
         }
+        // (block labels too: the passes after this see through them)
+        let block = |n: &str| {
+            n.strip_prefix('F').and_then(|r| r.split_once("_b")).is_some_and(|(id, b)| {
+                !id.is_empty()
+                    && !b.is_empty()
+                    && id.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            })
+        };
         for l in lines.iter_mut() {
             if let Line::Label(n) = l
-                && n.starts_with("_L")
+                && (n.starts_with("_L") || block(n))
                 && !used.contains(n.as_str())
             {
                 *l = Line::Other(String::new());
@@ -736,7 +818,7 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
         while end < lines.len() {
             let Some((op, arg)) = ins(&lines[end]) else {
                 let t = lines[end].trim();
-                if t.is_empty() || t.starts_with(';') {
+                if t.is_empty() || t.starts_with(';') || t.starts_with("_C") {
                     end += 1;
                     continue;
                 }
@@ -770,7 +852,7 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
             for l in &lines[i + 4..] {
                 let Some((op, _)) = ins(l) else {
                     let t = l.trim();
-                    if t.is_empty() || t.starts_with(';') {
+                    if t.is_empty() || t.starts_with(';') || t.starts_with("_C") {
                         continue;
                     }
                     break; // a label
@@ -892,4 +974,456 @@ pub fn touches_hw(text: &str) -> bool {
         }
     }
     false
+}
+
+/// `X+2+1` -> (`X`, 3); `None` if the operand is not a symbol plus offsets.
+fn sym_off(arg: &str) -> Option<(&str, u64)> {
+    let mut parts = arg.split('+');
+    let base = parts.next()?;
+    let mut chars = base.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let mut off = 0;
+    for p in parts {
+        off += p.parse::<u64>().ok()?;
+    }
+    Some((base, off))
+}
+
+/// One line of a function for [`forward`].
+enum FLine {
+    /// A label, or a line the pass does not read (kept as it is): what is
+    /// known about memory and A is forgotten there.
+    Barrier(String),
+    Ins(String, String),
+    /// A comment or an empty line.
+    Other(String),
+    Removed,
+}
+
+/// Where the names of a function's frame are: name -> (offset in the
+/// frame, size). Two names can mean the same bytes (`L<id>_<n>` and
+/// `F<id>v<n>`; a caller fills several arguments through one name), so the
+/// passes identify a byte by its offset.
+pub type FrameLayout = std::collections::HashMap<String, (u64, u64)>;
+
+/// Forwards copies inside one function and removes what that leaves dead.
+/// The bytes of the function's own frame (`layout`) can only be changed by
+/// this function's code, unless their address is taken or they are indexed
+/// ("escaped"), so:
+/// * in straight-line code, a read of a byte that holds a copy of an
+///   immediate or of another byte reads the original instead,
+/// * a read of constant data whose bytes are known (`konst`) becomes an
+///   immediate,
+/// * a store to a byte that is never read is removed (not below
+///   `args_end`: the result and the arguments, which other functions use),
+/// * a load of A directly followed by another load of A is removed.
+pub fn forward(
+    text: &str,
+    id: usize,
+    layout: &FrameLayout,
+    args_end: u64,
+    konst: &mut dyn FnMut(&str, u64) -> Option<String>,
+) -> String {
+    use std::collections::{HashMap, HashSet};
+    const IMM_OK: [&str; 11] =
+        ["lda", "ldx", "ldy", "adc", "sbc", "and", "ora", "eor", "cmp", "cpx", "cpy"];
+    // The frame byte a plain operand names.
+    let own = |arg: &str| -> Option<u64> {
+        let (base, off) = sym_off(arg)?;
+        layout.get(base).map(|&(o, _)| o + off)
+    };
+
+    let mut lines: Vec<FLine> = text
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with(';') {
+                FLine::Other(l.to_owned())
+            } else if !l.starts_with(' ') || t.starts_with('.') || t.starts_with('@') {
+                FLine::Barrier(l.to_owned())
+            } else {
+                let (op, arg) = t.split_once(' ').unwrap_or((t, ""));
+                let arg = arg.split(';').next().unwrap_or("").trim();
+                FLine::Ins(op.to_ascii_lowercase(), arg.to_owned())
+            }
+        })
+        .collect();
+
+    for _ in 0..8 {
+        let mut changed = false;
+        // Escaped bytes: of names used in anything but a plain operand.
+        let mut escaped: HashSet<u64> = HashSet::new();
+        for l in &lines {
+            let s = match l {
+                FLine::Barrier(s) => s.as_str(),
+                FLine::Ins(_, arg) if own(arg).is_none() => arg.as_str(),
+                _ => continue,
+            };
+            for w in s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if let Some(&(o, n)) = layout.get(w) {
+                    escaped.extend(o..o + n);
+                }
+            }
+        }
+        let plain = |arg: &str| -> Option<u64> { own(arg).filter(|c| !escaped.contains(c)) };
+
+        // Labels of this function that nothing jumps to are no barriers.
+        let mut refd: HashSet<&str> = HashSet::new();
+        for l in &lines {
+            let s = match l {
+                FLine::Ins(_, arg) => arg.as_str(),
+                FLine::Barrier(s) if !s.trim_end().ends_with(':') => s.as_str(),
+                _ => continue,
+            };
+            refd.extend(s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')));
+        }
+        let soft: Vec<bool> = lines
+            .iter()
+            .map(|l| {
+                let FLine::Barrier(s) = l else { return false };
+                let Some(n) = s.trim_end().strip_suffix(':') else { return false };
+                let local = n.strip_prefix(&format!("F{id}_")).is_some_and(|r| {
+                    r.len() > 1
+                        && matches!(r.as_bytes()[0], b'b' | b'i' | b'e')
+                        && r[1..].bytes().all(|b| b.is_ascii_digit())
+                });
+                local && !refd.contains(n)
+            })
+            .collect();
+
+        // 1. forward copies. A value is the operand to read it with and,
+        // if it is a frame byte, which one.
+        type V = (String, Option<u64>);
+        let mut map: HashMap<u64, V> = HashMap::new();
+        let mut a: Option<V> = None;
+        for (li, l) in lines.iter_mut().enumerate() {
+            let (op, arg) = match l {
+                FLine::Ins(op, arg) => (op, arg),
+                FLine::Barrier(_) if soft[li] => continue,
+                FLine::Barrier(_) => {
+                    map.clear();
+                    a = None;
+                    continue;
+                }
+                _ => continue,
+            };
+            let kill = |map: &mut HashMap<u64, V>, c: u64| {
+                map.remove(&c);
+                map.retain(|_, v| v.1 != Some(c));
+            };
+            let holds = |a: &Option<V>, c: u64| a.as_ref().is_some_and(|v| v.1 == Some(c));
+            match op.as_str() {
+                "sta" => {
+                    if let Some(c) = plain(arg)
+                        && !holds(&a, c)
+                    {
+                        kill(&mut map, c);
+                        match &a {
+                            Some(v) => {
+                                map.insert(c, v.clone());
+                            }
+                            None => a = Some((arg.clone(), Some(c))),
+                        }
+                    }
+                }
+                "stx" | "sty" | "inc" | "dec" | "asl" | "lsr" | "rol" | "ror" => {
+                    if arg.is_empty() || arg == "a" {
+                        a = None;
+                    } else if let Some(c) = plain(arg) {
+                        kill(&mut map, c);
+                        if holds(&a, c) {
+                            a = None;
+                        }
+                    }
+                }
+                _ => {
+                    let imm_ok = IMM_OK.contains(&op.as_str());
+                    if let Some(c) = plain(arg) {
+                        if let Some(v) = map.get(&c)
+                            && (imm_ok || (op == "bit" && !v.0.starts_with('#')))
+                        {
+                            *arg = v.0.clone();
+                            changed = true;
+                        }
+                    } else if imm_ok
+                        && let Some((base, off)) = sym_off(arg)
+                        && base.len() > 1
+                        && base.starts_with('A')
+                        && base[1..].bytes().all(|b| b.is_ascii_digit())
+                        && let Some(v) = konst(base, off)
+                    {
+                        *arg = v;
+                        changed = true;
+                    }
+                    match op.as_str() {
+                        "lda" => {
+                            a = if arg.starts_with('#') {
+                                Some((arg.clone(), None))
+                            } else {
+                                plain(arg).map(|c| (arg.clone(), Some(c)))
+                            };
+                        }
+                        "ldx" | "ldy" | "cmp" | "cpx" | "cpy" | "bit" | "tax" | "tay" | "inx"
+                        | "iny" | "dex" | "dey" | "clc" | "sec" | "cli" | "sei" | "cld" | "sed"
+                        | "clv" | "pha" | "php" | "nop" | "txs" | "tsx" | "bne" | "beq" | "bcc"
+                        | "bcs" | "bpl" | "bmi" | "bvc" | "bvs" | "jmp" | "rts" | "rti" => {}
+                        "jsr" | "adc" | "sbc" | "and" | "ora" | "eor" | "pla" | "txa" | "tya"
+                        | "plp" => a = None,
+                        _ => {
+                            // unknown: forget everything
+                            a = None;
+                            map.clear();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. stores nobody reads
+        let mut read: HashSet<u64> = HashSet::new();
+        for l in &lines {
+            if let FLine::Ins(op, arg) = l
+                && !matches!(op.as_str(), "sta" | "stx" | "sty")
+                && let Some(c) = plain(arg)
+            {
+                read.insert(c);
+            }
+        }
+        for l in lines.iter_mut() {
+            if let FLine::Ins(op, arg) = l
+                && matches!(op.as_str(), "sta" | "stx" | "sty")
+                && plain(arg).is_some_and(|c| c >= args_end && !read.contains(&c))
+            {
+                *l = FLine::Removed;
+                changed = true;
+            }
+        }
+
+        // 3. a load of A that the next instruction replaces (not a read of
+        // a numeric address: that may be an I/O register)
+        let code: Vec<usize> = (0..lines.len())
+            .filter(|&i| matches!(&lines[i], FLine::Ins(..) | FLine::Barrier(_)) && !soft[i])
+            .collect();
+        for w in code.windows(2) {
+            let (FLine::Ins(op, arg), FLine::Ins(op2, _)) = (&lines[w[0]], &lines[w[1]]) else {
+                continue;
+            };
+            let simple = arg.starts_with('#') || !(arg.contains('$') || arg.contains('(') || arg.contains(','));
+            if op == "lda" && simple && matches!(op2.as_str(), "lda" | "pla" | "txa" | "tya") {
+                lines[w[0]] = FLine::Removed;
+                changed = true;
+            }
+        }
+        lines.retain(|l| !matches!(l, FLine::Removed));
+        if !changed {
+            break;
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    for l in &lines {
+        match l {
+            FLine::Ins(op, arg) if arg.is_empty() => {
+                let _ = writeln!(out, "        {op}");
+            }
+            FLine::Ins(op, arg) => {
+                let _ = writeln!(out, "        {op} {arg}");
+            }
+            FLine::Barrier(s) | FLine::Other(s) => {
+                out.push_str(s);
+                out.push('\n');
+            }
+            FLine::Removed => {}
+        }
+    }
+    out
+}
+
+/// Removes stores to argument bytes nobody reads, in `code`: the argument
+/// slots of functions (`L<id>_<n>`) and the argument areas of assembly
+/// functions (`<sym>__args`). `others` is the rest of the program (library
+/// assembly, wrappers), which may read them too. `frame` gives the frame,
+/// offset and size of a frame name (see [`FrameLayout`]). A byte counts as
+/// read if any instruction but a plain store names it; a name used in any
+/// other way (indexed, as an address, in a directive) reads all its bytes.
+/// A load of A that is replaced by the next instruction goes too.
+pub fn drop_dead_args(
+    code: &str,
+    others: &[&str],
+    frame: &dyn Fn(&str) -> Option<(usize, u64, u64)>,
+) -> String {
+    use std::collections::HashSet;
+    // A byte: (frame or name, offset).
+    let byte = |base: &str, off: u64| -> (String, u64) {
+        match frame(base) {
+            Some((id, o, _)) => (format!("F{id}f"), o + off),
+            None => (base.to_owned(), off),
+        }
+    };
+    let is_arg_store = |base: &str| -> bool {
+        if base.ends_with("__args") {
+            return true;
+        }
+        base.strip_prefix('L')
+            .and_then(|r| r.split_once('_'))
+            .is_some_and(|(id, n)| {
+                !id.is_empty()
+                    && id.bytes().all(|b| b.is_ascii_digit())
+                    && n.parse::<usize>().is_ok_and(|n| n >= 1)
+            })
+    };
+    let ins = |l: &str| -> Option<(String, String)> {
+        let t = l.split(';').next().unwrap_or("").trim();
+        if t.is_empty() || !l.starts_with(' ') || t.starts_with('.') || t.starts_with('@') {
+            return None;
+        }
+        let (op, arg) = t.split_once(' ').unwrap_or((t, ""));
+        Some((op.to_ascii_lowercase(), arg.trim().to_owned()))
+    };
+    let mut read: HashSet<(String, u64)> = HashSet::new();
+    // names of which every byte is read (not frame names: their bytes are
+    // put into `read`)
+    let mut all: HashSet<String> = HashSet::new();
+    let mut whole = |w: &str, read: &mut HashSet<(String, u64)>| match frame(w) {
+        Some((id, o, n)) => {
+            for c in o..o + n {
+                read.insert((format!("F{id}f"), c));
+            }
+        }
+        None => {
+            all.insert(w.to_owned());
+        }
+    };
+    for text in std::iter::once(&code).chain(others) {
+        for l in text.lines() {
+            let t = l.split(';').next().unwrap_or("");
+            if t.trim().is_empty() {
+                continue;
+            }
+            if let Some((op, arg)) = ins(l) {
+                if let Some((b, o)) = sym_off(&arg) {
+                    if !matches!(op.as_str(), "sta" | "stx" | "sty") {
+                        read.insert(byte(b, o));
+                    }
+                    continue;
+                }
+                for w in arg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    whole(w, &mut read);
+                }
+            } else if !t.trim_end().ends_with(':') || t.trim().contains(' ') {
+                // a directive, an equate or a label with code after it
+                let t = match t.split_once(':') {
+                    Some((_, rest)) => rest,
+                    None => t,
+                };
+                // an equate defines its name: only the right side is a use
+                let t = match t.split_once('=') {
+                    Some((_, rest)) => rest,
+                    None => t,
+                };
+                for w in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    whole(w, &mut read);
+                }
+            }
+        }
+    }
+    let mut lines: Vec<Option<&str>> = code.lines().map(Some).collect();
+    for l in lines.iter_mut() {
+        let Some((op, arg)) = ins(l.unwrap()) else { continue };
+        if matches!(op.as_str(), "sta" | "stx" | "sty")
+            && let Some((b, o)) = sym_off(&arg)
+            && is_arg_store(b)
+            && !all.contains(b)
+            && !read.contains(&byte(b, o))
+        {
+            *l = None;
+        }
+    }
+    // loads of A that the next instruction replaces
+    loop {
+        let mut changed = false;
+        let live: Vec<usize> = (0..lines.len())
+            .filter(|&i| {
+                lines[i].is_some_and(|l| {
+                    let t = l.trim();
+                    !t.is_empty() && !t.starts_with(';')
+                })
+            })
+            .collect();
+        for w in live.windows(2) {
+            let (Some((op, arg)), Some((op2, _))) = (ins(lines[w[0]].unwrap()), ins(lines[w[1]].unwrap())) else {
+                continue;
+            };
+            let simple = arg.starts_with('#') || !(arg.contains('$') || arg.contains('(') || arg.contains(','));
+            if op == "lda" && simple && matches!(op2.as_str(), "lda" | "pla" | "txa" | "tya") {
+                lines[w[0]] = None;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out = String::with_capacity(code.len());
+    for l in lines.into_iter().flatten() {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+/// The size of an instruction or directive line, given which symbols are
+/// in the zero page: exact for what the code generator emits, otherwise an
+/// upper bound (a huge one for directives that are not understood).
+pub fn line_size(op: &str, arg: &str, in_zp: &dyn Fn(&str) -> bool) -> i64 {
+    match op {
+        "bne" | "beq" | "bpl" | "bmi" | "bcc" | "bcs" | "bvc" | "bvs" => return 2,
+        "jmp" | "jsr" => return 3,
+        ".byte" => {
+            let mut n = 0;
+            let mut in_str = false;
+            let mut item = false;
+            for c in arg.chars() {
+                match c {
+                    '"' => {
+                        in_str = !in_str;
+                        item = false;
+                    }
+                    _ if in_str => n += 1,
+                    ',' => item = false,
+                    c if !c.is_whitespace() && !item => {
+                        item = true;
+                        n += 1;
+                    }
+                    _ => {}
+                }
+            }
+            return n;
+        }
+        ".word" => return 2 * arg.split(',').count() as i64,
+        _ if op.starts_with('.') => return 100_000,
+        _ => {}
+    }
+    if arg.is_empty() || arg == "a" {
+        return 1;
+    }
+    if arg.starts_with('#') || arg.starts_with('(') {
+        return 2;
+    }
+    let (base, idx) = match arg.rsplit_once(',') {
+        Some((b, i)) => (b.trim(), i.trim().to_ascii_lowercase()),
+        None => (arg, String::new()),
+    };
+    if idx == "y" && !matches!(op, "ldx" | "stx") {
+        return 3;
+    }
+    let name = base.split('+').next().unwrap_or("").trim();
+    let zp = match name.strip_prefix('$') {
+        Some(h) => base == name && u32::from_str_radix(h, 16).is_ok_and(|v| v < 256),
+        None => in_zp(name),
+    };
+    if zp { 2 } else { 3 }
 }

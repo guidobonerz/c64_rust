@@ -1,0 +1,166 @@
+; c64-wic64: the WiC64 on the user port (calling convention: see
+; c64::rat_source!).
+;
+; The WiC64 is on port B of CIA 2 ($DD01, direction $DD03). PA2 ($DD00
+; bit 2) says who sends: high the C64, low the WiC64. Every access to
+; $DD01 pulses PC2, which tells the WiC64 that a byte was written or
+; taken; it answers on FLAG2, which sets bit 4 of $DD0D (reading $DD0D
+; clears it).
+;
+; A request is "R", the command, the length of the payload (low, high)
+; and the payload. The response is a status byte (0 = ok), the length of
+; the data (low, high) and the data.
+
+; Waits for the WiC64's handshake; the carry is set if it does not come
+; within rt_t+1 units of about 0.85 seconds.
+c64_wic64_wait:
+        lda rt_t+1
+        sta rt_t+2
+        ldx #0
+        ldy #0
+@wait:  lda $dd0d
+        and #$10
+        bne @ok
+        dex
+        bne @wait
+        dey
+        bne @wait
+        dec rt_t+2
+        bne @wait
+        sec
+        rts
+@ok:    clc
+        rts
+
+; Receives a byte in A; the carry is set on a time-out.
+c64_wic64_get:
+        jsr c64_wic64_wait
+        bcs @out
+        lda $dd01
+@out:   rts
+
+; c64_wic64_request(command: u8, payload: *const u8, len: u16, wait: u8)
+; -> u8: sends a request and receives the head of the response. Returns
+; the status, or $ff if the WiC64 does not answer (`wait`: how long the
+; answer may take, in units of 0.85 s). The length of the data is then in
+; c64_wic64_left.
+c64_wic64_request:
+        lda #$ff
+        sta $dd03               ; port B: output
+        lda $dd02
+        ora #$04
+        sta $dd02               ; PA2: output
+        lda $dd00
+        ora #$04
+        sta $dd00               ; PA2 high: the C64 sends
+        lda $dd0d
+        lda #1
+        sta rt_t+1
+        lda #$52                ; "R"
+        jsr @send
+        bcs @fail
+        lda c64_wic64_request__args
+        jsr @send
+        bcs @fail
+        lda c64_wic64_request__args+3
+        jsr @send
+        bcs @fail
+        lda c64_wic64_request__args+4
+        jsr @send
+        bcs @fail
+        lda c64_wic64_request__args+1
+        sta zp_p0
+        lda c64_wic64_request__args+2
+        sta zp_p0+1
+@byte:  lda c64_wic64_request__args+3
+        bne @count
+        lda c64_wic64_request__args+4
+        beq @sent
+        dec c64_wic64_request__args+4
+@count: dec c64_wic64_request__args+3
+        ldy #0
+        lda (zp_p0),y
+        jsr @send
+        bcs @fail
+        inc zp_p0
+        bne @byte
+        inc zp_p0+1
+        bne @byte
+@sent:  lda #0
+        sta $dd03               ; port B: input
+        lda $dd00
+        and #$fb
+        sta $dd00               ; PA2 low: the WiC64 sends
+        lda c64_wic64_request__args+5
+        sta rt_t+1
+        jsr c64_wic64_get       ; the status, when the answer is ready
+        bcs @fail
+        pha
+        lda #1
+        sta rt_t+1
+        jsr c64_wic64_get
+        bcs @failed
+        sta c64_wic64_left
+        jsr c64_wic64_get
+        bcs @failed
+        sta c64_wic64_left+1
+        pla
+        rts
+@failed:
+        pla
+@fail:  lda #0
+        sta c64_wic64_left
+        sta c64_wic64_left+1
+        lda #$ff
+        rts
+@send:  sta $dd01
+        jmp c64_wic64_wait
+
+; the bytes of the response that have not been read
+c64_wic64_left:
+        .word 0
+
+; c64_wic64_read(buf: *mut u8, max: u16) -> u16: the next bytes of the
+; response, at most max; returns how many.
+c64_wic64_read:
+        lda c64_wic64_read__args
+        sta zp_p1
+        lda c64_wic64_read__args+1
+        sta zp_p1+1
+        lda #0
+        sta rt_t+3
+        sta rt_t+4
+        lda #2
+        sta rt_t+1
+@loop:  lda c64_wic64_left
+        ora c64_wic64_left+1
+        beq @done
+        lda rt_t+3
+        cmp c64_wic64_read__args+2
+        lda rt_t+4
+        sbc c64_wic64_read__args+3
+        bcs @done
+        jsr c64_wic64_get
+        bcs @done
+        ldy #0
+        sta (zp_p1),y
+        inc zp_p1
+        bne @same
+        inc zp_p1+1
+@same:  inc rt_t+3
+        bne @left
+        inc rt_t+4
+@left:  lda c64_wic64_left
+        bne @low
+        dec c64_wic64_left+1
+@low:   dec c64_wic64_left
+        jmp @loop
+@done:  lda rt_t+3
+        ldx rt_t+4
+        rts
+
+; c64_wic64_remaining() -> u16
+c64_wic64_remaining:
+        lda c64_wic64_left
+        ldx c64_wic64_left+1
+        rts

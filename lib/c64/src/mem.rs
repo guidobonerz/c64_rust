@@ -52,7 +52,24 @@ pub unsafe fn bytes(a: u16, n: u16) -> &'static mut [u8] {
 pub fn copy(dst: u16, src: u16, n: u16) {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_mem_copy(dst, src, n)
+        crate::asm!(
+            "lda {src}",
+            "sta zp_p0",
+            "lda {src}+1",
+            "sta zp_p0+1",
+            "lda {dst}",
+            "sta zp_p1",
+            "lda {dst}+1",
+            "sta zp_p1+1",
+            "lda {n}",
+            "sta rt_n",
+            "lda {n}+1",
+            "sta rt_n+1",
+            "jsr rt_memcpy",
+            src = in(reg) src,
+            dst = in(reg) dst,
+            n = in(reg) n,
+        )
     }
     #[cfg(not(target_os = "c64"))]
     for i in 0..n {
@@ -64,21 +81,26 @@ pub fn copy(dst: u16, src: u16, n: u16) {
 pub fn fill(dst: u16, n: u16, v: u8) {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_mem_fill(dst, n, v)
+        crate::asm!(
+            "lda {dst}",
+            "sta zp_p1",
+            "lda {dst}+1",
+            "sta zp_p1+1",
+            "lda {n}",
+            "sta rt_n",
+            "lda {n}+1",
+            "sta rt_n+1",
+            "lda {v}",
+            "jsr rt_memset",
+            dst = in(reg) dst,
+            n = in(reg) n,
+            v = in(reg) v,
+        )
     }
     #[cfg(not(target_os = "c64"))]
     for i in 0..n {
         poke(dst.wrapping_add(i), v);
     }
-}
-
-#[cfg(target_os = "c64")]
-crate::rat_source!(MEM_RAT, "rat/mem.rat");
-
-#[cfg(target_os = "c64")]
-unsafe extern "C" {
-    fn c64_mem_copy(dst: u16, src: u16, n: u16);
-    fn c64_mem_fill(dst: u16, n: u16, v: u8);
 }
 
 #[cfg(not(target_os = "c64"))]

@@ -1,0 +1,109 @@
+; c64-ui: boxes on the text screen (calling convention: see
+; c64::rat_source!). Uses c64::text's routines for the cell address and
+; the conversion of the title.
+
+; c64_ui_box(col: u8, row: u8, w: u8, h: u8, style: u8, color: u8,
+;            title: *const u8, len: u8)
+; style: bit 0 = round corners, bit 1 = clear the inside.
+; Draws nothing unless 2 <= w, 2 <= h and the box is on the 40 x 25 screen.
+c64_ui_box:
+        cpy #2
+        bcc @no
+        clc
+        adc c64_ui_box__args+2
+        bcs @no
+        cmp #41
+        bcs @no
+        lda c64_ui_box__args+3
+        cmp #2
+        bcc @no
+        adc c64_ui_box__args+1  ; (the carry is set: one more)
+        bcs @no
+        cmp #27
+        bcc @draw
+@no:    rts
+@draw: lda c64_ui_box__args
+        jsr c64_text_cell       ; zp_p1 = screen, zp_p2 = colour RAM
+        ldx #0
+        lda c64_ui_box__args+4
+        lsr
+        bcc @top
+        ldx #6
+@top:   stx c64_ui_box__args    ; the corners: square or round
+        jsr @row
+
+        ; the title, from the third column, at most w - 4 characters
+        lda c64_ui_box__args+8
+        beq @sides
+        sec
+        lda c64_ui_box__args+2
+        sbc #4
+        bcc @sides
+        beq @sides
+        cmp c64_ui_box__args+8
+        bcs @text
+        sta c64_ui_box__args+8
+@text:  lda c64_ui_box__args+6
+        sta zp_p0
+        lda c64_ui_box__args+7
+        sta zp_p0+1
+        ldy #0
+@char:  lda (zp_p0),y
+        jsr c64_text_screen_code
+        iny
+        iny
+        sta (zp_p1),y
+        dey
+        cpy c64_ui_box__args+8
+        bne @char
+
+@sides: ldx #12
+        lda c64_ui_box__args+4
+        and #2
+        beq @next
+        ldx #15
+@next:  clc                     ; one line down
+        lda zp_p1
+        adc #40
+        sta zp_p1
+        bcc @col
+        inc zp_p1+1
+        clc
+@col:   lda zp_p2
+        adc #40
+        sta zp_p2
+        bcc @line
+        inc zp_p2+1
+@line:  dec c64_ui_box__args+3  ; the lines left, with this one
+        lda c64_ui_box__args+3
+        cmp #1
+        beq @last
+        jsr @row
+        bne @next               ; (always: the colour RAM page is not 0)
+@last:  clc
+        lda c64_ui_box__args
+        adc #3
+        tax
+        ; one line: the characters @chars+x (left, middle, right)
+@row:   ldy c64_ui_box__args+2
+        dey
+        lda @chars+2,x
+        jsr @put
+@mid:   dey
+        beq @left
+        lda @chars+1,x
+        beq @mid                ; 0: leave the inside as it is
+        jsr @put
+        bne @mid                ; (always)
+@left:  lda @chars,x
+@put:   sta (zp_p1),y
+        lda c64_ui_box__args+5
+        sta (zp_p2),y
+        lda zp_p2+1             ; never 0: for the branches after the call
+        rts
+@chars: .byte $70, $40, $6e     ; square: top
+        .byte $6d, $40, $7d     ;         bottom
+        .byte $55, $40, $49     ; round:  top
+        .byte $4a, $40, $4b     ;         bottom
+        .byte $5d, $00, $5d     ; sides
+        .byte $5d, $20, $5d     ; sides, inside cleared

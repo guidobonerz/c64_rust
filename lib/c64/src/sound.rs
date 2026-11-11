@@ -78,6 +78,7 @@ impl Note {
 }
 
 /// Frequencies (PAL register values) of the notes C0..B7.
+#[unsafe(export_name = "c64_sound_freq")]
 static NOTE_FREQ: [u16; 96] = [
     278, 295, 313, 331, 351, 372, 394, 417, 442, 468, 496, 526, 557, 590, 625, 662, 702, 743, 788,
     834, 884, 937, 992, 1051, 1114, 1180, 1250, 1325, 1403, 1487, 1575, 1669, 1768, 1873, 1985,
@@ -88,13 +89,69 @@ static NOTE_FREQ: [u16; 96] = [
     53401, 56576, 59940, 63504, 65535,
 ];
 
+// Exported for the assembly routines (rat/sound.rat).
+#[unsafe(export_name = "c64_sound_shadow")]
 static mut CONTROL: [u8; 3] = [0; 3];
+#[unsafe(export_name = "c64_sound_modevol")]
 static mut MODE_VOL: u8 = 0;
+
+#[cfg(target_os = "c64")]
+crate::rat_source!(SOUND_RAT, "rat/sound.rat");
+
+#[cfg(target_os = "c64")]
+unsafe extern "C" {
+    fn c64_sound_control(voice: u8, value: u8);
+    fn c64_sound_note_off(voice: u8);
+    fn c64_sound_reg16(voice: u8, reg: u8, value: u16);
+    fn c64_sound_adsr(voice: u8, attack: u8, decay: u8, sustain: u8, release: u8);
+    fn c64_sound_note_on(voice: u8, note: u8, wave: u8);
+    fn c64_sound_reset();
+}
 
 /// Voice 0-2.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Voice(pub u8);
 
+#[cfg(target_os = "c64")]
+impl Voice {
+    /// Sets the frequency register.
+    pub fn freq(self, f: u16) {
+        unsafe { c64_sound_reg16(self.0, 0, f) }
+    }
+
+    /// Sets the pulse width (0-4095).
+    pub fn pulse_width(self, w: u16) {
+        unsafe { c64_sound_reg16(self.0, 2, w) }
+    }
+
+    /// Sets the envelope (each 0-15).
+    pub fn adsr(self, attack: u8, decay: u8, sustain: u8, release: u8) {
+        unsafe { c64_sound_adsr(self.0, attack, decay, sustain, release) }
+    }
+
+    /// Starts the voice with a waveform at its current frequency.
+    pub fn play(self, wave: u8) {
+        unsafe { c64_sound_control(self.0, wave | GATE) }
+    }
+
+    /// Plays a note with a waveform.
+    pub fn note_on(self, note: Note, wave: u8) {
+        unsafe { c64_sound_note_on(self.0, note.0, wave) }
+    }
+
+    /// Starts the release.
+    pub fn note_off(self) {
+        unsafe { c64_sound_note_off(self.0) }
+    }
+}
+
+/// Silences the SID.
+#[cfg(target_os = "c64")]
+pub fn reset() {
+    unsafe { c64_sound_reset() }
+}
+
+#[cfg(not(target_os = "c64"))]
 impl Voice {
     fn regs(self) -> &'static hw::Voice {
         &hw::sid().voice[(self.0 % 3) as usize]
@@ -144,6 +201,7 @@ impl Voice {
 }
 
 /// Silences the SID.
+#[cfg(not(target_os = "c64"))]
 pub fn reset() {
     let s = hw::sid();
     for v in 0..3 {

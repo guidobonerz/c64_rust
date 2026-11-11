@@ -1,0 +1,176 @@
+; c64-uci: the Ultimate command interface (calling convention: see
+; c64::rat_source!).
+;
+;   $DF1C  write: control    bit 0 push command, 1 data accepted,
+;                            2 abort, 3 clear error
+;          read:  status     bit 7 data available, 6 status available,
+;                            5-4 state (00 idle, 01 busy, 10 last data,
+;                            11 more data), 3 error, 2 abort pending,
+;                            1 accept pending
+;   $DF1D  write: command bytes (target, command, parameters)
+;          read:  $C9 if the interface is there
+;   $DF1E  read:  response data
+;   $DF1F  read:  status text ("00,OK")
+;
+; The Ultimate answers when it gets to it: every step waits for the state
+; bits, there are no fixed delays.
+
+; c64_uci_begin(target: u8, command: u8): makes the interface idle (what
+; is left of the last command is accepted or aborted) and starts a command.
+c64_uci_begin:
+        lda $df1c
+        and #$08
+        beq @state
+        sta $df1c               ; clear the error
+@state: lda $df1c
+        and #$30
+        beq @idle
+        cmp #$10
+        beq @state              ; busy
+        cmp #$30
+        bne @accept
+        lda #$04                ; more data: abort
+        sta $df1c
+@abort: lda $df1c
+        and #$04
+        bne @abort
+        beq @state
+@accept:
+        jsr c64_uci_accept
+        jmp @state
+@idle:  lda c64_uci_begin__args
+        sta $df1d
+        lda c64_uci_begin__args+1
+        sta $df1d
+        rts
+
+; c64_uci_accept() -> u8: accepts the data and the status of this packet;
+; returns 1 if another packet follows, else 0.
+c64_uci_accept:
+        lda #$02
+        sta $df1c
+@wait:  lda $df1c
+        and #$02
+        bne @wait
+@busy:  lda $df1c
+        and #$30
+        cmp #$10
+        beq @busy
+        and #$20
+        beq @done
+        lda #1
+@done:  rts
+
+; c64_uci_put_bytes(data: *const u8, len: u16): parameters of the command
+c64_uci_put_bytes:
+        lda c64_uci_put_bytes__args
+        sta zp_p0
+        lda c64_uci_put_bytes__args+1
+        sta zp_p0+1
+        ldy #0
+@loop:  lda c64_uci_put_bytes__args+2
+        bne @count
+        lda c64_uci_put_bytes__args+3
+        beq @done
+        dec c64_uci_put_bytes__args+3
+@count: dec c64_uci_put_bytes__args+2
+        lda (zp_p0),y
+        sta $df1d
+        iny
+        bne @loop
+        inc zp_p0+1
+        bne @loop
+@done:  rts
+
+; c64_uci_push() -> u8: runs the command and waits for the answer; returns
+; the status register (bit 3: the command was not taken).
+c64_uci_push:
+        lda #$01
+        sta $df1c
+@busy:  lda $df1c
+        and #$30
+        cmp #$10
+        beq @busy
+        lda $df1c
+        rts
+
+; c64_uci_read(buf: *mut u8, max: u16) -> u16: the data of this packet, as
+; far as it fits; returns the number of bytes. What does not fit can be
+; read with another call, or is dropped by c64_uci_accept.
+c64_uci_read:
+        lda c64_uci_read__args
+        sta zp_p1
+        lda c64_uci_read__args+1
+        sta zp_p1+1
+        lda #0
+        sta rt_t
+        sta rt_t+1
+        tay
+@loop:  bit $df1c
+        bpl @done               ; no more data
+        lda rt_t
+        cmp c64_uci_read__args+2
+        lda rt_t+1
+        sbc c64_uci_read__args+3
+        bcs @done               ; full
+        lda $df1e
+        sta (zp_p1),y
+        inc rt_t
+        bne @next
+        inc rt_t+1
+@next:  iny
+        bne @loop
+        inc zp_p1+1
+        bne @loop
+@done:  lda rt_t
+        ldx rt_t+1
+        rts
+
+; c64_uci_status(buf: *mut u8, max: u8) -> u8: the status text, as far as
+; it fits; returns its length.
+c64_uci_status:
+        lda c64_uci_status__args
+        sta zp_p1
+        lda c64_uci_status__args+1
+        sta zp_p1+1
+        ldy #0
+@loop:  bit $df1c
+        bvc @done
+        cpy c64_uci_status__args+2
+        bcs @done
+        lda $df1f
+        sta (zp_p1),y
+        iny
+        bne @loop
+@done:  tya
+        rts
+
+; c64_uci_code() -> u8: the number at the start of the status text
+; ("82,FILE NOT FOUND" -> 82); 0 if there is no status. Reads the status
+; to its end.
+c64_uci_code:
+        lda #0
+        sta rt_t
+        bit $df1c
+        bvc @done
+        lda $df1f
+        and #$0f
+        asl
+        sta rt_t
+        asl
+        asl
+        adc rt_t                ; * 10 (the carry is clear)
+        sta rt_t
+        bit $df1c
+        bvc @done
+        lda $df1f
+        and #$0f
+        clc
+        adc rt_t
+        sta rt_t
+@rest:  bit $df1c
+        bvc @done
+        lda $df1f
+        jmp @rest
+@done:  lda rt_t
+        rts

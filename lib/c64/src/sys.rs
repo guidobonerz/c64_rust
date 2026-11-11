@@ -43,7 +43,7 @@ pub fn panic() -> ! {
 pub fn sei() {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_sys_sei()
+        crate::asm!("sei")
     }
 }
 
@@ -51,7 +51,7 @@ pub fn sei() {
 pub fn cli() {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_sys_cli()
+        crate::asm!("cli")
     }
 }
 
@@ -59,9 +59,11 @@ pub fn cli() {
 pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(target_os = "c64")]
     {
-        let p = unsafe { c64_sys_irq_save() };
+        // The status register: bit 2 says whether interrupts were off.
+        let p: u8;
+        unsafe { crate::asm!("php", "pla", "sta {p}", "sei", p = out(reg) p) };
         let r = f();
-        unsafe { c64_sys_irq_restore(p) };
+        unsafe { crate::asm!("lda {p}", "and #$04", "bne @off", "cli", "@off:", p = in(reg) p) };
         r
     }
     #[cfg(not(target_os = "c64"))]
@@ -93,9 +95,5 @@ crate::rat_source!(SYS_RAT, "rat/sys.rat");
 unsafe extern "C" {
     fn c64_sys_exit() -> !;
     fn c64_sys_panic() -> !;
-    fn c64_sys_sei();
-    fn c64_sys_cli();
-    fn c64_sys_irq_save() -> u8;
-    fn c64_sys_irq_restore(p: u8);
     fn c64_sys_jsr(addr: u16, a: u8, x: u8, y: u8) -> Regs;
 }

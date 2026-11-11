@@ -142,6 +142,75 @@ fn main() {
     // 14: PETSCII literals
     check(c64::p!("Ab1") == &[0x41, 0x42, 0x31] && c64::pm!("Ab") == &[0xc1, 0x42]);
 
+    // 15: inline assembly: operands in memory, a constant, a static, a
+    // local label, a result through a pointer
+    let (x, y) = (bb(0x12f0u16), bb(0x20u8));
+    let sum: u16;
+    let mut bits = bb(0xa5u8);
+    let count: u8;
+    let mut cell = [0u8; 3];
+    let p = bb(&mut cell[1]);
+    unsafe {
+        c64::asm!(
+            "clc",
+            "lda {x}",
+            "adc {y}",
+            "sta {sum}",
+            "lda {x}+1",
+            "adc #0",
+            "sta {sum}+1",
+            x = in(reg) x,
+            y = in(reg) y,
+            sum = out(reg) sum,
+        );
+        c64::asm!(
+            "ldx #0",
+            "@bit: asl {v}",
+            "bcc @zero",
+            "inx",
+            "@zero: lda {v}",
+            "bne @bit",
+            "stx {n}",
+            v = inout(reg) bits,
+            n = out(reg) count,
+        );
+        c64::asm!("lda #{k}", "sta {d}", "inc {t}", k = const 0x42, d = out(reg) *p, t = sym test_value);
+    }
+    check(sum == 0x1310 && count == 4 && bits == 0 && cell == [0, 0x42, 0] && unsafe { test_value } != 0);
+
+    // 16: the assembly behind text, fmt and the clock
+    let mut b = c64::fmt::Buf::<24>::new();
+    c64::write!(b, 0u8, ' ', 65535u16, ' ', 4_294_967_295u32, ' ', -1234i16);
+    check(
+        b.as_bytes() == b"0 65535 4294967295 -1234"
+            && text::petscii(b'a') == 0x41
+            && text::petscii(b'\n') == 13
+            && text::petscii(b'A') == 0x41
+            && text::petscii_to_screen(0x41) == 1
+            && text::petscii_to_screen(0xff) == 0x5e
+            && text::petscii_to_screen(0xa0) == 0x60
+            && text::petscii_to_screen(0xc1) == 0x41
+            && text::petscii_to_screen(0x90) == 0xd0
+            && text::screen_code(b'z') == 26
+            && text::screen_code(b' ') == 32,
+    );
+    text::put_str(37, 24, "ab!", Color::Red);
+    text::put_char(0, 23, 0x51, Color::Cyan);
+    let t0 = c64::kernal::jiffies();
+    hw::wait_frame();
+    hw::wait_frame();
+    let t1 = c64::kernal::jiffies();
+    check(
+        mem::peek(0x07e5) == 1
+            && mem::peek(0x07e7) == 0x21
+            && mem::peek(0xdbe7) & 15 == 2
+            && mem::peek(0x0400 + 23 * 40) == 0x51
+            && mem::peek(0xd800 + 23 * 40) & 15 == 3
+            && t1.wrapping_sub(t0) >= 1
+            && t1.wrapping_sub(t0) <= 3
+            && c64::kernal::rdtim() as u16 >= t1,
+    );
+
     unsafe {
         hw::vic().border.write(if FAILS == 0 { Color::Green } else { Color::Red });
     }

@@ -1,25 +1,8 @@
 ; c64::kernal: KERNAL wrappers (calling convention: see c64::rat_source!)
 
-c64_chrout = $ffd2
-c64_chrin  = $ffcf
-c64_getin  = $ffe4
-c64_scnkey = $ff9f
 c64_setlfs = $ffba
 c64_close  = $ffc3
-c64_clrchn = $ffcc
 c64_clall  = $ffe7
-c64_readst = $ffb7
-c64_rdtim  = $ffde
-c64_settim = $ffdb
-
-; returns 1 if RUN/STOP is pressed
-c64_stop:
-        jsr $ffe1
-        beq @stop
-        lda #0
-        rts
-@stop:  lda #1
-        rts
 
 ; A = row, X = col
 c64_plot:

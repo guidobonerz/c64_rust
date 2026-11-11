@@ -1,0 +1,9 @@
+[package]
+name = "c64-wic64"
+description = "The WiC64 WiFi module for rust64: HTTP, TCP and information requests over the user port"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+c64 = { path = "../c64" }

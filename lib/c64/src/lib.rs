@@ -21,6 +21,8 @@
 //! must not define their own.
 
 #![cfg_attr(target_os = "c64", no_std)]
+#![cfg_attr(target_os = "c64", feature(asm_experimental_arch, allow_internal_unstable))]
+#![cfg_attr(target_os = "c64", allow(internal_features))]
 
 pub mod dos;
 pub mod fmt;
@@ -57,6 +59,52 @@ macro_rules! pm {
         const P: [u8; $s.len()] = $crate::text::petscii_str::<{ $s.len() }>($s, true);
         &P
     }};
+}
+
+/// Inline assembly: the lines become part of the function, without a call.
+///
+/// ```ignore
+/// let sum: u16;
+/// unsafe {
+///     c64::asm!(
+///         "clc",
+///         "lda {a}",
+///         "adc {b}",
+///         "sta {sum}",
+///         "lda {a}+1",
+///         "adc #0",
+///         "sta {sum}+1",
+///         a = in(reg) a,          // a: u16
+///         b = in(reg) b,          // b: u8
+///         sum = out(reg) sum,
+///     );
+/// }
+/// ```
+///
+/// This is `core::arch::asm!` (the macro only spares the program the
+/// feature gate), with 6510 code in rat syntax. rust64 keeps values in
+/// memory, not in registers, so a placeholder stands for the **memory
+/// location** of its operand, an address: `lda {x}`, `sta {x}+1`.
+///
+/// | Operand | `{name}` is |
+/// |---|---|
+/// | `in(reg) value` | where the value is (8 or 16 bits) |
+/// | `out(reg) place`, `lateout(reg) place` | where the result goes |
+/// | `inout(reg) var` | a copy of `var` that is stored back |
+/// | `const N` | the number: `lda #{n}` |
+/// | `sym STATIC` | the label of the static |
+///
+/// A, X, Y and the flags are free inside the block and undefined after
+/// it. Local labels start with `@` (`"@loop: dex"`, `"bne @loop"`) and
+/// belong to the block. The runtime's labels can be used (`zp_p0`,
+/// `rt_memcpy`, ... see chapter 7 of the guide).
+#[cfg(target_os = "c64")]
+#[macro_export]
+#[allow_internal_unstable(asm_experimental_arch)]
+macro_rules! asm {
+    ($($t:tt)*) => {
+        ::core::arch::asm!($($t)*)
+    };
 }
 
 /// Includes a rat assembly file in the program:

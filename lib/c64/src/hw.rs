@@ -273,6 +273,21 @@ pub const IO_ONLY: u8 = 0x35;
 
 /// The raster line of the beam (0-311 on PAL): `$D012` plus bit 7 of
 /// `$D011`.
+#[cfg(target_os = "c64")]
+pub fn raster_line() -> u16 {
+    let line: u16;
+    unsafe {
+        crate::asm!("jsr c64_hw_raster_line", "sta {l}", "stx {l}+1", l = out(reg) line);
+    }
+    line
+}
+
+#[cfg(target_os = "c64")]
+crate::rat_source!(HW_RAT, "rat/hw.rat");
+
+/// The raster line of the beam (0-311 on PAL): `$D012` plus bit 7 of
+/// `$D011`.
+#[cfg(not(target_os = "c64"))]
 pub fn raster_line() -> u16 {
     let v = vic();
     let hi = v.control1.read() & 0x80;
@@ -291,6 +306,13 @@ pub fn raster_line() -> u16 {
 /// it, or for the next frame to start. (Comparing for equality would miss
 /// the line when one check takes longer than a raster line, and an
 /// interrupt handler may cover the whole rest of the frame.)
+#[cfg(target_os = "c64")]
+pub fn wait_raster(line: u8) {
+    unsafe { crate::asm!("lda {l}", "jsr c64_hw_wait_raster", l = in(reg) line) }
+}
+
+/// Busy-waits until the beam reaches `line` (see above).
+#[cfg(not(target_os = "c64"))]
 pub fn wait_raster(line: u8) {
     let l = line as u16;
     let mut prev = raster_line();

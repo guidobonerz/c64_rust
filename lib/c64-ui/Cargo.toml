@@ -1,0 +1,9 @@
+[package]
+name = "c64-ui"
+description = "Text-mode user interface elements for rust64: PETSCII boxes with square or round corners, titles"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+c64 = { path = "../c64" }
