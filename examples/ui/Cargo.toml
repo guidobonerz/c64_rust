@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 c64 = { path = "../../lib/c64" }
-c64-ui = { path = "../../lib/c64-ui" }
 
 [profile.dev]
 opt-level = 1

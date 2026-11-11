@@ -1,4 +1,4 @@
-//! End-to-end test of `c64-ui`: boxes are drawn and the screen and colour
+//! End-to-end test of `c64::ui`: boxes are drawn and the screen and colour
 //! memory are read back. Border green = all passed; the number of the
 //! first failing check is at $07C0, the number of checks at $07C2.
 #![no_std]
@@ -7,7 +7,7 @@
 use c64::hw::{self, Color};
 use c64::mem;
 use c64::text;
-use c64_ui::{self as ui, Border};
+use c64::ui::{self, Border};
 
 static mut TEST: u8 = 0;
 static mut FAILS: u8 = 0;

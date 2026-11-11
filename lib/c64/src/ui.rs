@@ -4,7 +4,7 @@
 //!
 //! ```ignore
 //! use c64::hw::Color;
-//! use c64_ui::{self as ui, Border};
+//! use c64::ui::{self, Border};
 //!
 //! ui::frame(2, 2, 20, 8, Border::Round, Color::White);
 //! ui::titled_panel(10, 6, 24, 10, Border::Square, Color::Yellow, "OPTIONS");
@@ -30,9 +30,8 @@
 //! does not move. Round corners need the upper case / graphics character
 //! set (the default): with `c64::text::lowercase()` they show as letters.
 //! Square corners and the lines are in both sets.
-#![no_std]
 
-use c64::hw::Color;
+use crate::hw::Color;
 
 /// The corners of a box.
 #[repr(u8)]
@@ -46,7 +45,7 @@ pub enum Border {
 const FILL: u8 = 2;
 
 #[cfg(target_os = "c64")]
-c64::rat_source!(UI_RAT, "ui.rat");
+crate::rat_source!(UI_RAT, "rat/ui.rat");
 
 #[cfg(target_os = "c64")]
 unsafe extern "C" {
@@ -86,12 +85,12 @@ pub fn titled_panel(col: u8, row: u8, w: u8, h: u8, border: Border, color: Color
     draw(col, row, w, h, border as u8 | FILL, color, title);
 }
 
-/// The same boxes for the host (tests of programs that use this crate).
+/// The same boxes for the host (tests of programs that use this module).
 #[cfg(not(target_os = "c64"))]
 mod host {
     use super::FILL;
-    use c64::hw::Color;
-    use c64::text;
+    use crate::hw::Color;
+    use crate::text;
 
     pub fn draw(col: u8, row: u8, w: u8, h: u8, style: u8, color: Color, title: &str) {
         if w < 2 || h < 2 || col as u16 + w as u16 > 40 || row as u16 + h as u16 > 25 {

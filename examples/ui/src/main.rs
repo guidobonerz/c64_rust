@@ -5,7 +5,7 @@
 
 use c64::hw::Color;
 use c64::text;
-use c64_ui::{self as ui, Border};
+use c64::ui::{self, Border};
 
 #[c64::main]
 fn main() {

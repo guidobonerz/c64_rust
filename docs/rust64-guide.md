@@ -941,12 +941,33 @@ File names are ASCII and converted to PETSCII capitals.
 | `sei()`, `cli()`, `without_interrupts(f)` | the interrupt flag |
 | `unsafe jsr(addr, Regs) -> Regs` | call machine code with A/X/Y, get A/X/Y/P back (`carry()`) |
 
+### c64::ui â€” boxes on the text screen
+
+Boxes drawn with the PETSCII line characters, written straight into the
+screen and colour memory. See `examples/ui`.
+
+```rust
+use c64::ui::{self, Border};
+ui::frame(2, 2, 20, 8, Border::Round, Color::White);
+ui::titled_panel(10, 6, 24, 10, Border::Square, Color::Yellow, " OPTIONS ");
+```
+
+| Item | Description |
+|---|---|
+| `frame(col, row, w, h, border, color)` | the lines of a box; what is inside stays |
+| `panel(...)` | a box with the inside cleared (a window on top of other text) |
+| `titled_frame(..., title)`, `titled_panel(..., title)` | with a title in the top line, from the third column, cut off at `w - 4` characters |
+| `Border::Square`, `Border::Round` | the corners; round ones need the upper case / graphics character set |
+
+`w` and `h` include the lines. A box smaller than 2 x 2 or not completely
+on the screen is not drawn.
+
 ---
 
 ### More hardware: separate crates
 
 Four crates next to `c64` (in `lib/`) support hardware that not every
-C64 has; a fifth, `c64-ui`, draws boxes on the text screen. A program names the ones it needs in its `Cargo.toml`
+C64 has. A program names the ones it needs in its `Cargo.toml`
 (`c64-uci = { path = "../../lib/c64-uci" }`); what it does not call is not
 in the program. Each has an example in `examples/` (except the sampler)
 and a test in `tests/e2e/`.
@@ -1035,25 +1056,6 @@ if ua::present() {
     v.play(0);                           // or REPEAT, IRQ, BITS_16
 }
 ```
-
-**`c64-ui`** — boxes on the text screen, drawn with the PETSCII line
-characters; no extra hardware. See `examples/ui`.
-
-```rust
-use c64_ui::{self as ui, Border};
-ui::frame(2, 2, 20, 8, Border::Round, Color::White);
-ui::titled_panel(10, 6, 24, 10, Border::Square, Color::Yellow, " OPTIONS ");
-```
-
-| Item | Description |
-|---|---|
-| `frame(col, row, w, h, border, color)` | the lines of a box; what is inside stays |
-| `panel(...)` | a box with the inside cleared (a window on top of other text) |
-| `titled_frame(..., title)`, `titled_panel(..., title)` | with a title in the top line, from the third column, cut off at `w - 4` characters |
-| `Border::Square`, `Border::Round` | the corners; round ones need the upper case / graphics character set |
-
-`w` and `h` include the lines. A box smaller than 2 x 2 or not completely
-on the screen is not drawn.
 
 mimic emulates the SD2IEC, the command interface and the WiC64, and the
 tests run against it. It does not emulate the sampler: `c64-uaudio` follows

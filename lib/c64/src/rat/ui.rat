@@ -1,4 +1,4 @@
-; c64-ui: boxes on the text screen (calling convention: see
+; c64::ui: boxes on the text screen (calling convention: see
 ; c64::rat_source!). Uses c64::text's routines for the cell address and
 ; the conversion of the title.
 

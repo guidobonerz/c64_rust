@@ -1,6 +1,6 @@
 [package]
 name = "c64"
-description = "The Commodore 64 library for rust64: hardware, KERNAL, text, formatting, input"
+description = "The Commodore 64 library for rust64: hardware, KERNAL, text, formatting, input, graphics, sound, UI"
 version = "0.1.0"
 edition = "2024"
 publish = false

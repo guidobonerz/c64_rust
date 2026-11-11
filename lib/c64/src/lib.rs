@@ -36,6 +36,7 @@ pub mod sound;
 pub mod sprite;
 pub mod sys;
 pub mod text;
+pub mod ui;
 
 pub use c64_macros::{at, main, sid, zp};
 
