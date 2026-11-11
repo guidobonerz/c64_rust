@@ -1,0 +1,168 @@
+; Stable raster bars: one colour per raster line for border and background,
+; changed while the beam is outside the visible picture.
+;
+;   raster_start()              install the interrupt
+;   raster_stop()               remove it, KERNAL interrupt back
+;   raster_colors() -> u16      the colour table, RASTER_LINES bytes
+;   raster_wait()               wait until this frame's bars are drawn
+;
+; An interrupt starts 0-7 cycles late, depending on the instruction it
+; interrupts: far too coarse for a colour change that has to fall into
+; the few cycles in which the beam is off screen. So there are two
+; interrupts. The first one only arms the second, two lines further down,
+; and then runs 2-cycle NOPs: the second one starts 0 or 1 cycle late.
+; Reading $D012 twice across the end of a line removes that last cycle,
+; and from there on every instruction is counted.
+;
+; A raster line has 63 cycles (PAL). On every eighth line of the text
+; screen, a bad line, the VIC fetches the characters and stops the CPU for
+; cycles 15-54 (in fact from the first read after cycle 12). The loop below
+; is unrolled over eight lines: a bad line first (20 cycles of code), then
+; seven normal lines (63 cycles).
+;
+; Branches that cross a page and indexed reads that cross a page take one
+; cycle more. The table and the timed code are in one page (.align, and an
+; assert at the end).
+
+RASTER_LINES = 96               ; a multiple of 8
+RASTER_FIRST = 99               ; a bad line: (line & 7) == 3
+RASTER_IRQ   = RASTER_FIRST - 4 ; no bad line in the three lines after it
+
+raster_start:
+        sei
+        lda #$7f
+        sta $dc0d               ; CIA1 interrupts off
+        lda $dc0d
+        lda #RASTER_IRQ
+        sta $d012
+        lda $d011
+        and #$7f
+        sta $d011
+        lda #<raster_irq1
+        sta $0314
+        lda #>raster_irq1
+        sta $0315
+        lda #1
+        sta $d01a               ; raster interrupt on
+        sta $d019
+        cli
+        rts
+
+raster_stop:
+        sei
+        lda #0
+        sta $d01a
+        lda #$ff
+        sta $d019
+        lda #$31
+        sta $0314
+        lda #$ea
+        sta $0315
+        lda #$81
+        sta $dc0d
+        cli
+        rts
+
+raster_wait:
+        lda raster_frame
+@wait:  cmp raster_frame
+        beq @wait
+        rts
+
+raster_frame:
+        .byte 0
+
+raster_colors:
+        lda #<raster_table
+        ldx #>raster_table
+        rts
+
+        .align 256
+        .res 8                  ; raster_table-8,x stays in the page
+raster_table:
+        .res RASTER_LINES
+
+; The second interrupt, at line RASTER_IRQ + 2: it interrupted a NOP of
+; raster_irq1 and starts at cycle 40 or 41 of the line.
+raster_irq2:
+        txs                     ; drop this interrupt's stack frame
+        bit $ea                 ; 15 cycles: the second read of $D012
+        .repeat 6 { nop }       ; must be the one at the end of the line
+        lda $d012               ; the line before its end ...
+        cmp $d012               ; ... and at cycle 63, or 1 of the next
+        beq @sync               ; same line: 3 cycles, the next: 2
+@sync:
+        ; cycle 4 of line RASTER_FIRST - 1; the loop starts at cycle 58
+        ldx #0
+        ldy #9
+@wait:  dey
+        bne @wait
+        .repeat 3 { nop }
+@group:
+        ; a bad line: 20 cycles (58-63, 1-11, 55-57). The colours are
+        ; written in cycles 2 and 6, as on all lines.
+        lda raster_table,x
+        sta $d020
+        sta $d021
+        txa
+        clc
+        adc #8                  ; the CPU waits here
+        tax
+        ; seven normal lines: 12 + 51 cycles
+        .for i in 1..7 {
+        lda raster_table-8+i,x
+        sta $d020
+        sta $d021
+        jsr @d51
+        }
+        lda raster_table-1,x
+        sta $d020
+        sta $d021
+        jsr @d46
+        cpx #RASTER_LINES
+        bne @group
+        lda #0                  ; below the bars: black
+        sta $d020
+        sta $d021
+        jmp raster_done         ; timing does not matter any more
+
+; 51 and 46 cycles, with jsr and rts
+@d51:   bit $ea
+        nop
+@d46:   ldy #6
+@d:     dey
+        bne @d
+        bit $ea
+        rts
+@end:
+        .assert ((raster_table - 8) >> 8) == (@end >> 8), "raster.rat: the timed code crosses a page"
+
+; The next frame starts with the first interrupt again.
+raster_done:
+        lda #<raster_irq1
+        sta $0314
+        lda #>raster_irq1
+        sta $0315
+        lda #RASTER_IRQ
+        sta $d012
+        lda #1
+        sta $d019
+        inc raster_frame
+        jmp $ea31               ; keyboard, clock, return
+
+; The first interrupt, at line RASTER_IRQ (the KERNAL has pushed A, X, Y).
+raster_irq1:
+        lda #1
+        sta $d019               ; acknowledge
+        lda #RASTER_IRQ + 2
+        sta $d012
+        lda #<raster_irq2
+        sta $0314
+        lda #>raster_irq2
+        sta $0315
+        tsx                     ; raster_irq2 continues on this stack
+        cli
+        ; The beam is at the start of the next line; the second interrupt
+        ; comes within these NOPs.
+        .repeat 40 { nop }
+        jmp $ea81               ; never reached

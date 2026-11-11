@@ -129,6 +129,10 @@ struct Program<'tcx> {
     rat: String,
     /// `symbol = label` for statics and functions exported to assembly.
     exports: String,
+    /// Statics that are in the program because they are exported: their
+    /// data goes with the library assembly, where it is dropped again if
+    /// nothing refers to it.
+    exported_statics: FxIndexSet<usize>,
     zp_next: u64,
     /// Code that initializes the zero-page statics.
     zp_init: Asm,
@@ -136,10 +140,11 @@ struct Program<'tcx> {
     /// Addresses of `at` statics without data (the program must end below
     /// them if they are in RAM).
     fixed_vars: Vec<(u64, String)>,
-    /// Whether code compiled for [`CTX_PTR`] uses the runtime registers or
-    /// assembly-function argument areas (then interrupt dispatchers must
-    /// save all of them, otherwise only the zero-page pointers).
-    ptr_ctx_full: bool,
+    /// What code compiled for [`CTX_PTR`] (interrupt handlers) uses, and
+    /// the interrupt dispatcher therefore has to save: the arithmetic
+    /// registers of the runtime, the registers of calls through pointers
+    /// (`rt_args`, `rt_ret`), assembly functions (their argument areas).
+    ptr_ctx: PtrCtx,
 }
 
 impl<'tcx> Program<'tcx> {
@@ -234,11 +239,12 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         foreign: FxIndexMap::default(),
         rat: String::new(),
         exports: String::new(),
+        exported_statics: FxIndexSet::default(),
         zp_next: ZP_FIRST,
         zp_init: Asm::default(),
         fixed: Vec::new(),
         fixed_vars: Vec::new(),
-        ptr_ctx_full: false,
+        ptr_ctx: PtrCtx::default(),
     };
 
     let mut main = None;
@@ -270,6 +276,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     // Data: constant allocations and statics. Emitting one can discover
     // more (pointers in data), so loop until both lists are done.
     let mut data = Asm::default();
+    let mut exported_data = Asm::default();
     let (mut na, mut ns) = (0, 0);
     while na < p.allocs.len() || ns < p.statics.len() {
         while na < p.allocs.len() {
@@ -279,7 +286,11 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
             na += 1;
         }
         while ns < p.statics.len() {
-            emit_static(&mut p, &mut data, ns);
+            if p.exported_statics.contains(&ns) {
+                emit_static(&mut p, &mut exported_data, ns);
+            } else {
+                emit_static(&mut p, &mut data, ns);
+            }
             ns += 1;
         }
     }
@@ -323,6 +334,8 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     let zp_avail = ZP_LAST + 1 - p.zp_next;
     let mut zp_frames = String::new();
     let mut zp_ids = FxIndexSet::default();
+    // Where the frames in the zero page end.
+    let mut zp_frame_ends: Vec<(usize, u64)> = Vec::new();
     for (id, sz, defs) in frames {
         let o = off[id].unwrap_or_else(|| {
             // not reachable from a root: its own space
@@ -331,6 +344,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         });
         if sz > 0 && o + sz <= zp_avail {
             zp_ids.insert(id);
+            zp_frame_ends.push((id, p.zp_next + o + sz));
             let _ = writeln!(zp_frames, "F{id}f = ${:02x}", p.zp_next + o);
             zp_frames.push_str(&defs);
         } else {
@@ -361,13 +375,19 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     lib.push_str(RUNTIME);
     lib.push_str(&p.rat);
     lib.push_str("\nrt_loc: .res 16                  ; dummy core::panic::Location\n");
-    lib.push_str(&ctx_save(p.ptr_ctx_full));
+    lib.push_str("\n; ---- exported to assembly ----\n");
+    lib.push_str(&p.exports);
+    lib.push_str(&exported_data.text);
+    lib.push_str(&ctx_save(p.ptr_ctx));
 
     let mut out = String::new();
     let _ = writeln!(out, "\nrt_main = F{main_id}");
-    out.push_str("\n; ---- zero-page statics ----\nrt_zpinit:\n");
-    out.push_str(&p.zp_init.text);
-    out.push_str("        rts\n");
+    let zp_init = !p.zp_init.text.is_empty();
+    if zp_init {
+        out.push_str("\n; ---- zero-page statics ----\nrt_zpinit:\n");
+        out.push_str(&p.zp_init.text);
+        out.push_str("        rts\n");
+    }
     // Pointers in zero-page frames are dereferenced directly.
     let code = crate::asm::zp_direct(&p.asm.text, |name| {
         // F<id>v<n>[+off] or F<id>t+off
@@ -378,8 +398,6 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     });
     out.push_str(&code);
     out.push_str(&wrappers);
-    out.push_str("\n; ---- exported to assembly ----\n");
-    out.push_str(&p.exports);
     out.push_str("\n; ---- data ----\n");
     out.push_str(&data.text);
     out.push_str("\n; ---- bss (not in the file) ----\n__bss:\n");
@@ -415,11 +433,146 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         let _ = writeln!(out, ".org ${:04x}", f.addr);
         out.push_str(&f.text);
     }
-    let lib = crate::asm::prune(&lib, &format!("rt_start\n{out}"));
+    // Start and exit: only what this program needs. What it needs shows in
+    // the program and the library routines it keeps.
+    let kept = crate::asm::prune(&lib, &out);
+    let all = format!("{kept}{out}");
+    let exit_used = all.lines().any(|l| {
+        let l = l.split(';').next().unwrap_or("");
+        l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|t| t == "rt_exit")
+    });
+    let hw = crate::asm::touches_hw(&all)
+        || p.fixed_vars.iter().any(|(a, _)| *a < 2 || (0x0314..0x031a).contains(a) || (0xd000..0xe000).contains(a));
+    // The used part of the zero page: the statics, and the frames the
+    // code refers to (an optimized function may not need its frame).
+    let refers = |id: usize| {
+        let (v, t, l) = (format!("F{id}v"), format!("F{id}t"), format!("L{id}_"));
+        all.lines().any(|line| {
+            line.starts_with(' ')
+                && line
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| w.starts_with(&v) || w.starts_with(&t) || w.starts_with(&l))
+        })
+    };
+    let zp_end = zp_frame_ends
+        .iter()
+        .filter(|(id, _)| refers(*id))
+        .map(|&(_, end)| end)
+        .fold(p.zp_next, u64::max);
+    let start = start_exit(zp_end - ZP_FIRST, hw, exit_used, zp_init);
+    let lib = crate::asm::prune(&lib, &format!("{start}{out}"));
     format!(
         "; generated by rust64\n.basicupstart rt_start\n\n; ---- frames in the zero page ----\n\
-         {zp_frames}\n{lib}{out}"
+         {zp_frames}\n{start}{lib}{out}"
     )
+}
+
+/// The start and exit code of the program.
+///
+/// * `zp`: the bytes of the zero page from `$02` that hold zero-page
+///   statics and frames. They are BASIC's: saved and cleared at the
+///   start, restored at the exit.
+/// * `hw`: the program can change the interrupt setup, the memory
+///   configuration, the VIC mode or bank or the SID
+///   ([`crate::asm::touches_hw`]): saved at the start (what cannot be set
+///   to a known value), restored at the exit.
+/// * `exit_used`: something jumps to `rt_exit` (`sys::exit`, a panic), from
+///   any depth of calls: the stack pointer is saved.
+/// * `zp_init`: there are zero-page statics to initialize.
+///
+/// A program that needs none of this starts directly with `main`, whose
+/// `rts` returns to BASIC.
+fn start_exit(zp: u64, hw: bool, exit_used: bool, zp_init: bool) -> String {
+    let mut a = Asm::default();
+    a.raw("\n; ---- start and exit ----");
+    if zp == 0 && !hw && !exit_used && !zp_init {
+        a.raw("rt_start = rt_main");
+        return a.text;
+    }
+    a.label("rt_start");
+    if zp > 0 {
+        a.ins(format!("ldx #{zp}"));
+        a.raw("@save:");
+        a.ins("lda $01,x");
+        a.ins("sta rt_zpsave-1,x");
+        a.ins("lda #0");
+        a.ins("sta $01,x");
+        a.ins("dex");
+        a.ins("bne @save");
+    }
+    if exit_used {
+        a.ins("tsx");
+        a.ins("stx rt_sp");
+    }
+    const SAVED: [(&str, &str); 7] = [
+        ("$0314", "rt_irqsave"),
+        ("$0315", "rt_irqsave+1"),
+        ("$01", "rt_port"),
+        ("$dd00", "rt_dd00"),
+        ("$d018", "rt_d018"),
+        ("$d011", "rt_d011"),
+        ("$d016", "rt_d016"),
+    ];
+    if hw {
+        for (reg, at) in SAVED {
+            a.ins(format!("lda {reg}"));
+            a.ins(format!("sta {at}"));
+        }
+        a.ins("lda $d015");
+        a.ins("sta rt_d015");
+        a.ins("cld");
+    }
+    if zp_init {
+        a.ins("jsr rt_zpinit");
+    }
+    if zp == 0 && !hw && !exit_used {
+        a.ins("jmp rt_main");
+        return a.text;
+    }
+    a.ins("jsr rt_main");
+    // Back to BASIC from anywhere: restore the IRQ vector, the CIA
+    // interrupt, the memory configuration, the VIC (except the colours, so
+    // the program's output stays readable), silence the SID, restore the
+    // zero page.
+    a.label("rt_exit");
+    if hw {
+        a.ins("sei");
+    }
+    if exit_used {
+        a.ins("ldx rt_sp");
+        a.ins("txs");
+    }
+    if hw {
+        for (i, (reg, at)) in SAVED.iter().enumerate() {
+            a.ins(format!("lda {at}"));
+            a.ins(format!("sta {reg}"));
+            if i == 1 {
+                a.ins("lda #0");
+                a.ins("sta $d01a");
+                a.ins("lda #$ff");
+                a.ins("sta $d019");
+                a.ins("lda #$81");
+                a.ins("sta $dc0d");
+            }
+        }
+        a.ins("lda rt_d015");
+        a.ins("sta $d015");
+        a.ins("lda #0");
+        for reg in ["$d404", "$d40b", "$d412", "$d418"] {
+            a.ins(format!("sta {reg}"));
+        }
+        a.ins("cli");
+    }
+    if zp > 0 {
+        a.ins(format!("ldx #{zp}"));
+        a.raw("@rest:");
+        a.ins("lda rt_zpsave-1,x");
+        a.ins("sta $01,x");
+        a.ins("dex");
+        a.ins("bne @rest");
+    }
+    a.ins("rts");
+    a.text
 }
 
 /// Parses an address of a `link_section = "at:<addr>"`: `$d020`, `0xd020`
@@ -617,6 +770,7 @@ fn scan_crates(p: &mut Program<'_>) {
                         } else if attrs.contains_extern_indicator() {
                             let sym = tcx.symbol_name(Instance::mono(tcx, id)).name.to_owned();
                             let n = p.statics.insert_full(id).0;
+                            p.exported_statics.insert(n);
                             let _ = writeln!(p.exports, "{sym} = S{n}");
                         }
                     }
@@ -1035,14 +1189,19 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
     let opt = crate::asm::peephole(&crate::asm::relax(&f.p.asm.text[start..]));
     f.p.asm.text.truncate(start);
     f.p.asm.text.push_str(&opt);
-    if ctx == CTX_PTR && !f.p.ptr_ctx_full {
+    if ctx == CTX_PTR {
         let text = &f.p.asm.text[start..];
-        f.p.ptr_ctx_full = text.contains("__args")
-            || text.contains("__res")
-            || text.match_indices("rt_").any(|(i, _)| {
-                let r = &text[i..];
-                !(r.starts_with("rt_jvec") || r.starts_with("rt_jsrind") || r.starts_with("rt_panic"))
-            });
+        let mut c = f.p.ptr_ctx;
+        c.foreign |= text.contains("__args") || text.contains("__res");
+        for (i, _) in text.match_indices("rt_") {
+            let r = &text[i..];
+            if r.starts_with("rt_args") || r.starts_with("rt_ret") {
+                c.calls = true;
+            } else if !(r.starts_with("rt_jvec") || r.starts_with("rt_jsrind") || r.starts_with("rt_panic")) {
+                c.arith = true;
+            }
+        }
+        f.p.ptr_ctx = c;
     }
 }
 
@@ -1050,14 +1209,22 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
 /// the code reached through function pointers can change to `rt_ctxbuf`
 /// and back: always the zero-page pointers and `rt_jvec`, the runtime
 /// registers and assembly argument areas only if that code uses them.
-fn ctx_save(full: bool) -> String {
+/// See `Program::ptr_ctx`.
+#[derive(Clone, Copy, Default)]
+struct PtrCtx {
+    arith: bool,
+    calls: bool,
+    foreign: bool,
+}
+
+fn ctx_save(c: PtrCtx) -> String {
     let mut a = Asm::default();
     a.raw("");
-    a.comment(if full {
-        "interrupt context: zero-page pointers, runtime registers, assembly argument areas"
-    } else {
-        "interrupt context: zero-page pointers and rt_jvec (pointer code uses no runtime registers)"
-    });
+    a.comment(
+        "interrupt context: the zero-page pointers and rt_jvec, and what the code\n\
+         reached through function pointers uses of the runtime registers and the\n\
+         assembly argument areas",
+    );
     for (name, save) in [("rt_ctx_save", true), ("rt_ctx_restore", false)] {
         a.label(name);
         let copy = |a: &mut Asm, from: &str, to: &str, n: &str, guard: bool| {
@@ -1076,8 +1243,14 @@ fn ctx_save(full: bool) -> String {
         };
         copy(&mut a, "$f9", "rt_ctxbuf+256", "6", false);
         copy(&mut a, "rt_jvec", "rt_ctxbuf+262", "2", false);
-        if full {
-            copy(&mut a, "rt_save", "rt_ctxbuf", "rt_save_end-rt_save", false);
+        // Assembly functions may use the arithmetic registers too.
+        if c.arith || c.foreign {
+            copy(&mut a, "rt_save", "rt_ctxbuf", "rt_args-rt_save", false);
+        }
+        if c.calls {
+            copy(&mut a, "rt_args", "rt_ctxbuf+rt_args-rt_save", "rt_save_end-rt_args", false);
+        }
+        if c.foreign {
             copy(&mut a, "rt_fsave", "rt_ctxbuf+rt_save_end-rt_save", "rt_fsave_end-rt_fsave", true);
         }
         a.ins("rts");
@@ -2024,6 +2197,17 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.a().ins(format!("rol {t}+1"));
             }
         } else {
+            // A 16-bit view of the value (one byte: zero-extended).
+            let wide = match (vsize < 2, v.byte(0)) {
+                (false, _) => Some(v.clone()),
+                (true, Some(b)) => Some(Val::Imm(vec![b, "#$00".into()])),
+                (true, None) => None,
+            };
+            if let Some(w) = &wide
+                && self.mul_const(&tv, w, 2, k)
+            {
+                return t;
+            }
             let a = &mut self.p.asm;
             a.copy(&Addr::Abs("rt_a".into()), v, vsize.min(2));
             if vsize < 2 {
@@ -2031,12 +2215,84 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 a.ins("sta rt_a+1");
             }
             a.copy(&Addr::Abs("rt_b".into()), &Val::imm_u64(k, 2), 2);
-            a.ins("lda #2");
-            a.ins("sta rt_n");
-            a.ins("jsr rt_mul");
+            a.ins("jsr rt_mul16");
             a.copy(&tv, &Val::Mem(Addr::Abs("rt_r".into())), 2);
         }
         t
+    }
+
+    /// `dst = v * c` (n bytes, wrapping) with shifts and additions, for
+    /// one- and two-byte values and constants with few bits. Returns false
+    /// (and emits nothing) when the call to the runtime is the better choice.
+    ///
+    /// The product is built from the top bit of `c` down: shift left, and
+    /// add `v` where `c` has a bit. One byte: all in A. Two bytes: the low
+    /// byte in A, the high byte in a temporary; `dst` is only written at the
+    /// end, so it may be `v` itself.
+    fn mul_const(&mut self, dst: &Addr, v: &Val, n: u64, c: u64) -> bool {
+        let c = if n >= 8 { c } else { c & ((1 << (8 * n)) - 1) };
+        if c == 0 {
+            self.a().copy(dst, &Val::imm_u64(0, n), n);
+            return true;
+        }
+        if n > 2 {
+            return false;
+        }
+        let shifts = 63 - c.leading_zeros() as u64;
+        let adds = c.count_ones() as u64 - 1;
+        // Bytes of code, roughly; a call costs about 20 (one byte) or 35.
+        let (cost, limit) = if n == 1 { (shifts + 4 * adds, 20) } else { (4 * shifts + 15 * adds, 56) };
+        if cost > limit {
+            return false;
+        }
+        if n == 1 {
+            let a = &mut self.p.asm;
+            a.setup_val(v, 0);
+            a.setup(dst, 2);
+            a.lda(v, 0, 0);
+            for bit in (0..shifts).rev() {
+                a.ins("asl");
+                if (c >> bit) & 1 == 1 {
+                    a.ins("clc");
+                    a.op_byte("adc", v, 0, 0);
+                }
+            }
+            a.sta(dst, 0, 2);
+            return true;
+        }
+        // Both bytes of v as plain operands (the additions use X).
+        let v = match (v.byte(0), v.byte(1)) {
+            (Some(_), Some(_)) => v.clone(),
+            _ => {
+                let t = Addr::Abs(self.temp(2));
+                self.a().copy(&t, v, 2);
+                Val::Mem(t)
+            }
+        };
+        let (v0, v1) = (v.byte(0).unwrap(), v.byte(1).unwrap());
+        let h = self.temp(1);
+        let a = &mut self.p.asm;
+        a.setup(dst, 2);
+        a.ins(format!("lda {v1}"));
+        a.ins(format!("sta {h}"));
+        a.ins(format!("lda {v0}"));
+        for bit in (0..shifts).rev() {
+            a.ins("asl");
+            a.ins(format!("rol {h}"));
+            if (c >> bit) & 1 == 1 {
+                a.ins("clc");
+                a.ins(format!("adc {v0}"));
+                a.ins("tax");
+                a.ins(format!("lda {h}"));
+                a.ins(format!("adc {v1}"));
+                a.ins(format!("sta {h}"));
+                a.ins("txa");
+            }
+        }
+        a.sta(dst, 0, 2);
+        a.ins(format!("lda {h}"));
+        a.sta(dst, 1, 2);
+        true
     }
 
     fn operand(&mut self, op: &Operand<'tcx>) -> (Val, TyAndLayout<'tcx>) {
@@ -2082,7 +2338,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         Some(x)
     }
 
-    /// Adds or subtracts 1 in place (1 or 2 bytes).
+    /// Adds 1 (any size) or subtracts 1 (1 or 2 bytes) in place.
     fn inc_dec(a: &mut Asm, d: &str, n: u64, add: bool) {
         if n == 1 {
             a.ins(format!("{} {d}", if add { "inc" } else { "dec" }));
@@ -2091,8 +2347,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let l = a.new_label();
         if add {
             a.ins(format!("inc {d}"));
-            a.ins(format!("bne {l}"));
-            a.ins(format!("inc {d}+1"));
+            for i in 1..n {
+                a.ins(format!("bne {l}"));
+                a.ins(format!("inc {d}+{i}"));
+            }
         } else {
             a.ins(format!("lda {d}"));
             a.ins(format!("bne {l}"));
@@ -2102,6 +2360,38 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             return;
         }
         a.label(&l);
+    }
+
+    /// `d = d + b` or `d = d - b` in place, where only the low byte of `b`
+    /// is not zero: the upper bytes of `d` just take the carry (`inc`) or
+    /// the borrow (`dec`, two bytes only). Returns false if this does not
+    /// apply.
+    fn add_in_place(a: &mut Asm, dst: &Addr, va: &Val, vb: &Val, n: u64, add: bool) -> bool {
+        let (Val::Mem(Addr::Abs(s)), Addr::Abs(d), Val::Imm(_)) = (va, dst, vb) else {
+            return false;
+        };
+        if s != d || n < 2 || (!add && n > 2) || vb.byte_is(0, 0) || !(1..n).all(|i| vb.byte_is(i, 0)) {
+            return false;
+        }
+        let b0 = vb.byte(0).unwrap();
+        let l = a.new_label();
+        a.ins(if add { "clc" } else { "sec" });
+        a.ins(format!("lda {d}"));
+        a.ins(format!("{} {b0}", if add { "adc" } else { "sbc" }));
+        a.ins(format!("sta {d}"));
+        if add {
+            a.ins(format!("bcc {l}"));
+            a.ins(format!("inc {d}+1"));
+            for i in 2..n {
+                a.ins(format!("bne {l}"));
+                a.ins(format!("inc {d}+{i}"));
+            }
+        } else {
+            a.ins(format!("bcs {l}"));
+            a.ins(format!("dec {d}+1"));
+        }
+        a.label(&l);
+        true
     }
 
     /// Shifts the `n` bytes at `t` by the constant `k`.
@@ -2420,11 +2710,21 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         dst: &Addr,
         dl: TyAndLayout<'tcx>,
     ) {
-        let (va, la) = self.operand(x);
-        let (vb, lb) = self.operand(y);
+        let (mut va, la) = self.operand(x);
+        let (mut vb, lb) = self.operand(y);
         let n = la.size.bytes();
         let signed = Self::is_signed(la.ty);
         use BinOp::*;
+        // c + x, c * x, ...: the constant to the right, where the special
+        // cases look for it.
+        if matches!(
+            op,
+            Add | AddUnchecked | AddWithOverflow | Mul | MulUnchecked | MulWithOverflow | BitAnd | BitOr | BitXor
+        ) && Self::imm_value(&va, n).is_some()
+            && Self::imm_value(&vb, n).is_none()
+        {
+            std::mem::swap(&mut va, &mut vb);
+        }
         // x * 2^k, x / 2^k, x % 2^k (unsigned): shifts and masks.
         if matches!(op, Mul | MulUnchecked | Div | Rem)
             && (!signed || matches!(op, Mul | MulUnchecked))
@@ -2470,8 +2770,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             Add | AddUnchecked | AddWithOverflow | Sub | SubUnchecked | SubWithOverflow => {
                 let add = matches!(op, Add | AddUnchecked | AddWithOverflow);
                 // x = x + 1 / x - 1 in place
-                if n <= 2
-                    && !matches!(op, AddWithOverflow | SubWithOverflow)
+                let checked = matches!(op, AddWithOverflow | SubWithOverflow);
+                if (n <= 2 || (add && n <= 8))
+                    && !checked
                     && Self::imm_value(&vb, n) == Some(1)
                     && let (Val::Mem(Addr::Abs(s)), Addr::Abs(d)) = (&va, dst)
                     && s == d
@@ -2480,13 +2781,16 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     Self::inc_dec(&mut self.p.asm, &d, n, add);
                     return;
                 }
+                // x = x + small / x - small in place
+                if !checked && Self::add_in_place(&mut self.p.asm, dst, &va, &vb, n, add) {
+                    return;
+                }
                 let a = &mut self.p.asm;
                 a.setup_val(&va, 0);
                 a.setup_val(&vb, 1);
                 a.setup(dst, 2);
                 // While only zero bytes were added, the carry is unchanged
                 // and the byte is just copied.
-                let checked = matches!(op, AddWithOverflow | SubWithOverflow);
                 let mut plain = !checked;
                 let first = (0..n).find(|&i| !vb.byte_is(i, 0)).unwrap_or(n);
                 if !plain || first < n {
@@ -2654,18 +2958,32 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 if n > 8 {
                     self.fatal("128-bit multiplication/division is not supported")
                 }
+                let mul = matches!(op, Mul | MulUnchecked | MulWithOverflow);
+                // x * constant: shifts and additions.
+                let inline = mul
+                    && match Self::imm_value(&vb, n) {
+                        Some(c) => self.mul_const(dst, &va, n, c),
+                        None => false,
+                    };
                 let a = &mut self.p.asm;
-                a.copy(&Addr::Abs("rt_a".into()), &va, n);
-                a.copy(&Addr::Abs("rt_b".into()), &vb, n);
-                a.ins(format!("lda #{n}"));
-                a.ins("sta rt_n");
-                let (routine, result) = match op {
-                    Div => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_a"),
-                    Rem => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_r"),
-                    _ => ("rt_mul", "rt_r"),
-                };
-                a.ins(format!("jsr {routine}"));
-                a.copy(dst, &Val::Mem(Addr::Abs(result.into())), n);
+                if !inline {
+                    a.copy(&Addr::Abs("rt_a".into()), &va, n);
+                    a.copy(&Addr::Abs("rt_b".into()), &vb, n);
+                    // One and two bytes have their own multiplication.
+                    if !mul || n > 2 {
+                        a.ins(format!("lda #{n}"));
+                        a.ins("sta rt_n");
+                    }
+                    let (routine, result) = match op {
+                        Div => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_a"),
+                        Rem => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_r"),
+                        _ if n == 1 => ("rt_mul8", "rt_r"),
+                        _ if n == 2 => ("rt_mul16", "rt_r"),
+                        _ => ("rt_mul", "rt_r"),
+                    };
+                    a.ins(format!("jsr {routine}"));
+                    a.copy(dst, &Val::Mem(Addr::Abs(result.into())), n);
+                }
                 if op == MulWithOverflow {
                     // TODO: detect overflow (needs the full-width product).
                     let fo = dl.fields.offset(1).bytes();
@@ -2688,6 +3006,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     }
                     let kv = Val::imm_u64(k, 2);
                     let a = &mut self.p.asm;
+                    if Self::add_in_place(a, dst, &va, &kv, 2, true) {
+                        return;
+                    }
                     a.setup_val(&va, 0);
                     a.setup(dst, 2);
                     a.ins("clc");
@@ -2701,13 +3022,18 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 if elem == 1 {
                     let vb = if lb.size.bytes() >= 2 {
                         vb.clone()
-                    } else {
+                    } else if let Some(b) = vb.byte(0) {
                         // one byte, zero-extended
+                        Val::Imm(vec![b, "#$00".into()])
+                    } else {
                         let t = self.temp(1);
                         self.a().copy(&Addr::Abs(t.clone()), &vb, 1);
                         Val::Imm(vec![t, "#$00".into()])
                     };
                     let a = &mut self.p.asm;
+                    if Self::add_in_place(a, dst, &va, &vb, 2, true) {
+                        return;
+                    }
                     a.setup_val(&va, 0);
                     a.setup_val(&vb, 1);
                     a.setup(dst, 2);

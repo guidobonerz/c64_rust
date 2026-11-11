@@ -10,8 +10,10 @@
 //!
 //! Two raster interrupts limit this to the scroller's row: the first one,
 //! above the row, sets the shift and 38 columns; the second one, below it,
-//! restores the normal 40 columns. The rows next to the scroller are empty,
-//! so it does not matter on exactly which raster line the handlers act.
+//! restores the normal 40 columns. The rows around the scroller are empty,
+//! so it does not matter on exactly which raster line the handlers act:
+//! each has some 50 lines until the next text. A debug build needs them,
+//! its handlers are slow.
 #![no_std]
 #![no_main]
 
@@ -73,7 +75,8 @@ fn main() {
         text::put_char(col, ROW, b' ', RAINBOW[(col / 5) as usize & 7]);
     }
 
-    irq::add(ROW_LINE - 6, scroll_on);
+    // Below the title (row 4), and just below the scroller.
+    irq::add(ROW_LINE - 54, scroll_on);
     irq::add(ROW_LINE + 10, scroll_off);
 
     let mut next = 0usize;

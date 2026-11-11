@@ -144,6 +144,43 @@ pub extern "C" fn main() {
     check(f(bb(5)) == 15);
     // 36: iterator adapters
     check((0..bb(10u8)).filter(|x| x % 3 == 0).map(|x| x as u16 * 2).sum::<u16>() == 36);
+    // 37-41: multiply by a constant (shifts and additions, or the runtime)
+    check(bb(7u8) * 10 == 70 && bb(3u8).wrapping_mul(255) == 253 && bb(9u8) * 0 == 0);
+    check(bb(25u16) * 40 == 1000 && bb(199u16) * 320 == 63680);
+    check(bb(123u16).wrapping_mul(0xfffb) == 0xfd99 && 100 * bb(655u16) == 65500);
+    check(bb(-7i16) * 100 == -700 && bb(-3i8) * 5 == -15);
+    let mut m = bb(321u16);
+    m *= 10;
+    check(m == 3210);
+    // 42-45: multiply, variable operands
+    check(bb(255u8).wrapping_mul(bb(255)) == 1 && bb(0u8) * bb(9) == 0 && bb(16u8) * bb(15) == 240);
+    check(bb(0xffffu16).wrapping_mul(bb(0xffff)) == 1 && bb(256u16) * bb(255) == 65280);
+    check(bb(-300i16) * bb(100) == -30000 && bb(0u16) * bb(1234) == 0);
+    check(
+        bb(0x0001_0000u32) * bb(0xffff) == 0xffff_0000
+            && bb(0xffff_ffffu32).wrapping_mul(bb(0xffff_ffff)) == 1
+            && bb(123_456_789u64) * bb(1_000_000_007) == 123_456_789_864_197_523
+            && bb(5u32) * bb(0) == 0,
+    );
+    // 46-49: add and subtract a small value in place
+    let mut w = bb(0x12f0u16);
+    w += 0x20;
+    check(w == 0x1310);
+    w -= 0x11;
+    check(w == 0x12ff);
+    let mut d = bb(0x00ff_fff0u32);
+    d += 0x20;
+    d += 1;
+    check(d == 0x0100_0011);
+    let mut q = bb(0xffff_ffff_ffff_ffffu64);
+    q = q.wrapping_add(1);
+    let mut z = bb(0x1200u16);
+    z -= 1;
+    check(q == 0 && z == 0x11ff && 5 + bb(1000u16) == 1005);
+    // 50: indexing with a scaled index (elements of 3 and 6 bytes)
+    let rgb = [[1u8, 2, 3], [4, 5, 6], [7, 8, 9]];
+    let wide = [[1u16, 2, 3], [4, 5, 6], [7, 8, 9]];
+    check(rgb[bb(2usize)][1] == 8 && wide[bb(1usize)][2] == 6 && wide[bb(2u8) as usize][0] == 7);
 
     unsafe {
         write_volatile(0xd020 as *mut u8, if FAILS == 0 { 5 } else { 2 });

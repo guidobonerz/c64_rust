@@ -801,3 +801,95 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
     out.push('\n');
     out
 }
+
+/// Whether the program text can change machine state that the exit code
+/// restores for BASIC: the interrupt setup, the memory configuration, the
+/// VIC mode and bank, the SID.
+///
+/// The answer is "no" only if every write is to a place that is known and
+/// harmless: a label of the program, or an absolute address outside the
+/// CPU port, the interrupt vectors and the I/O area (the border and
+/// background colours `$D020`-`$D02E` are not restored and do not count).
+/// A store through a pointer or with an index on a numeric address, a call
+/// to a numeric address outside the ROMs, an indirect jump, `sei` and
+/// labels that are names for such addresses all count as "can change it".
+/// Calls into the BASIC and KERNAL ROMs do not: they leave the machine in
+/// a state BASIC can go on with.
+pub fn touches_hw(text: &str) -> bool {
+    let risky_addr = |a: u32| a < 2 || (0x0314..=0x0319).contains(&a) || (0xd000..=0xdfff).contains(&a) && !(0xd020..=0xd02e).contains(&a);
+    // A number or a sum of numbers (`$d000+32`).
+    let number = |e: &str| -> Option<u32> {
+        let mut sum = 0u32;
+        for part in e.split('+') {
+            let part = part.trim();
+            sum += match part.strip_prefix('$') {
+                Some(h) => u32::from_str_radix(h, 16).ok()?,
+                None => part.parse().ok()?,
+            };
+        }
+        Some(sum)
+    };
+    let numeric = |e: &str| e.starts_with('$') || e.chars().next().is_some_and(|c| c.is_ascii_digit());
+    // Names for risky addresses: `name = $d011`.
+    let mut names = std::collections::HashSet::new();
+    for l in text.lines() {
+        let l = l.split(';').next().unwrap_or("");
+        if let Some((name, value)) = l.split_once('=')
+            && !l.starts_with(' ')
+            && numeric(value.trim())
+            && number(value).is_none_or(risky_addr)
+        {
+            names.insert(name.trim().to_owned());
+        }
+    }
+    for l in text.lines() {
+        let l = l.split(';').next().unwrap_or("");
+        let mut t = l.trim();
+        // strip a label in front of the instruction
+        if let Some(i) = t.find(':')
+            && !t[..i].contains(char::is_whitespace)
+        {
+            t = t[i + 1..].trim();
+        }
+        if t.is_empty() || t.starts_with('.') || t.contains('=') {
+            continue;
+        }
+        let (op, arg) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
+        let (op, arg) = (op.to_ascii_lowercase(), arg.trim());
+        match op.as_str() {
+            "sei" | "txs" | "brk" => return true,
+            "jsr" | "jmp" => {
+                let rom = |a: u32| (0xa000..=0xbfff).contains(&a) || a >= 0xe000;
+                if arg.starts_with('(') || numeric(arg) && !number(arg).is_some_and(rom) {
+                    return true;
+                }
+            }
+            "sta" | "stx" | "sty" | "inc" | "dec" | "asl" | "lsr" | "rol" | "ror" => {
+                if arg.is_empty() || arg.eq_ignore_ascii_case("a") {
+                    continue;
+                }
+                if arg.contains('(') {
+                    return true;
+                }
+                let (base, indexed) = match arg.split_once(',') {
+                    Some((b, _)) => (b.trim(), true),
+                    None => (arg, false),
+                };
+                if numeric(base) {
+                    if indexed || number(base).is_none_or(risky_addr) {
+                        return true;
+                    }
+                } else {
+                    let end = base
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '@'))
+                        .unwrap_or(base.len());
+                    if names.contains(&base[..end]) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}

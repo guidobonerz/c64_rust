@@ -1,0 +1,1040 @@
+; c64::gfx: pixels, lines, areas, rectangles and circles on the bitmap at
+; $6000 (calling convention: see c64::rat_source!).
+;
+; All routines take a pattern and a mode. The mode is 0 for hires (320
+; pixels of one bit) or $80 for multicolour (160 pixels of two bits). The
+; pattern is the byte a cell row has when all its pixels are drawn with the
+; pen ($00/$ff in hires; $00, $55, $aa, $ff in multicolour); a pixel takes
+; its bits from the pattern. Coordinates are signed 16-bit numbers; what
+; is outside the screen is not drawn.
+;
+; Inside, x is counted in bits (0-319), in rt_a/rt_a+1; y is in rt_a+2 and
+; the mode in rt_a+3. zp_p0 points to the byte column of the cell (the
+; byte is at (zp_p0),y with Y = y & 7), zp_p1 is the mask of the pixel's
+; bits and zp_p1+1 the pattern. Everything is in registers that the
+; interrupt dispatcher saves, and no code is modified: handlers may draw
+; too.
+
+; c64_gfx_put(x: i16, y: i16, pattern: u8, mode: u8): one pixel.
+c64_gfx_put:
+        lda c64_gfx_put__args+3
+        beq @y
+@out:   rts
+@y:     lda c64_gfx_put__args+2
+        cmp #200
+        bcs @out
+        sta rt_a+2
+        lda c64_gfx_put__args
+        ldx c64_gfx_put__args+1
+        ldy c64_gfx_put__args+5
+        sty rt_a+3
+        bmi @mc
+        cpx #1                  ; hires: 0-319
+        bcc @ok
+        bne @out
+        cmp #64
+        bcs @out
+        bcc @ok
+@mc:    cpx #0                  ; multicolour: 0-159, two bits each
+        bne @out
+        cmp #160
+        bcs @out
+        asl
+        bcc @ok
+        inx
+@ok:    sta rt_a
+        stx rt_a+1
+        lda c64_gfx_put__args+4
+        sta zp_p1+1
+        jsr c64_gfx_addr
+; The bits of the mask zp_p1 in the byte at (zp_p0),y from the pattern.
+c64_gfx_set:
+        lda (zp_p0),y
+        eor zp_p1+1
+        and zp_p1
+        eor (zp_p0),y
+        sta (zp_p0),y
+        rts
+
+; The byte and the mask of the pixel at rt_a.. (see above).
+c64_gfx_addr:
+        lda rt_a+2
+        lsr
+        lsr
+        lsr
+        tax
+        lda rt_a
+        and #$f8
+        clc
+        adc c64_gfx_rowlo,x
+        sta zp_p0
+        lda rt_a+1
+        adc c64_gfx_rowhi,x
+        sta zp_p0+1
+        lda rt_a
+        and #7
+        bit rt_a+3
+        bpl @hires
+        ora #8
+@hires: tax
+        lda c64_gfx_mask,x
+        sta zp_p1
+        lda rt_a+2
+        and #7
+        tay
+        rts
+
+; The address of each cell row of the bitmap.
+c64_gfx_rowlo:
+        .fill 25, <($6000 + i * 320)
+c64_gfx_rowhi:
+        .fill 25, >($6000 + i * 320)
+; The mask of the pixel at bit x & 7: hires, then multicolour.
+c64_gfx_mask:
+        .byte $80, $40, $20, $10, $08, $04, $02, $01
+        .byte $c0, $c0, $30, $30, $0c, $0c, $03, $03
+
+; c64_gfx_line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mode: u8):
+; a line, both ends included.
+;
+; * Horizontal and vertical lines are areas one pixel high or wide
+;   (c64_gfx_area): cut to the screen, then whole bytes, or one column.
+; * With both ends on the screen: the loops below.
+; * Otherwise pixel by pixel through c64_gfx_put (c64_gfx_sline).
+;
+; c64_gfx_fline (same arguments) draws the same line, and flat ones
+; faster, in horizontal runs (c64_gfx_runs). That code is only part of
+; programs that call c64_gfx_fline: it leaves the address of the routine
+; in rt_r, which is 0 for c64_gfx_line.
+;
+; All three draw the pixels of this Bresenham line from (x0, y0) to
+; (x1, y1), with `major` the longer and `minor` the shorter side:
+;
+;   err = (major - 1) / 2
+;   repeat major times: one step along the longer side; err -= minor;
+;       if err < 0 { err += major; one step along the shorter side }
+;
+; The loops here draw from left to right. When that swaps the ends, err
+; starts with major / 2, which gives the same pixels. The address is not
+; computed for each pixel: a step to the right shifts the mask, a step up
+; or down changes Y, and only at the edge of a cell the pointer moves.
+;
+; rt_b: dx (2 bytes), rt_b+2: dy, rt_b+5: steps left (high byte; the low
+; byte is in X), rt_b+6: $80 if the ends were swapped, rt_b+7: $80 if the
+; line goes up. zp_p2: err.
+c64_gfx_fline:
+        ldx #9
+@copy:  lda c64_gfx_fline__args,x
+        sta c64_gfx_line__args,x
+        dex
+        bpl @copy
+        lda #<(c64_gfx_runs-1)
+        ldx #>(c64_gfx_runs-1)
+        bne c64_gfx_draw
+c64_gfx_line:
+        lda #0
+        tax
+c64_gfx_draw:
+        sta rt_r
+        stx rt_r+1
+        lda c64_gfx_line__args+2
+        cmp c64_gfx_line__args+6
+        bne @notx
+        lda c64_gfx_line__args+3
+        cmp c64_gfx_line__args+7
+        beq @area
+@notx:  lda c64_gfx_line__args
+        cmp c64_gfx_line__args+4
+        bne @slant
+        lda c64_gfx_line__args+1
+        cmp c64_gfx_line__args+5
+        bne @slant
+@area:  ldx #2                  ; the corners in order, for c64_gfx_area
+@sort:  lda c64_gfx_line__args+4,x
+        cmp c64_gfx_line__args,x
+        lda c64_gfx_line__args+5,x
+        sbc c64_gfx_line__args+1,x
+        bvc @sign
+        eor #$80
+@sign:  bpl @sorted
+        jsr @swap2
+@sorted:
+        dex
+        dex
+        bpl @sort
+        ldx #9
+@copy:  lda c64_gfx_line__args,x
+        sta c64_gfx_area__args,x
+        dex
+        bpl @copy
+        jmp c64_gfx_area
+
+@slant: ldx #0
+        jsr @onscr
+        bcs @slow
+        ldx #4
+        jsr @onscr
+        bcc @fast
+@slow:  jmp c64_gfx_sline
+
+@fast:  lda c64_gfx_line__args+8
+        sta zp_p1+1
+        lda c64_gfx_line__args+9
+        sta rt_a+3
+        ldy #0
+        lda c64_gfx_line__args+4
+        cmp c64_gfx_line__args
+        lda c64_gfx_line__args+5
+        sbc c64_gfx_line__args+1
+        bcs @order
+        ldx #0                  ; x1 < x0: swap the ends
+        jsr @swap2
+        ldx #2
+        jsr @swap2
+        ldy #$80
+@order: sty rt_b+6
+        sec
+        lda c64_gfx_line__args+4
+        sbc c64_gfx_line__args
+        sta rt_b
+        lda c64_gfx_line__args+5
+        sbc c64_gfx_line__args+1
+        sta rt_b+1
+        lda c64_gfx_line__args
+        sta rt_a
+        lda c64_gfx_line__args+1
+        sta rt_a+1
+        bit rt_a+3
+        bpl @hires
+        asl rt_a                ; multicolour: two bits per pixel
+        rol rt_a+1
+@hires: lda c64_gfx_line__args+2
+        sta rt_a+2
+        ldx #0
+        sec
+        lda c64_gfx_line__args+6
+        sbc c64_gfx_line__args+2
+        bcs @down
+        eor #$ff
+        adc #1
+        ldx #$80
+@down:  sta rt_b+2
+        stx rt_b+7
+        jsr c64_gfx_addr
+        lda rt_b+1
+        bne @xmajor
+        lda rt_b
+        cmp rt_b+2
+        bcs @xmajor
+        jmp @ymajor
+
+; dx >= dy: one pixel per column
+@xmajor:
+        lda rt_r+1              ; c64_gfx_fline, and a flat line
+        beq @pixels             ; (dx >= 8 * dy): in runs
+        lda rt_b+1
+        lsr
+        lda rt_b
+        ror
+        lsr
+        lsr
+        cmp rt_b+2
+        bcc @pixels
+        lda rt_b
+        ldx rt_b+1
+        jsr @init
+        lda rt_r+1              ; jmp c64_gfx_runs
+        pha
+        lda rt_r
+        pha
+        rts
+@pixels:
+        lda rt_b
+        ldx rt_b+1
+        jsr @init
+@xloop: lda (zp_p0),y
+        eor zp_p1+1
+        and zp_p1
+        eor (zp_p0),y
+        sta (zp_p0),y
+        txa
+        bne @xgo
+        dec rt_b+5
+        bmi @done
+@xgo:   dex
+        lsr zp_p1               ; one pixel to the right
+        bit rt_a+3
+        bpl @xbit
+        lsr zp_p1
+@xbit:  bcc @xerr
+        lda rt_a+3              ; the next byte: mask $80 or $c0
+        lsr
+        ora #$80
+        sta zp_p1
+        lda zp_p0               ; (carry is clear)
+        adc #8
+        sta zp_p0
+        bcc @xerr
+        inc zp_p0+1
+@xerr:  sec
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @xloop
+        dec zp_p2+1
+        bpl @xloop
+        clc                     ; err < 0: err += dx, one line up or down
+        adc rt_b
+        sta zp_p2
+        lda zp_p2+1
+        adc rt_b+1
+        sta zp_p2+1
+        jsr @ystep
+        jmp @xloop
+@done:  rts
+
+; dy > dx: one pixel per line; dx and dy are below 200, err has one byte
+@ymajor:
+        lda rt_b+2
+        ldx #0
+        jsr @init
+@yloop: lda (zp_p0),y
+        eor zp_p1+1
+        and zp_p1
+        eor (zp_p0),y
+        sta (zp_p0),y
+        txa
+        beq @done
+        dex
+        jsr @ystep
+        sec
+        lda zp_p2
+        sbc rt_b
+        sta zp_p2
+        bcs @yloop
+        adc rt_b+2              ; err < 0: err += dy, one pixel to the right
+        sta zp_p2
+        lsr zp_p1
+        bit rt_a+3
+        bpl @ybit
+        lsr zp_p1
+@ybit:  bcc @yloop
+        lda rt_a+3
+        lsr
+        ora #$80
+        sta zp_p1
+        lda zp_p0
+        adc #8
+        sta zp_p0
+        bcc @yloop
+        inc zp_p0+1
+        bne @yloop
+
+; one line down or up
+@ystep: bit rt_b+7
+        bmi @up
+        iny
+        cpy #8
+        bne @stepped
+        ldy #0
+        clc
+        lda zp_p0
+        adc #$40
+        sta zp_p0
+        lda zp_p0+1
+        adc #1
+        sta zp_p0+1
+        rts
+@up:    dey
+        bpl @stepped
+        ldy #7
+        sec
+        lda zp_p0
+        sbc #$40
+        sta zp_p0
+        lda zp_p0+1
+        sbc #1
+        sta zp_p0+1
+@stepped:
+        rts
+
+; A/X = the longer side: the number of steps (low byte in X), and err.
+@init:  stx rt_b+5
+        pha
+        bit rt_b+6
+        bmi @half
+        sec
+        sbc #1
+        bcs @half
+        dex
+@half:  stx zp_p2+1
+        lsr zp_p2+1
+        ror
+        sta zp_p2
+        pla
+        tax
+        rts
+
+; exchanges the two bytes at args,x and args+4,x
+@swap2: jsr @swap1
+        inx
+        jsr @swap1
+        dex
+        rts
+@swap1: lda c64_gfx_line__args,x
+        pha
+        lda c64_gfx_line__args+4,x
+        sta c64_gfx_line__args,x
+        pla
+        sta c64_gfx_line__args+4,x
+        rts
+
+; carry clear if the point at args,x is on the screen
+@onscr: lda c64_gfx_line__args+3,x
+        bne @off
+        lda c64_gfx_line__args+2,x
+        cmp #200
+        bcs @ret
+        lda c64_gfx_line__args+1,x
+        beq @low
+        cmp #1
+        bne @off
+        bit c64_gfx_line__args+9
+        bmi @off
+        lda c64_gfx_line__args,x
+        cmp #64
+        rts
+@low:   bit c64_gfx_line__args+9
+        bpl @on
+        lda c64_gfx_line__args,x
+        cmp #160
+        rts
+@on:    clc
+        rts
+@off:   sec
+@ret:   rts
+
+; The line of c64_gfx_line (same arguments) with any ends: the
+; coordinates are stepped as 16-bit numbers in the arguments of
+; c64_gfx_put, which leaves out what is not on the screen.
+;
+; For the axes x (index 0) and y (index 2): rt_b: the length of the side,
+; rt_t: $80 if it goes down. rt_b+4: steps left, rt_t+4/+5: the index of
+; the longer and the shorter side. zp_p2: err.
+c64_gfx_sline:
+        lda c64_gfx_line__args+8
+        sta c64_gfx_put__args+4
+        lda c64_gfx_line__args+9
+        sta c64_gfx_put__args+5
+        ldx #2
+@axis:  lda c64_gfx_line__args,x
+        sta c64_gfx_put__args,x
+        lda c64_gfx_line__args+1,x
+        sta c64_gfx_put__args+1,x
+        lda #0
+        sta rt_t,x
+        sec
+        lda c64_gfx_line__args+4,x
+        sbc c64_gfx_line__args,x
+        sta rt_b,x
+        lda c64_gfx_line__args+5,x
+        sbc c64_gfx_line__args+1,x
+        sta rt_b+1,x
+        bpl @plus
+        sec
+        lda #0
+        sbc rt_b,x
+        sta rt_b,x
+        lda #0
+        sbc rt_b+1,x
+        sta rt_b+1,x
+        lda #$80
+        sta rt_t,x
+@plus:  dex
+        dex
+        bpl @axis
+        ldx #0
+        ldy #2
+        lda rt_b
+        cmp rt_b+2
+        lda rt_b+1
+        sbc rt_b+3
+        bcs @major
+        ldx #2
+        ldy #0
+@major: stx rt_t+4
+        sty rt_t+5
+        lda rt_b,x
+        sta rt_b+4
+        sec
+        sbc #1
+        tay
+        lda rt_b+1,x
+        sta rt_b+5
+        sbc #0
+        lsr
+        sta zp_p2+1
+        tya
+        ror
+        sta zp_p2
+@loop:  jsr c64_gfx_put
+        lda rt_b+4
+        bne @count
+        lda rt_b+5
+        beq @done
+        dec rt_b+5
+@count: dec rt_b+4
+        ldx rt_t+4
+        jsr @step
+        ldx rt_t+5
+        sec
+        lda zp_p2
+        sbc rt_b,x
+        sta zp_p2
+        lda zp_p2+1
+        sbc rt_b+1,x
+        sta zp_p2+1
+        bcs @loop
+        ldy rt_t+4
+        clc
+        lda zp_p2
+        adc rt_b,y
+        sta zp_p2
+        lda zp_p2+1
+        adc rt_b+1,y
+        sta zp_p2+1
+        jsr @step
+        jmp @loop
+@done:  rts
+
+; the coordinate with index X one further
+@step:  lda rt_t,x
+        bmi @back
+        inc c64_gfx_put__args,x
+        bne @same
+        inc c64_gfx_put__args+1,x
+@same:  rts
+@back:  lda c64_gfx_put__args,x
+        bne @low
+        dec c64_gfx_put__args+1,x
+@low:   dec c64_gfx_put__args,x
+        rts
+
+; The flat lines of c64_gfx_fline (dx >= 8 * dy, both ends on the screen,
+; from left to right; dx, dy, the direction and err as in c64_gfx_line).
+;
+; A flat line is a staircase of horizontal runs, one per line, and a
+; run is drawn like a horizontal line: whole bytes at a time
+; (c64_gfx_span). The run lengths come from the same err: with
+; err = q * dy + r (r < dy), q + 1 pixels are on this line, and the next
+; line starts with err = r - dy + dx. So after the first run every run
+; has dx / dy pixels, or one more whenever the remainders add up to dy;
+; the last one ends with the line.
+;
+; rt_t: pixels left (2 bytes), rt_t+2: dy, rt_t+3: dx / dy (2 bytes),
+; rt_t+5: dx % dy, rt_t+6: r. zp_p2: the run. The position is kept in the
+; arguments (x0, y0).
+c64_gfx_runs:
+        lda rt_b+2
+        sta rt_t+2
+        ldx rt_b+1              ; pixels: dx + 1
+        ldy rt_b
+        iny
+        bne @r1
+        inx
+@r1:    sty rt_t
+        stx rt_t+1
+        lda zp_p2               ; the first run: err / dy + 1
+        sta rt_t+3
+        lda zp_p2+1
+        sta rt_t+4
+        jsr @div
+        sta rt_t+6
+        ldx rt_t+4
+        ldy rt_t+3
+        iny
+        bne @r2
+        inx
+@r2:    sty zp_p2
+        stx zp_p2+1
+        lda rt_b
+        sta rt_t+3
+        lda rt_b+1
+        sta rt_t+4
+        jsr @div
+        sta rt_t+5
+@run:   lda rt_t                ; not more than the pixels left
+        cmp zp_p2
+        lda rt_t+1
+        sbc zp_p2+1
+        bcs @fits
+        lda rt_t
+        sta zp_p2
+        lda rt_t+1
+        sta zp_p2+1
+@fits:  clc                     ; from x to x + run - 1; x += run
+        lda c64_gfx_line__args
+        sta c64_gfx_area__args
+        adc zp_p2
+        sta c64_gfx_line__args
+        tay
+        lda c64_gfx_line__args+1
+        sta c64_gfx_area__args+1
+        adc zp_p2+1
+        sta c64_gfx_line__args+1
+        tax
+        tya
+        bne @r3
+        dex
+@r3:    dey
+        sty c64_gfx_area__args+4
+        stx c64_gfx_area__args+5
+        lda c64_gfx_line__args+2
+        sta c64_gfx_area__args+2
+        lda #1
+        sta c64_gfx_area__args+3
+        jsr c64_gfx_span
+        sec                     ; pixels left
+        lda rt_t
+        sbc zp_p2
+        sta rt_t
+        lda rt_t+1
+        sbc zp_p2+1
+        sta rt_t+1
+        ora rt_t
+        beq @rdone
+        bit rt_b+7              ; the next line
+        bmi @rup
+        inc c64_gfx_line__args+2
+        bne @rnext
+@rup:   dec c64_gfx_line__args+2
+@rnext: lda rt_t+3              ; its run: dx / dy, or one more
+        sta zp_p2
+        lda rt_t+4
+        sta zp_p2+1
+        clc
+        lda rt_t+6
+        adc rt_t+5
+        bcs @rmore
+        cmp rt_t+2
+        bcc @rkeep
+@rmore: sbc rt_t+2
+        inc zp_p2
+        bne @rkeep
+        inc zp_p2+1
+@rkeep: sta rt_t+6
+        jmp @run
+@rdone: rts
+
+; rt_t+3/+4 divided by rt_t+2: the quotient replaces it, the remainder
+; is in A.
+@div:   lda #0
+        ldx #16
+@div1:  asl rt_t+3
+        rol rt_t+4
+        rol
+        bcs @div2
+        cmp rt_t+2
+        bcc @div3
+@div2:  sbc rt_t+2
+        inc rt_t+3
+@div3:  dex
+        bne @div1
+        rts
+
+; c64_gfx_hline(x0: i16, x1: i16, y: i16, pattern: u8, mode: u8): the
+; horizontal line from x0 to x1 (in any order) as an area.
+c64_gfx_hline:
+        lda c64_gfx_hline__args+4
+        sta c64_gfx_area__args+2
+        sta c64_gfx_area__args+6
+        lda c64_gfx_hline__args+5
+        sta c64_gfx_area__args+3
+        sta c64_gfx_area__args+7
+        lda c64_gfx_hline__args+6
+        sta c64_gfx_area__args+8
+        lda c64_gfx_hline__args+7
+        sta c64_gfx_area__args+9
+        ldx #0                  ; X: the left end, Y: the right end
+        ldy #2
+        lda c64_gfx_hline__args+2
+        cmp c64_gfx_hline__args
+        lda c64_gfx_hline__args+3
+        sbc c64_gfx_hline__args+1
+        bvc @sign
+        eor #$80
+@sign:  bpl @order
+        ldx #2
+        ldy #0
+@order: lda c64_gfx_hline__args,x
+        sta c64_gfx_area__args
+        lda c64_gfx_hline__args+1,x
+        sta c64_gfx_area__args+1
+        lda c64_gfx_hline__args,y
+        sta c64_gfx_area__args+4
+        lda c64_gfx_hline__args+1,y
+        sta c64_gfx_area__args+5
+        jmp c64_gfx_area
+
+; c64_gfx_vline(x: i16, y0: i16, y1: i16, pattern: u8, mode: u8): the
+; vertical line from y0 to y1 (in any order) as an area.
+c64_gfx_vline:
+        lda c64_gfx_vline__args
+        sta c64_gfx_area__args
+        sta c64_gfx_area__args+4
+        lda c64_gfx_vline__args+1
+        sta c64_gfx_area__args+1
+        sta c64_gfx_area__args+5
+        lda c64_gfx_vline__args+6
+        sta c64_gfx_area__args+8
+        lda c64_gfx_vline__args+7
+        sta c64_gfx_area__args+9
+        ldx #2                  ; X: the upper end, Y: the lower end
+        ldy #4
+        lda c64_gfx_vline__args+4
+        cmp c64_gfx_vline__args+2
+        lda c64_gfx_vline__args+5
+        sbc c64_gfx_vline__args+3
+        bvc @sign
+        eor #$80
+@sign:  bpl @order
+        ldx #4
+        ldy #2
+@order: lda c64_gfx_vline__args,x
+        sta c64_gfx_area__args+2
+        lda c64_gfx_vline__args+1,x
+        sta c64_gfx_area__args+3
+        lda c64_gfx_vline__args,y
+        sta c64_gfx_area__args+6
+        lda c64_gfx_vline__args+1,y
+        sta c64_gfx_area__args+7
+        jmp c64_gfx_area
+
+; c64_gfx_area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mode: u8):
+; all pixels from (x0, y0) to (x1, y1), both included; nothing if x1 < x0
+; or y1 < y0. The area is cut to the screen. Whole bytes are stored, only
+; the two ends of a line go through a mask. An area inside one byte column
+; (a vertical line) is drawn going down, without a new address per line.
+;
+; rt_b: bytes after the first one, rt_b+1/+2: masks of the first and the
+; last byte. The height replaces the high byte of y0.
+c64_gfx_area:
+        lda c64_gfx_area__args+9
+        sta rt_a+3
+        lda c64_gfx_area__args+8
+        sta zp_p1+1
+        ldx #2                  ; x0 and y0: not below 0
+@min:   lda c64_gfx_area__args+1,x
+        bpl @minok
+        lda #0
+        sta c64_gfx_area__args,x
+        sta c64_gfx_area__args+1,x
+@minok: dex
+        dex
+        bpl @min
+        lda c64_gfx_area__args+5
+        bpl @x1
+@out:   rts
+@x1:    ldx #$3f                ; x1: not beyond 319 or 159
+        ldy #1
+        bit rt_a+3
+        bpl @width
+        ldx #$9f
+        dey
+@width: cpx c64_gfx_area__args+4
+        tya
+        sbc c64_gfx_area__args+5
+        bcs @x1ok
+        stx c64_gfx_area__args+4
+        sty c64_gfx_area__args+5
+@x1ok:  lda c64_gfx_area__args+4
+        cmp c64_gfx_area__args
+        lda c64_gfx_area__args+5
+        sbc c64_gfx_area__args+1
+        bcc @out
+        lda c64_gfx_area__args+7 ; y1: not beyond 199
+        bmi @out
+        bne @y1max
+        lda c64_gfx_area__args+6
+        cmp #200
+        bcc @y1ok
+@y1max: lda #199
+        sta c64_gfx_area__args+6
+@y1ok:  lda c64_gfx_area__args+3
+        bne @out
+        lda c64_gfx_area__args+6
+        sec
+        sbc c64_gfx_area__args+2
+        bcc @out
+        adc #0                  ; the height: y1 - y0 + 1
+        sta c64_gfx_area__args+3
+; The area with the arguments of c64_gfx_area, on the screen, the height
+; in place of the high byte of y0; pattern and mode in zp_p1+1 and rt_a+3.
+c64_gfx_span:
+        lda c64_gfx_area__args+2
+        sta rt_a+2
+        bit rt_a+3
+        bpl @hires
+        asl c64_gfx_area__args  ; multicolour: bits 2 * x0 to 2 * x1 + 1
+        rol c64_gfx_area__args+1
+        sec
+        rol c64_gfx_area__args+4
+        rol c64_gfx_area__args+5
+@hires: lda c64_gfx_area__args+1
+        sta rt_a+1
+        lsr
+        lda c64_gfx_area__args
+        sta rt_a
+        ror
+        lsr
+        lsr
+        sta rt_b
+        lda c64_gfx_area__args+5
+        lsr
+        lda c64_gfx_area__args+4
+        ror
+        lsr
+        lsr
+        sec
+        sbc rt_b
+        sta rt_b
+        lda rt_a
+        and #7
+        tax
+        lda c64_gfx_left,x
+        sta rt_b+1
+        lda c64_gfx_area__args+4
+        and #7
+        tax
+        lda c64_gfx_right,x
+        sta rt_b+2
+        lda rt_b
+        bne @row
+        jsr c64_gfx_addr        ; one byte column: go down
+        lda rt_b+1
+        and rt_b+2
+        sta zp_p1
+        ldx c64_gfx_area__args+3
+@vloop: lda (zp_p0),y
+        eor zp_p1+1
+        and zp_p1
+        eor (zp_p0),y
+        sta (zp_p0),y
+        dex
+        beq @done
+        iny
+        cpy #8
+        bne @vloop
+        ldy #0
+        clc
+        lda zp_p0
+        adc #$40
+        sta zp_p0
+        lda zp_p0+1
+        adc #1
+        sta zp_p0+1
+        bne @vloop
+@done:  rts
+@row:   jsr c64_gfx_addr
+        lda rt_b+1
+        sta zp_p1
+        jsr c64_gfx_set
+        ldx rt_b
+        clc
+@col:   tya                     ; the next byte is 8 further
+        adc #8
+        tay
+        bcc @same
+        inc zp_p0+1
+        clc
+@same:  dex
+        beq @last
+        lda zp_p1+1
+        sta (zp_p0),y
+        bcc @col
+@last:  lda rt_b+2
+        sta zp_p1
+        jsr c64_gfx_set
+        inc rt_a+2
+        dec c64_gfx_area__args+3
+        bne @row
+        rts
+
+; The bits from x & 7 to the right end of a byte, and up to x & 7.
+c64_gfx_left:
+        .byte $ff, $7f, $3f, $1f, $0f, $07, $03, $01
+c64_gfx_right:
+        .byte $80, $c0, $e0, $f0, $f8, $fc, $fe, $ff
+
+; c64_gfx_rect(x: i16, y: i16, r: i16, b: i16, pattern: u8, mode: u8): the
+; outline of the rectangle with the corners (x, y) and (r, b); nothing if
+; r < x or b < y. Four areas: top, bottom, left, right.
+c64_gfx_rect:
+        ldx #2
+@check: lda c64_gfx_rect__args+4,x
+        cmp c64_gfx_rect__args,x
+        lda c64_gfx_rect__args+5,x
+        sbc c64_gfx_rect__args+1,x
+        bvc @sign
+        eor #$80
+@sign:  bmi @out
+        dex
+        dex
+        bpl @check
+        lda #0
+        sta rt_t+7
+@edge:  ldx #0
+@copy:  ldy rt_t+7
+        lda @corners,y
+        tay
+        lda c64_gfx_rect__args,y
+        sta c64_gfx_area__args,x
+        lda c64_gfx_rect__args+1,y
+        sta c64_gfx_area__args+1,x
+        inc rt_t+7
+        inx
+        inx
+        cpx #8
+        bne @copy
+        lda c64_gfx_rect__args+8
+        sta c64_gfx_area__args+8
+        lda c64_gfx_rect__args+9
+        sta c64_gfx_area__args+9
+        jsr c64_gfx_area
+        lda rt_t+7
+        cmp #16
+        bne @edge
+@out:   rts
+; where x0, y0, x1, y1 of each area come from
+@corners:
+        .byte 0, 2, 4, 2,  0, 6, 4, 6,  0, 2, 0, 6,  4, 2, 4, 6
+
+; c64_gfx_circle(cx: i16, cy: i16, r: i16, pattern: u8, mode: u8): a
+; circle (midpoint algorithm).
+;
+;   x = r; y = 0; err = 1 - r
+;   while x >= y:
+;       the eight pixels (cx +- x, cy +- y), (cx +- y, cy +- x)
+;       y += 1
+;       if err < 0: err += 2 * y + 1
+;       else:       x -= 1; err += 2 * (y - x) + 1
+;
+; rt_b: x, rt_b+2: y, rt_b+4: err (two bytes each). rt_t: cx + a, cx - a,
+; cy + b, cy - b for four of the pixels.
+c64_gfx_circle:
+        lda c64_gfx_circle__args+6
+        sta c64_gfx_put__args+4
+        lda c64_gfx_circle__args+7
+        sta c64_gfx_put__args+5
+        lda c64_gfx_circle__args+4
+        sta rt_b
+        lda c64_gfx_circle__args+5
+        sta rt_b+1
+        lda #0
+        sta rt_b+2
+        sta rt_b+3
+        sec                     ; err = 1 - r
+        lda #1
+        sbc rt_b
+        sta rt_b+4
+        lda #0
+        sbc rt_b+1
+        sta rt_b+5
+@loop:  sec                     ; x < y (signed): done
+        lda rt_b
+        sbc rt_b+2
+        lda rt_b+1
+        sbc rt_b+3
+        bvc @cmp
+        eor #$80
+@cmp:   bpl @draw
+        rts
+@draw:  ldx #0
+        ldy #2
+        jsr @four
+        ldx #2
+        ldy #0
+        jsr @four
+        inc rt_b+2
+        bne @err
+        inc rt_b+3
+@err:   lda rt_b+2              ; A/X = y
+        ldx rt_b+3
+        bit rt_b+5
+        bmi @add
+        lda rt_b                ; x -= 1
+        bne @decx
+        dec rt_b+1
+@decx:  dec rt_b
+        sec                     ; A/X = y - x
+        lda rt_b+2
+        sbc rt_b
+        tay
+        lda rt_b+3
+        sbc rt_b+1
+        tax
+        tya
+@add:   asl                     ; err += 2 * A/X + 1
+        sta rt_r
+        txa
+        rol
+        tax
+        sec
+        lda rt_b+4
+        adc rt_r
+        sta rt_b+4
+        txa
+        adc rt_b+5
+        sta rt_b+5
+        jmp @loop
+
+; The four pixels (cx +- a, cy +- b): a is at rt_b,x and b at rt_b,y.
+@four:  clc
+        lda c64_gfx_circle__args
+        adc rt_b,x
+        sta rt_t
+        lda c64_gfx_circle__args+1
+        adc rt_b+1,x
+        sta rt_t+1
+        sec
+        lda c64_gfx_circle__args
+        sbc rt_b,x
+        sta rt_t+2
+        lda c64_gfx_circle__args+1
+        sbc rt_b+1,x
+        sta rt_t+3
+        clc
+        lda c64_gfx_circle__args+2
+        adc rt_b,y
+        sta rt_t+4
+        lda c64_gfx_circle__args+3
+        adc rt_b+1,y
+        sta rt_t+5
+        sec
+        lda c64_gfx_circle__args+2
+        sbc rt_b,y
+        sta rt_t+6
+        lda c64_gfx_circle__args+3
+        sbc rt_b+1,y
+        sta rt_t+7
+        ldx #0
+        ldy #4
+        jsr @pixel
+        ldx #2
+        ldy #4
+        jsr @pixel
+        ldx #0
+        ldy #6
+        jsr @pixel
+        ldx #2
+        ldy #6
+; The pixel with x at rt_t,x and y at rt_t,y.
+@pixel: lda rt_t,x
+        sta c64_gfx_put__args
+        lda rt_t+1,x
+        sta c64_gfx_put__args+1
+        lda rt_t,y
+        sta c64_gfx_put__args+2
+        lda rt_t+1,y
+        sta c64_gfx_put__args+3
+        jmp c64_gfx_put

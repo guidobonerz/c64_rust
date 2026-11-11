@@ -191,7 +191,9 @@ lower case letters show as capitals.)
 The repository has more examples in `examples/`: `hello`, `sprites`,
 `drawing`, `music`, `dir` (the same as c64_go's), `joystick`, `scroller`
 (a horizontal soft scroll: `$D016` set by two raster interrupts for one
-text row), `diagonal` (the whole screen scrolls diagonally over a pattern in
+text row), `rasterbars` (colour bars over the whole width of the screen: a
+stable raster interrupt in assembly, the colour table from Rust),
+`diagonal` (the whole screen scrolls diagonally over a pattern in
 a custom character set, with two screens that are swapped) and `border`
 (the smallest program, without the library).
 
@@ -364,12 +366,13 @@ placed static in RAM. Using `c64::gfx` places its colour matrix at
 
 ### Start and exit
 
-The program starts like a BASIC program (`RUN`). The runtime
+The program starts like a BASIC program (`RUN`). The start code
 
-1. saves the zero page `$02-$8F` and clears it,
+1. saves the part of the zero page `$02-$8F` that the program uses and
+   clears it,
 2. saves the stack pointer, the IRQ vector (`$0314`), the CPU port
-   (`$01`) and the VIC registers `$D011`, `$D015`, `$D016`, `$D018`,
-   `$D020`, `$D021`, and CIA 2's port A (the VIC bank),
+   (`$01`), the VIC registers `$D011`, `$D015`, `$D016`, `$D018` and
+   CIA 2's port A (the VIC bank),
 3. initializes the zero-page statics,
 4. calls `main`.
 
@@ -379,6 +382,22 @@ configuration, the VIC mode and bank, silences the SID and restores the
 zero page, so BASIC continues normally. The border and background colours
 are not restored, so the program's last screen stays readable (and the
 tests can read the border colour).
+
+The backend generates this code for each program and leaves out what the
+program cannot need:
+
+| Step | Left out when |
+|---|---|
+| zero page | no zero-page statics, and no function frame in the zero page is used (otherwise only the used bytes are saved) |
+| stack pointer | nothing can reach `sys::exit()` or a panic |
+| interrupts, memory configuration, VIC, SID | every write of the program goes to a known, harmless place: its own variables, or a fixed address outside `$00/$01`, `$0314-$0319` and the I/O area (the colours `$D020-$D02E` are harmless) |
+
+Anything the backend cannot follow keeps the last step: a store through a
+pointer, an indexed store to a numeric address, `sei`, a call to a numeric
+address outside the ROMs or through a vector. Calls into the KERNAL and
+BASIC ROMs do not count. A program that needs none of the steps starts
+directly with `main`: `examples/border` (`lda #5`, `sta $d020`, `rts`) is
+a 20-byte file, 12 of them the BASIC line.
 
 ### Static frames
 
@@ -404,13 +423,15 @@ and stores byte by byte. The code is correct but not yet small or fast
 
 ### Runtime registers
 
-The arithmetic helpers (`rt_mul`, `rt_udiv`, `rt_sdiv`, `rt_memcpy`, ...)
+The arithmetic helpers (`rt_mul8`, `rt_mul16`, `rt_mul`, `rt_udiv`, `rt_sdiv`, `rt_memcpy`, ...)
 use registers in the BSS: `rt_a`, `rt_b`, `rt_r`, `rt_t` (8 bytes each),
 `rt_n`, `rt_cnt`; calls through pointers use `rt_args` (32 bytes),
 `rt_ret` (16 bytes) and `rt_jvec`. The interrupt dispatcher saves them
-(`rt_ctx_save`), but only if the code reached by handlers uses them;
-otherwise it saves only the six zero-page pointer bytes. Only the helpers
-a program uses are part of it.
+(`rt_ctx_save`), but only the groups that the code reached by handlers
+uses: the arithmetic registers (39 bytes), `rt_args`/`rt_ret` (48 bytes),
+the argument areas of assembly functions. Otherwise it saves only the six
+zero-page pointer bytes and `rt_jvec`. Only the helpers a program uses are
+part of it.
 
 ### Zero page
 
@@ -723,12 +744,34 @@ gfx::text();
 | `multicolor(bg, c1, c2, c3) -> Bitmap<Multicolor>` | 160x200, pens 0-3 |
 | `show_koala(pic) -> Option<Bitmap<Multicolor>>` | a Koala picture (10003 bytes with load address) |
 | `text()` | back to the text screen |
-| `Bitmap<M>` | `pen`, `clear`, `plot(x, y)`, `line`, `rect`, `fill_rect`, `circle` |
+| `Bitmap<M>` | `pen`, `clear`, `plot(x, y)`, `line(x0, y0, x1, y1)`, `fline` (the same, fast), `hline(x0, x1, y)`, `vline(x, y0, y1)`, `rect`, `fill_rect`, `circle` |
 | `Bitmap<Hires>` | also `point(x, y)`, `set_colors`, `set_cell_colors(col, row, fg, bg)` |
 | `BITMAP`, `MATRIX` | `$6000`, `$4000` (VIC bank 1) |
 
 Coordinates are `i16`; pixels outside the screen are skipped. The mode is
 part of the type, so `point` only exists for hires bitmaps.
+
+The drawing itself is assembly (`lib/c64/src/rat/gfx.rat`), shared by both
+modes, and a program contains just the routines it uses:
+
+* `plot`: one pixel, about 150 cycles.
+* `line`: with both ends on the screen, a mask and a pointer move from
+  pixel to pixel instead of a new address for each one (about 60-100
+  cycles per pixel). A line that leaves the screen is stepped pixel by
+  pixel through the pixel routine; it draws the same pixels.
+* `fline` draws the same line as `line`, and flat ones (at least 8
+  pixels across for each line down, both ends on the screen) as a
+  staircase of horizontal runs: each run is stored like a horizontal
+  line, whole bytes at a time, about three times as fast. It adds some
+  300 bytes to the program, which is why it is a method of its own.
+* `hline` and `vline` draw horizontal and vertical lines without the
+  line routine: a program that only needs those stays small. (`line`
+  also takes this path when it gets such a line.)
+* Horizontal and vertical lines, `fill_rect` and `rect` are areas: they
+  are cut to the screen first, then whole bytes are stored (about 25
+  cycles for 8 pixels) or, for one column, the routine goes down the
+  column (about 35 cycles per pixel).
+* `circle`: eight pixels per step.
 
 ### c64::sound — the SID
 
@@ -935,8 +978,22 @@ fn raster_bars() {
 }
 ```
 
-A handler costs a few raster lines of overhead (more if its code uses the
-runtime's arithmetic helpers), so keep the lines some distance apart.
+A handler costs a few raster lines of overhead, so keep the lines some
+distance apart. It costs more when its code uses the runtime's arithmetic
+helpers (about 16 lines more: the dispatcher saves their registers), and
+in a debug build nearly every handler does, through rustc's runtime
+checks. Where the screen allows it, leave a handler 30 lines or more
+before its effect is needed (`examples/scroller` does), or build with
+`--release`.
+
+The colour changes at a slightly different place in every frame, somewhere
+in the line: an interrupt starts up to seven cycles late, and Rust code
+is not timed by the cycle. For bars with clean edges, one colour per
+raster line, see `examples/rasterbars`: its `raster.rat` has a stable
+raster interrupt (two interrupts in a row, then cycle-counted code that
+also allows for the bad lines) that writes a 96-byte colour table to
+`$D020`/`$D021`, one byte per line, while the beam is off screen. The Rust
+program fills that table once per frame.
 
 ### Drawing on the bitmap
 
@@ -1501,7 +1558,7 @@ Values still live in memory and are handled byte by byte, so tight loops
 are slower than hand-written assembly. Still open: values in A/X/Y across
 statements, 8-bit loop counters in X/Y, inlining of small functions when
 the program is put together (rustc cannot inline trait methods called from
-generic code, such as the pixel routine of `gfx`). Release builds
+generic code). Release builds
 (`opt-level = "s"`) give the best code. Debug builds include rustc's
 runtime checks and are much bigger and slower.
 
