@@ -8,6 +8,13 @@
 ; its bits from the pattern. Coordinates are signed 16-bit numbers; what
 ; is outside the screen is not drawn.
 ;
+; With C64_GFX_UNCLIPPED defined (the crate's feature `gfx-unclipped`,
+; which puts the definition in front of this file) nothing is checked
+; against the screen: every pixel a routine is asked to draw must be on
+; it, or other memory is overwritten. That leaves out the checks of
+; c64_gfx_put, c64_gfx_line and c64_gfx_area and all of c64_gfx_sline.
+; Empty areas (x1 < x0 or y1 < y0) are still nothing.
+;
 ; Inside, x is counted in bits (0-319), in rt_a/rt_a+1; y is in rt_a+2 and
 ; the mode in rt_a+3. zp_p0 points to the byte column of the cell (the
 ; byte is at (zp_p0),y with Y = y & 7), zp_p1 is the mask of the pixel's
@@ -17,6 +24,18 @@
 
 ; c64_gfx_put(x: i16, y: i16, pattern: u8, mode: u8): one pixel.
 c64_gfx_put:
+.ifdef C64_GFX_UNCLIPPED {
+        lda c64_gfx_put__args+2
+        sta rt_a+2
+        lda c64_gfx_put__args
+        ldx c64_gfx_put__args+1
+        ldy c64_gfx_put__args+5
+        sty rt_a+3
+        bpl @ok
+        asl                     ; multicolour: two bits each
+        bcc @ok
+        inx
+} .else {
         lda c64_gfx_put__args+3
         beq @y
 @out:   rts
@@ -42,6 +61,7 @@ c64_gfx_put:
         asl
         bcc @ok
         inx
+}
 @ok:    sta rt_a
         stx rt_a+1
         lda c64_gfx_put__args+4
@@ -169,14 +189,16 @@ c64_gfx_draw:
         bpl @copy
         jmp c64_gfx_area
 
-@slant: ldx #0
+@slant:
+.ifndef C64_GFX_UNCLIPPED {
+        ldx #0
         jsr @onscr
         bcs @slow
         ldx #4
         jsr @onscr
         bcc @fast
 @slow:  jmp c64_gfx_sline
-
+}
 @fast:  lda c64_gfx_line__args+8
         sta zp_p1+1
         lda c64_gfx_line__args+9
@@ -389,6 +411,7 @@ c64_gfx_draw:
         sta c64_gfx_line__args+4,x
         rts
 
+.ifndef C64_GFX_UNCLIPPED {
 ; carry clear if the point at args,x is on the screen
 @onscr: lda c64_gfx_line__args+3,x
         bne @off
@@ -413,6 +436,7 @@ c64_gfx_draw:
         rts
 @off:   sec
 @ret:   rts
+}
 
 ; The line of c64_gfx_line (same arguments) with any ends: the
 ; coordinates are stepped as 16-bit numbers in the arguments of
@@ -422,6 +446,7 @@ c64_gfx_draw:
 ; rt_t: $80 if it goes down. rt_b+4: steps left, rt_t+4/+5: the index of
 ; the longer and the shorter side. zp_p2: err.
 c64_gfx_sline:
+.ifndef C64_GFX_UNCLIPPED {
         lda c64_gfx_line__args+8
         sta c64_gfx_put__args+4
         lda c64_gfx_line__args+9
@@ -519,6 +544,7 @@ c64_gfx_sline:
         dec c64_gfx_put__args+1,x
 @low:   dec c64_gfx_put__args,x
         rts
+}
 
 ; The flat lines of c64_gfx_fline (dx >= 8 * dy, both ends on the screen,
 ; from left to right; dx, dy, the direction and err as in c64_gfx_line).
@@ -723,6 +749,25 @@ c64_gfx_area:
         sta rt_a+3
         lda c64_gfx_area__args+8
         sta zp_p1+1
+.ifdef C64_GFX_UNCLIPPED {
+        ldx #2                  ; nothing if x1 < x0 or y1 < y0
+@empty: lda c64_gfx_area__args+4,x
+        cmp c64_gfx_area__args,x
+        lda c64_gfx_area__args+5,x
+        sbc c64_gfx_area__args+1,x
+        bvc @sign
+        eor #$80
+@sign:  bpl @some
+        rts
+@some:  dex
+        dex
+        bpl @empty
+        sec                     ; the height: y1 - y0 + 1
+        lda c64_gfx_area__args+6
+        sbc c64_gfx_area__args+2
+        adc #0
+        sta c64_gfx_area__args+3
+} .else {
         ldx #2                  ; x0 and y0: not below 0
 @min:   lda c64_gfx_area__args+1,x
         bpl @minok
@@ -768,6 +813,7 @@ c64_gfx_area:
         bcc @out
         adc #0                  ; the height: y1 - y0 + 1
         sta c64_gfx_area__args+3
+}
 ; The area with the arguments of c64_gfx_area, on the screen, the height
 ; in place of the high byte of y0; pattern and mode in zp_p1+1 and rt_a+3.
 c64_gfx_span:

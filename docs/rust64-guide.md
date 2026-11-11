@@ -225,6 +225,7 @@ Behind the scenes `cargo c64` writes the target specification
 ```
 cargo build -Zbuild-std=core -Zjson-target-spec --target target/rust64/mos-c64.json
   with RUSTFLAGS = -Zcodegen-backend=<backend> -Zalways-encode-mir -Zinline-mir
+                   -Zinline-mir-threshold=100 -Zinline-mir-hint-threshold=500
 ```
 
 with the pinned nightly. `core` is built from source for the C64 target.
@@ -820,6 +821,26 @@ modes, and a program contains just the routines it uses:
   cycles for 8 pixels) or, for one column, the routine goes down the
   column (about 35 cycles per pixel).
 * `circle`: eight pixels per step.
+
+**Without clipping.** All of this checks the coordinates against the
+screen. A program that never draws outside it can leave the checks out
+with the feature `gfx-unclipped` of the `c64` crate:
+
+```toml
+[dependencies]
+c64 = { path = "../c64_rust/lib/c64", features = ["gfx-unclipped"] }
+```
+
+or for one build: `cargo c64 build --release --features c64/gfx-unclipped`.
+The feature holds for the whole program. The pixel routine then has no
+range check, `line` does not look at its ends and the pixel-by-pixel
+line is not in the program: `examples/drawing` shrinks from 2663 to 2275
+bytes and draws 2.5% faster (the circles 6%; lines already ran without a
+check per pixel). The price: **every pixel must be on the screen.** One
+outside is written to other memory and can destroy the program. Empty
+rectangles (`w` or `h` not positive) still draw nothing, and `point`
+still answers `false` outside the screen. On the host the stand-ins
+always clip.
 
 ### c64::sound — the SID
 
@@ -1623,6 +1644,7 @@ ok   gfx (debug)
 | `lib` | printing, cursor, formatting, memory, `sys::jsr`, assembly functions, hardware registers, input |
 | `lib2` | function pointers, `at`/`zp` statics, exported statics, raster interrupts, SID tunes, sprites, sound, PETSCII literals |
 | `gfx` | hires and multicolour drawing, cell colours, bitmap mode |
+| `gfxu` | the same with the feature `gfx-unclipped`, everything on the screen |
 
 A test program writes the number of the first failing check to the screen,
 so the snapshot (`rust64-e2e-<name>-<profile>.png` in the temp directory)

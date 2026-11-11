@@ -18,6 +18,13 @@ use std::process::{Command, ExitCode};
 const TOOLCHAIN: &str = "nightly-2026-11-10";
 const TARGET_SPEC: &str = include_str!("../../../target-spec/mos-c64.json");
 const TARGET_NAME: &str = "mos-c64";
+/// How much rustc's MIR inliner may inline: functions without `#[inline]`
+/// up to a cost of 100 (rustc: 50), with it up to 500 (rustc: 100). A call
+/// is expensive here (the arguments go through memory), and the small
+/// `#[inline]` helpers of `core` (iterators, ranges) otherwise stay calls.
+/// These values gave the smallest total over the release builds of
+/// `examples/` (2.6% less; `drawing` 25% less); higher ones change nothing.
+const INLINE_FLAGS: &str = "-Zinline-mir-threshold=100 -Zinline-mir-hint-threshold=500";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -117,13 +124,15 @@ fn build(cmd: &str, mut args: Vec<String>) -> Result<(), String> {
     let name = package_name(&root).ok_or("no package name in Cargo.toml")?;
     let profile = if release { "release" } else { "debug" };
     rebuild_if_backend_changed(&root, &spec, &backend, &name, profile, release)?;
-    let mut rustflags = format!(
+    let backend_flags = format!(
         "-Zcodegen-backend={} -Zalways-encode-mir -Zinline-mir",
         backend.display()
     );
-    if let Ok(extra) = env::var("RUSTFLAGS") {
-        rustflags = format!("{extra} {rustflags}");
-    }
+    // The user's RUSTFLAGS come after the thresholds, so they can set others.
+    let rustflags = match env::var("RUSTFLAGS") {
+        Ok(extra) => format!("{INLINE_FLAGS} {extra} {backend_flags}"),
+        Err(_) => format!("{INLINE_FLAGS} {backend_flags}"),
+    };
 
     let status = Command::new("cargo")
         .env("RUSTUP_TOOLCHAIN", TOOLCHAIN)

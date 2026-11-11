@@ -11,6 +11,25 @@
 //! g.circle(160, 100, 50);
 //! gfx::text();
 //! ```
+//!
+//! # Clipping
+//!
+//! The drawing methods leave out what is outside the screen: a line may
+//! start at `(-50, 100)`. A program that never draws outside can switch the
+//! checks off with the feature `gfx-unclipped`, for the whole program:
+//!
+//! ```toml
+//! c64 = { path = "...", features = ["gfx-unclipped"] }
+//! ```
+//!
+//! Drawing is then faster (most for pixels and circles) and the program
+//! smaller (`examples/drawing`: 2275 instead of 2663 bytes, 2.5% faster),
+//! but **every pixel must be on the screen**: one
+//! outside is written to other memory, which can destroy the program. Empty
+//! rectangles (`w` or `h` not positive) still draw nothing, and
+//! [`Bitmap::point`] still answers `false` outside the screen. The feature
+//! only changes programs for the C64; on the host the stand-ins always
+//! clip.
 
 use core::marker::PhantomData;
 
@@ -101,8 +120,35 @@ impl Mode for Multicolor {
 // 16-bit arithmetic; the Rust versions here are what the host uses, and
 // they draw the same pixels.
 
-#[cfg(target_os = "c64")]
+#[cfg(all(target_os = "c64", not(feature = "gfx-unclipped")))]
 crate::rat_source!(GFX_RAT, "rat/gfx.rat");
+
+// The feature `gfx-unclipped`: the same assembly behind the definition
+// that switches its checks off (see rat/gfx.rat).
+#[cfg(all(target_os = "c64", feature = "gfx-unclipped"))]
+mod unclipped {
+    const DEFINE: &[u8] = b"C64_GFX_UNCLIPPED = 1\n";
+    const SOURCE: &[u8] = include_bytes!("rat/gfx.rat");
+
+    const fn joined() -> [u8; DEFINE.len() + SOURCE.len()] {
+        let mut out = [0; DEFINE.len() + SOURCE.len()];
+        let mut i = 0;
+        while i < DEFINE.len() {
+            out[i] = DEFINE[i];
+            i += 1;
+        }
+        while i < out.len() {
+            out[i] = SOURCE[i - DEFINE.len()];
+            i += 1;
+        }
+        out
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    #[unsafe(link_section = "rat")]
+    pub static GFX_RAT: [u8; DEFINE.len() + SOURCE.len()] = joined();
+}
 
 #[cfg(target_os = "c64")]
 unsafe extern "C" {

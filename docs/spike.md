@@ -35,8 +35,17 @@ mul/div/shift, loops, arrays, slices, iterators, closures, structs, enums,
   overlay with zero-page frames, block layout, branch relaxation, peephole,
   pruning of unused runtime: the examples are 48-76% smaller and up to
   2.75x as fast). Open: values in registers across statements, X/Y loop
-  counters, inlining at program level. More aggressive rustc inlining
-  (`-Zinline-mir-threshold`) was tried: mixed sizes, no speed gain.
+  counters, inlining at program level.
+* rustc's MIR inliner: raising `-Zinline-mir-threshold` alone (functions
+  without `#[inline]`) gives mixed sizes. `cargo c64` sets it to 100 and
+  `-Zinline-mir-hint-threshold` (functions with `#[inline]`: the helpers of
+  iterators and ranges in `core`) to 500; higher values change nothing.
+  Over the release builds of `examples/` that is 3.6% less code, in dev
+  builds 7.6% (`drawing`: 3555 to 2663 bytes and 1.5% faster; only
+  `diagonal` grows, by 6%). With that much inlining rustc also inlines
+  `panic_fmt` and the construction of its arguments, which point to
+  `core::fmt`: blocks that can only end in a panic are therefore compiled
+  as `jmp rt_panic` (`panic_blocks` in codegen.rs).
 * `jmp (vector)` must not be used with a vector that can lie across a page
   boundary (6502 bug): `rt_jsrind` is a self-modified `jmp`.
 * `MulWithOverflow` never reports overflow (debug builds only).

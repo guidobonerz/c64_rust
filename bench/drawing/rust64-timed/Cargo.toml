@@ -1,0 +1,16 @@
+[package]
+name = "drawing-timed"
+version = "0.1.0"
+edition = "2024"
+
+# not a member of the repository's workspace (it is built with `cargo c64`)
+[workspace]
+
+[dependencies]
+c64 = { path = "../../../lib/c64" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = "s"

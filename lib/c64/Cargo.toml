@@ -8,5 +8,10 @@ publish = false
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("c64"))'] }
 
+[features]
+# c64::gfx draws without checking the coordinates against the screen:
+# smaller and faster, but every pixel must be on the screen.
+gfx-unclipped = []
+
 [dependencies]
 c64-macros = { path = "../c64-macros" }

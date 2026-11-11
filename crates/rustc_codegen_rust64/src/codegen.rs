@@ -1486,10 +1486,15 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let label = format!("F{}", self.id);
         self.a().label(&label);
         let order = self.block_order();
+        let panics = self.panic_blocks();
         for (k, &bb) in order.iter().enumerate() {
             let data = &self.mir.basic_blocks[bb];
             let l = self.block(bb);
             self.a().label(&l);
+            if panics[bb.as_usize()] {
+                self.a().ins("jmp rt_panic");
+                continue;
+            }
             let term = data.terminator();
             let next = order.get(k + 1).copied();
             let fused = self.fusable(bb);
@@ -1579,6 +1584,77 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             work.extend(term.successors());
         }
         seen
+    }
+
+    /// Whether a call is a panic: `abort`, `unreachable`, or a diverging
+    /// function of `core` (see `call`).
+    fn is_panic_call(&self, func: &Operand<'tcx>) -> bool {
+        let tcx = self.tcx();
+        let fty = self.monomorphize(func.ty(self.mir, tcx));
+        let ty::FnDef(def_id, fargs) = *fty.kind() else {
+            return false;
+        };
+        let inst =
+            Instance::expect_resolve(tcx, TypingEnv::fully_monomorphized(), def_id, fargs.skip_binder(), self.span);
+        match inst.def {
+            InstanceKind::Intrinsic(_) => {
+                matches!(tcx.item_name(inst.def_id()).as_str(), "abort" | "abort_immediate" | "unreachable")
+            }
+            InstanceKind::Item(d) => {
+                !tcx.is_foreign_item(d)
+                    && tcx.crate_name(d.krate) == rustc_span::sym::core
+                    && fty.fn_sig(tcx).output().skip_binder().is_never()
+            }
+            _ => false,
+        }
+    }
+
+    /// Blocks that can only end in a panic and do nothing before it that
+    /// could be seen: no call, no store through a pointer (which may be a
+    /// hardware register). A panic has no message, so what such a block
+    /// computes (the arguments of the message, when rustc has inlined
+    /// `panic_fmt`) is not needed: the block is compiled as `jmp rt_panic`.
+    /// That also keeps `core::fmt`, whose functions the arguments point
+    /// to, out of the program.
+    fn panic_blocks(&self) -> Vec<bool> {
+        let blocks = &self.mir.basic_blocks;
+        let mut panics = vec![false; blocks.len()];
+        loop {
+            let mut changed = false;
+            for (bb, data) in blocks.iter_enumerated() {
+                if panics[bb.as_usize()] {
+                    continue;
+                }
+                let quiet = data.statements.iter().all(|s| match &s.kind {
+                    StatementKind::Assign(b) => !b.0.is_indirect(),
+                    StatementKind::SetDiscriminant { place, .. } => !place.is_indirect(),
+                    StatementKind::Intrinsic(..) => false,
+                    _ => true,
+                });
+                let p = |t: BasicBlock| panics[t.as_usize()];
+                let ends = match &data.terminator().kind {
+                    TerminatorKind::Unreachable
+                    | TerminatorKind::UnwindResume
+                    | TerminatorKind::UnwindTerminate(_) => true,
+                    TerminatorKind::Goto { target, .. }
+                    | TerminatorKind::FalseEdge { real_target: target, .. }
+                    | TerminatorKind::FalseUnwind { real_target: target, .. } => p(*target),
+                    TerminatorKind::SwitchInt { discr, targets } => match self.const_bits(discr) {
+                        Some(c) => p(targets.target_for_value(c)),
+                        None => targets.all_targets().iter().all(|&t| p(t)),
+                    },
+                    TerminatorKind::Call { func, target: None, .. } => self.is_panic_call(func),
+                    _ => false,
+                };
+                if quiet && ends {
+                    panics[bb.as_usize()] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return panics;
+            }
+        }
     }
 
     // ---- lazy values and fused comparisons ----

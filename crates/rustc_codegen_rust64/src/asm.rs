@@ -732,7 +732,8 @@ pub fn prune(lib: &str, program: &str) -> String {
                     t = r[1..].trim();
                 }
             }
-            if !t.is_empty() {
+            // the end of a conditional block (`}`, `} .else {`) is no code
+            if !t.is_empty() && !t.starts_with('}') {
                 last = Some(t.split_whitespace().next().unwrap_or("").to_ascii_lowercase());
             }
         }
