@@ -27,6 +27,8 @@ extern crate rustc_driver;
 
 mod asm;
 mod codegen;
+mod inline;
+mod opt;
 mod runtime;
 
 use std::any::Any;

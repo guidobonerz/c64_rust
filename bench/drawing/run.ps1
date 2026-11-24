@@ -41,7 +41,8 @@ foreach ($variant in 'unclip', 'clip') {
         & $cargoC64 build --release @features 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "cargo c64 build failed in $dir" }
         Pop-Location
-        $prg = Get-ChildItem "$dir\target\mos-c64\release\*.prg" | Select-Object -First 1
+        # the program just built, not one an earlier build left there
+        $prg = Get-ChildItem "$dir\target\mos-c64\release\*.prg" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         $copy = "$rustOut\$($prg.BaseName)-$variant.prg"
         Copy-Item $prg.FullName $copy -Force
         $copy

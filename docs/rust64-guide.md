@@ -354,7 +354,7 @@ its own screen codes:
 | `$0400-$07FF` | text screen (default) |
 | `$0801` | BASIC line `SYS 2061`, then the runtime and the program |
 | after the code | constant data and statics with initial values |
-| after the data | BSS (not in the file): runtime buffers, static frames |
+| after the data | BSS (not in the file): runtime buffers, statics that start as zero, static frames |
 | up to `$9FFF` | the end: the program, its data and BSS must stay below |
 | `$A000-$BFFF` | BASIC ROM (RAM after `hw::bank_out_basic()`) |
 | `$C000-$CFFF` | free RAM |
@@ -375,7 +375,9 @@ The program starts like a BASIC program (`RUN`). The start code
 2. saves the stack pointer, the IRQ vector (`$0314`), the CPU port
    (`$01`), the VIC registers `$D011`, `$D015`, `$D016`, `$D018` and
    CIA 2's port A (the VIC bank),
-3. initializes the zero-page statics,
+3. clears the statics that start as zero (they are in the BSS, not in the
+   file, so they are zero at every `RUN`) and initializes the zero-page
+   statics,
 4. calls `main`.
 
 When `main` returns, or on `sys::exit()` or a panic, it restores the
@@ -392,6 +394,7 @@ program cannot need:
 |---|---|
 | zero page | no zero-page statics, and no function frame in the zero page is used (otherwise only the used bytes are saved) |
 | stack pointer | nothing can reach `sys::exit()` or a panic |
+| clearing statics | no static starts as zero (a few bytes of them stay in the file instead) |
 | interrupts, memory configuration, VIC, SID | every write of the program goes to a known, harmless place: its own variables, or a fixed address outside `$00/$01`, `$0314-$0319` and the I/O area (the colours `$D020-$D02E` are harmless) |
 
 Anything the backend cannot follow keeps the last step: a store through a
@@ -405,8 +408,10 @@ a 20-byte file, 12 of them the BASIC line.
 
 There is no stack for data: every function gets a fixed block of memory
 (its frame) in the BSS for its parameters, locals and temporaries. A call
-copies the arguments into the callee's frame, `jsr`s, and copies the
-result back. `&local` is an ordinary 16-bit address.
+passes the first three bytes of the arguments in A, X and Y and copies
+the rest into the callee's frame; a result of up to three bytes comes
+back in A, X and Y, a larger one in the callee's frame. `&local` is an
+ordinary 16-bit address.
 
 This is fast on the 6510, which has only 256 bytes of hardware stack and
 no stack-relative addressing, but it has two consequences:
@@ -419,9 +424,10 @@ no stack-relative addressing, but it has two consequences:
   copies `(pointer copy)`. Statics are shared as usual: use
   `sys::without_interrupts` when main and a handler change the same data.
 
-Values live in memory, not in registers: each operation loads, computes
-and stores byte by byte. The code is correct but not yet small or fast
-(see chapter 13).
+Values live in memory, not in registers: the code generator makes each
+operation load, compute and store byte by byte. A data-flow pass over the
+assembly of each function then removes most of what that costs (chapter
+10), and only the bytes of a frame that are still used get memory.
 
 ### Runtime registers
 
@@ -638,11 +644,24 @@ operand: an address, used like a label (`lda {x}`, `sta {x}+1`).
 | `const N` | the number: `lda #{n}` |
 | `sym STATIC` | the label of the static |
 
-A, X, Y and the flags are free inside the block and undefined after it.
+A, X, Y and the flags are free inside the block; they are undefined at
+its start and after it. The same holds for the scratch pointers `zp_p0`
+to `zp_p2`: a block that uses one sets it up itself.
 Local labels start with `@` and belong to the block (`"@loop: dex"`,
 `"bne @loop"`). The runtime's labels and the routines of rat sources can
 be used (`jsr rt_memcpy`, `sta zp_p0`). The library uses this for its small
 wrappers: `kernal::chrout(c)` is `lda c`, `jsr $ffd2`.
+
+The lines of a block are part of the function, and the optimizer reads
+them like its own code: an operand that holds a constant becomes an
+immediate (`lda {c}` with `c = 5` is `lda #$05`), a load of a value that
+the register already holds goes, and so does an instruction whose result
+nothing uses. Code where every instruction and cycle counts (a stable
+raster routine) belongs in a rat source, which is taken as it is. A
+function is also left as it is when the optimizer cannot follow its
+assembly completely: directives (`.byte`), labels other than `@labels`, a
+subroutine inside the block, code that changes itself or takes the
+address of one of its labels, decimal mode.
 
 Use a rat source instead when the code is long, is called from several
 places (inline code is repeated at every use) or needs data tables.
@@ -834,7 +853,7 @@ c64 = { path = "../c64_rust/lib/c64", features = ["gfx-unclipped"] }
 or for one build: `cargo c64 build --release --features c64/gfx-unclipped`.
 The feature holds for the whole program. The pixel routine then has no
 range check, `line` does not look at its ends and the pixel-by-pixel
-line is not in the program: `examples/drawing` shrinks from 2663 to 2275
+line is not in the program: `examples/drawing` shrinks from 2491 to 2103
 bytes and draws 2.5% faster (the circles 6%; lines already ran without a
 check per pixel). The price: **every pixel must be on the screen.** One
 outside is written to other memory and can destroy the program. Empty
@@ -927,8 +946,8 @@ File names are ASCII and converted to PETSCII capitals.
 | Function | Description |
 |---|---|
 | `peek(a)`, `poke(a, v)`, `peek_word(a)`, `poke_word(a, v)` | volatile accesses |
-| `copy(dst, src, n)` | fast copy, front to back |
-| `fill(dst, n, v)` | fast fill |
+| `copy(dst, src, n)` | fast copy, front to back; up to 255 bytes it is a loop in place (two bytes per round when `n` is even), more goes through `rt_memcpy` |
+| `fill(dst, n, v)` | fast fill; up to 255 bytes a loop in place (two bytes per round when `n` is even) |
 | `unsafe bytes(a, n) -> &'static mut [u8]` | memory as a slice |
 | `addr(a) -> *mut u8` | a pointer to an address |
 
@@ -1536,20 +1555,20 @@ pub extern "C" fn main() {
 ```
 ; fn main
 F0:
-F0_b0:
         lda #$05
         sta $d020
-F0_b1:
         rts
 ```
 
 Labels: `F<n>` is function n, `F<n>_b<k>` its basic block k, `F<n>f` its
 frame, `F<n>v<i>` the storage of its local i, `F<n>t` its temporaries,
 `L<n>_<i>` its result (0) and arguments (1...), `A<n>` constant data,
-`S<n>` statics, `F<n>_ind` the pointer entry of a function.
+`S<n>` statics, `F<n>_ind` the pointer entry of a function,
+`F<n>_i<k>`/`F<n>_e<k>` the start and the end of an `asm!` block.
 
-Every value still lives in memory (there is no register allocation), but
-the backend avoids most of the cost of that:
+The code generator (`codegen.rs`) keeps every value in memory and
+translates one statement at a time. It already avoids part of the cost
+of that:
 
 * **Known addresses.** A pointer that always holds the same address
   (hardware registers, statics, `&local`) is used as a constant: accesses
@@ -1565,40 +1584,136 @@ the backend avoids most of the cost of that:
   high bytes are skipped, `x < 0` tests the sign bit.
 * **Tables.** Arrays of up to 256 bytes at a known address are indexed
   with X: `lda table,x`.
-* **Small arithmetic.** Shifts by a constant are unrolled in place;
-  unsigned `* / %` by powers of two become shifts and masks; `x += 1` is
-  `inc` (with `bne`/`inc` for 16 bits); zero bytes of a constant are not
-  added; `and #$ff` and similar disappear.
-* **Frame overlay and zero page.** Frames only contain the locals that
-  are really stored, and functions that are never active at the same time
-  share memory: a frame lies above the frames of everything the function
-  calls, so leaves are at the bottom. Whatever fits into the free zero
-  page goes there, the leaves (called most) first: shorter and faster
-  instructions, and pointers there are dereferenced directly with
-  `(ptr),y`. Function pointer targets (interrupt handlers) get their own
-  region.
-* **Control flow.** Blocks are laid out along the usual path, so most
-  jumps fall through; jumps to jumps and to the next line are removed;
-  `bcc skip / jmp target` becomes `bcs target` when the target is certainly
-  in range.
-* **Peephole.** Loads of a value that A, X or Y already holds are
-  removed (never reads of numeric addresses, which may be I/O registers).
+* **Small arithmetic.** Shifts of a byte by a constant are done in A,
+  wider ones in place; unsigned `* / %` by powers of two become shifts and
+  masks; `x += 1` is `inc` (with `bne`/`inc` for 16 bits); zero bytes of a
+  constant are not added; `and #$ff` and similar disappear. `min` and
+  `max` are a comparison and a copy; unsigned division of one and two
+  bytes has routines of its own.
+* **Blocks of memory.** A copy or fill of a known size up to 255 bytes is
+  a loop in place (5 to 11 bytes) instead of a call to `rt_memcpy` or
+  `rt_memset`.
+* **Block layout.** The blocks are emitted in reverse postorder, the
+  usual successor directly after its block: the body of a loop stays
+  together with the exit after it, both sides of an `if` and the cases of
+  a `match` come before the code they join in. Most jumps fall through
+  and most branches are short.
+
+Then the assembly of each function goes through a **data-flow pass**
+(`opt.rs`), which looks at the function as a whole:
+
+* **Values.** For A, X, Y and every byte of the frame that is only used
+  as a plain operand it follows which value the location holds (a
+  constant, a copy of another location) and in which range the value is,
+  through branches and loops. A read of a constant becomes an immediate,
+  a read of a copy reads the original, a load of what another register
+  holds becomes a transfer (`sta t` / `ldx t` is `tax`), and a load or
+  store that changes nothing goes.
+* **Ranges and branches.** A branch narrows the ranges on its two sides
+  (`cmp #25` / `bcc`: below 25 where it is taken), so the bounds check of
+  a loop counter or of a masked index (`i & 7` into eight elements) is
+  known to pass and disappears with its comparison; a `clc` in front of an
+  addition goes when the carry is known to be clear; code that cannot be
+  reached is removed.
+* **Liveness.** Stores to frame bytes that nobody reads afterwards, loads
+  and computations whose result is not used go. At the end of a function
+  only its result is needed; registers carry nothing into or out of a
+  generated function, and an assembly function takes exactly the argument
+  bytes of its signature in A, X and Y.
+* **Copies.** Two frame bytes that are connected by a copy and never hold
+  different values that are both still needed become one byte (as a
+  register allocator merges copies), and the copy disappears. That removes
+  most of the moves between the temporaries of iterators and ranges.
+* **Index registers.** A pointer that was computed as address + byte or
+  pointer + byte and is then only dereferenced becomes an indexed access,
+  and its computation goes: `0x0400 + i as u16` written through is
+  `ldx i` / `sta $0400,x`, an element of a slice is `ldy i` /
+  `lda (slice),y`.
+* **Loop counters.** A frame byte that a loop only loads, stores and
+  steps lives in X or Y for the time of the loop, when the loop does not
+  need that register for something else and the byte is not used after it:
+  `lda i` is `tya`, the step is `iny` at the end of the body, and the copy
+  of the counter that a `for` loop works with is not needed any more.
+* **Steps at the end.** A `for` loop over a slice steps its pointer (and
+  `enumerate` its counter) first and works with a copy of the old value.
+  The step moves to the end of the loop, where nothing needs the copy any
+  more: the copy and the pointer become one, and the step is done in
+  place (`inc p` / `bne` / `inc p+1`).
+* **Out of the loop.** A computation that gives the same in every round
+  (it reads only what the loop does not change: its own variables that
+  the loop does not write, immutable statics, constants) moves in front
+  of the loop, for example the address of the row that an inner loop
+  works on. A bounds check of that kind moves too, when the loop is known
+  to run at least once (a loop over an array or over a slice of known
+  length).
+* **Test at the end.** The test of a small loop moves behind its body, so
+  each round ends with one conditional branch instead of a branch and a
+  jump; the loop is entered with a jump to the test (or directly, when the
+  first test is known to pass and the body needs nothing from it).
+
+Finally, for the program as a whole:
+
+* **Arguments.** The first three bytes of the arguments are in A, X and
+  Y, and so is a result of up to three bytes; the callee stores them only
+  if it needs them in memory. An argument byte in memory that the callee
+  never reads is not passed.
+* **Inlining.** rustc inlines small functions before the code generator
+  starts; some only show to be small, or to have one caller, in the
+  finished program. So at the end the assembly of a function replaces the
+  calls of it if the function is called from one place only, or if its
+  code is not longer than what its calls save (a call is three bytes, and
+  the function itself goes away). The caller is then optimized again with
+  the code in it: arguments that were constants stay constants, a result
+  stays in its register. Functions whose address is taken (interrupt
+  handlers) stay functions. In the listing such a function no longer
+  appears under its name; its variables keep their names (`F<n>v<m>`).
+  `RUST64_NO_INLINE=1` in the environment turns this off.
+* **Frames.** Only the bytes of a frame that the final code still names
+  get memory, and functions that are never active at the same time share
+  it: a frame lies above the frames of everything the function calls.
+  Whatever fits into the free zero page goes there, the leaves first:
+  shorter and faster instructions, and pointers there are dereferenced
+  directly with `(ptr),y`. After the data-flow pass the frames of small
+  programs fit completely. Function pointer targets (interrupt handlers)
+  get their own region.
+* **Statics in the BSS.** Statics that are all zero are not in the file:
+  they are cleared at the start.
+* **Jumps.** Jumps to jumps and to the next line are removed; `bcc skip /
+  jmp target` becomes `bcs target` when the target is certainly in range;
+  `jsr f` / `rts` becomes `jmp f`.
 * **Pruning.** Only the runtime and library assembly routines that the
-  program refers to are included: the smallest program is about 200 bytes.
+  program refers to are included: the smallest program is 20 bytes.
 
-A KERNAL call looks like
-this:
+A loop over a row of the colour matrix, from `examples/drawing`
+(`set_cell_colors(c, 24, Color::from_u8(c & 15 | 1), Color::Black)` for
+`c` in `0..40`), comes out as
 
 ```
-; fn c64::kernal::chrout
-F3:
-F3_b0:
-        lda F3v1
-        sta c64_chrout__args+0
-        jsr c64_chrout          ; = $ffd2
-F3_b1:
-        rts
+        ldy #$00
+        jmp F1_b3
+_L19:
+        and #$0f
+        ora #$01
+        sta F1v9
+        tya
+        adc #$c0                ; 24 * 40 + c, the low byte (the carry is clear)
+        tax
+        lda F1v9
+        asl
+        asl
+        asl
+        asl
+        sta S12+0+768,x         ; the matrix, + $300
+        iny
+F1_b3:
+        tya                     ; c
+        cmp #$28
+        bcc _L19
 ```
+
+What is still missing is in chapter 13. Setting `RUST64_NO_OPT=1` for a
+build leaves the data-flow pass out (to compare, or to look for a bug in
+it).
 
 ### Source layout
 
@@ -1606,7 +1721,8 @@ F3_b1:
 |---|---|
 | `crates/rustc_codegen_rust64/src/lib.rs` | the `CodegenBackend`: drives the build, writes `.prg`, `.rat`, `.d64` |
 | `crates/rustc_codegen_rust64/src/codegen.rs` | MIR to 6510: whole program, frames, statements, calls, intrinsics, data |
-| `crates/rustc_codegen_rust64/src/asm.rs` | operands (absolute, indirect) and byte-wise code emission |
+| `crates/rustc_codegen_rust64/src/asm.rs` | operands (absolute, indirect) and byte-wise code emission; the passes over the text: jumps, zero-page pointers, pruning |
+| `crates/rustc_codegen_rust64/src/opt.rs` | the data-flow pass over the assembly of a function |
 | `crates/rustc_codegen_rust64/src/runtime.rat` | start/exit, panic, memcpy/memset/memcmp, mul/div, bit counts |
 | `crates/rustc_codegen_rust64/src/runtime.rs` | the call into rat |
 | `crates/cargo-c64` | the `cargo c64` command and the end-to-end test harness |
@@ -1736,21 +1852,24 @@ rust64 follows the phases in `PLAN.md`:
 | 2. Language breadth: enums, structs, slices, closures, iterators, panics | done |
 | 3. Library I: `hw`, `mem`, `sys`, `kernal`, `text`, `fmt`, `input`, assembly, `at`/`zp`, PETSCII | done |
 | 4. Library II: `sprite`, `gfx`, `sound`, `irq`, `dos`, function pointers, D64 | done |
-| 5. Optimization: frame overlay, zero-page allocation, 8-bit narrowing, block layout, peephole, pruning (done); X/Y loops, register values, inlining (open) | mostly done |
+| 5. Optimization: frame overlay, zero-page allocation, block layout, data-flow pass (values, ranges, liveness, copies, index registers, loop counters, steps and tests at the end of loops, invariant code out of loops), arguments in registers, inlining of small functions, pruning | done |
 | 6. Tooling: `cargo c64 new/test`, Rust source spans for rat errors, memory map, debugger labels, `c64::asm!` | |
 | 7. Extensions: recursion on a software stack, `alloc`, `dyn Trait`, `f32`, cartridges | |
 
-Code quality: the optimizations of chapter 10 made the example programs
-48-76% smaller and up to 2.75 times as fast as the unoptimized backend
-(`hello`: 3123 to 962 bytes, `sprites`: 6335 to 2143, `drawing` finishes
-its picture in 167 instead of 460 frames, about 390 cycles per pixel).
-Values still live in memory and are handled byte by byte, so tight loops
-are slower than hand-written assembly. Still open: values in A/X/Y across
-statements, 8-bit loop counters in X/Y, inlining of small functions when
-the program is put together (rustc cannot inline trait methods called from
-generic code). Release builds
-(`opt-level = "s"`) give the best code. Debug builds include rustc's
-runtime checks and are much bigger and slower.
+Code quality: the data-flow pass of chapter 10 made the release builds of
+the examples 30% smaller in total than the code generator alone gives
+(`diagonal`: 3155 to 1510 bytes, `rasterbars`: 1733 to 1327, `wic64`: 3392
+to 2340) and compiled loops more than twice as fast. Compared with
+oscar64, an optimizing C compiler for the 6502, rust64 is level or ahead
+where the library's assembly does the work; where compiled code does, its
+programs are 15 to 34% larger and within 5% in time per frame (ahead in
+two of three) (the
+README has the numbers).
+Still open: the 16-bit comparison of an iterator's pointer with its end in every round, a counter in a
+register also where the loop needs both index registers (a block copy in
+its body).
+Release builds (`opt-level = "s"`) give the best code. Debug builds
+include rustc's runtime checks and are much bigger and slower.
 
 Other open points:
 

@@ -196,6 +196,9 @@ impl Asm {
         }
         if size > 16 {
             if let Val::Mem(s) = src {
+                if self.copy_block(dst, s, size) {
+                    return;
+                }
                 self.addr_to(s, ZP[0]);
                 self.addr_to(dst, ZP[1]);
                 self.ins(format!("lda #{}", size & 0xff));
@@ -217,6 +220,68 @@ impl Asm {
         for i in 0..size {
             self.lda(src, i, 0);
             self.sta(dst, i, 2);
+        }
+    }
+
+    /// A copy of up to 256 bytes between places that do not overlap as a
+    /// loop in place of the call to `rt_memcpy`; false: not for these
+    /// operands.
+    pub fn copy_block(&mut self, dst: &Addr, src: &Addr, size: u64) -> bool {
+        // not an I/O register: those are written once, in order
+        let plain = |e: &str| !e.contains('$');
+        if size == 0 || size > 255 {
+            return false;
+        }
+        let l = format!("_C{}", LABELS.fetch_add(1, Ordering::Relaxed) + 1);
+        match (src, dst) {
+            (Addr::Abs(s), Addr::Abs(d)) if plain(s) && plain(d) => {
+                self.ins(format!("ldx #{}", size & 0xff));
+                self.label(&l);
+                self.ins(format!("lda {s}-1,x"));
+                self.ins(format!("sta {d}-1,x"));
+                self.ins("dex");
+                self.ins(format!("bne {l}"));
+                true
+            }
+            _ if size <= 128 => {
+                self.addr_to(src, ZP[0]);
+                self.addr_to(dst, ZP[1]);
+                self.ins(format!("ldy #{}", size - 1));
+                self.label(&l);
+                self.ins(format!("lda ({}),y", ZP[0]));
+                self.ins(format!("sta ({}),y", ZP[1]));
+                self.ins("dey");
+                self.ins(format!("bpl {l}"));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Sets `size` bytes (1 to 255) at `dst` to the byte `val`, as a loop
+    /// in place of the call to `rt_memset`.
+    pub fn fill_block(&mut self, dst: &Addr, val: &Val, size: u64) {
+        let l = format!("_C{}", LABELS.fetch_add(1, Ordering::Relaxed) + 1);
+        match dst {
+            Addr::Abs(d) if !d.contains('$') => {
+                self.setup_val(val, 0);
+                self.lda(val, 0, 0);
+                self.ins(format!("ldx #{size}"));
+                self.label(&l);
+                self.ins(format!("sta {d}-1,x"));
+                self.ins("dex");
+                self.ins(format!("bne {l}"));
+            }
+            _ => {
+                self.addr_to(dst, ZP[1]);
+                self.setup_val(val, 0);
+                self.lda(val, 0, 0);
+                self.ins(format!("ldy #{size}"));
+                self.label(&l);
+                self.ins("dey");
+                self.ins(format!("sta ({}),y", ZP[1]));
+                self.ins(format!("bne {l}"));
+            }
         }
     }
 
@@ -305,6 +370,11 @@ impl Asm {
     }
 }
 
+/// A new unique label for code that a pass adds.
+pub fn fresh_label() -> String {
+    format!("_L{}", LABELS.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
 /// Whether the value of operand `x` can be remembered in a register: an
 /// immediate, or a symbolic absolute address (frames, statics, runtime
 /// registers). Numeric addresses are left alone: they may be I/O registers,
@@ -353,6 +423,8 @@ pub fn peephole(text: &str) -> String {
     let mut x: Option<String> = None;
     // N/Z reflect the value in A (set by the last instruction that set them).
     let mut nz_a = false;
+    // The instruction before, if nothing can come in between.
+    let mut last = String::new();
     for (i, l) in lines.iter().enumerate() {
         let Some((op, arg)) = parse(l) else {
             if !l.trim().is_empty() && !l.trim().starts_with(';') {
@@ -360,6 +432,7 @@ pub fn peephole(text: &str) -> String {
                 y = None;
                 x = None;
                 nz_a = false;
+                last.clear();
             }
             out.push_str(l);
             out.push('\n');
@@ -415,6 +488,8 @@ pub fn peephole(text: &str) -> String {
                     x = None;
                 }
             }
+            // `tax` / `txa`: A and the flags are as they were
+            "txa" | "tya" if last == if op == "txa" { "tax" } else { "tay" } => keep = false,
             "adc" | "sbc" | "and" | "ora" | "eor" | "pla" | "txa" | "tya" => a.clear(),
             "iny" | "dey" | "tay" => y = None,
             "jsr" => {
@@ -433,6 +508,7 @@ pub fn peephole(text: &str) -> String {
                 | "bvs" => nz_a,
                 _ => false,
             };
+            last = op;
             out.push_str(l);
             out.push('\n');
         }
@@ -441,7 +517,7 @@ pub fn peephole(text: &str) -> String {
 }
 
 /// An upper bound of the size of an instruction line in bytes.
-fn max_size(op: &str, arg: &str) -> i64 {
+pub fn max_size(op: &str, arg: &str) -> i64 {
     match op {
         "bne" | "beq" | "bpl" | "bmi" | "bcc" | "bcs" | "bvc" | "bvs" => 2,
         _ if arg.is_empty() || arg == "a" => 1,
@@ -450,7 +526,7 @@ fn max_size(op: &str, arg: &str) -> i64 {
     }
 }
 
-fn opposite(branch: &str) -> Option<&'static str> {
+pub fn opposite(branch: &str) -> Option<&'static str> {
     Some(match branch {
         "bne" => "beq",
         "beq" => "bne",
@@ -578,6 +654,40 @@ pub fn relax_with(text: &str, size: &dyn Fn(&str, &str) -> i64, range: i64) -> S
                 _ => {}
             }
         }
+        // 1b. jsr X / rts  ->  jmp X; what follows a jmp or rts up to
+        // the next label is never reached
+        for i in 0..lines.len() {
+            let Line::Ins(op, arg) = &lines[i] else { continue };
+            if op == "jsr"
+                && let Some(j) = next_ins(&lines, i + 1)
+                && matches!(&lines[j], Line::Ins(o, _) if o == "rts")
+            {
+                lines[i] = Line::Ins("jmp".into(), arg.clone());
+                changed = true;
+            }
+        }
+        let mut dead = false;
+        for l in lines.iter_mut() {
+            match l {
+                // (a directive is data, perhaps of an `asm!` block)
+                Line::Ins(op, _) if op.starts_with('.') => dead = false,
+                Line::Ins(op, _) => {
+                    if dead {
+                        *l = Line::Other(String::new());
+                        changed = true;
+                    } else {
+                        dead = matches!(op.as_str(), "jmp" | "rts" | "rti");
+                    }
+                }
+                Line::Label(_) => dead = false,
+                Line::Other(s) => {
+                    let t = s.trim();
+                    if !t.is_empty() && !t.starts_with(';') {
+                        dead = false;
+                    }
+                }
+            }
+        }
         // 2. jmp to the next line
         for i in 0..lines.len() {
             let Line::Ins(op, arg) = &lines[i] else { continue };
@@ -662,6 +772,49 @@ pub fn relax_with(text: &str, size: &dyn Fn(&str, &str) -> i64, range: i64) -> S
         }
     }
     out
+}
+
+/// Makes the branches long that do not reach their targets any more after
+/// text was put between them: `bcc far` becomes `bcs skip` / `jmp far` /
+/// `skip:`. Sizes are upper bounds, as in [`relax`], which makes such a
+/// branch short again if it can be.
+pub fn widen(lines: &mut Vec<String>) {
+    loop {
+        let mut pos = Vec::with_capacity(lines.len());
+        let mut label_pos = std::collections::HashMap::new();
+        let mut at = 0i64;
+        for l in lines.iter() {
+            pos.push(at);
+            let code = l.split(';').next().unwrap_or("");
+            let mut rest = code.trim();
+            if !l.starts_with([' ', '\t'])
+                && let Some((name, r)) = rest.split_once(':')
+            {
+                label_pos.insert(name.trim().to_owned(), at);
+                rest = r.trim();
+            }
+            if !rest.is_empty() && !rest.contains('=') {
+                let (op, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+                at += max_size(op, arg.trim());
+            }
+        }
+        let far = lines.iter().enumerate().find_map(|(i, l)| {
+            if !l.starts_with([' ', '\t']) {
+                return None;
+            }
+            let (op, target) = l.split(';').next().unwrap_or("").trim().split_once(' ')?;
+            let opp = opposite(op)?;
+            let target = target.trim();
+            let d = label_pos.get(target)? - (pos[i] + 2);
+            (!target.starts_with('@') && !(-110..=110).contains(&d)).then(|| (i, opp, target.to_owned()))
+        });
+        let Some((i, opp, target)) = far else { break };
+        let skip = fresh_label();
+        lines.splice(
+            i..=i,
+            [format!("        {opp} {skip}"), format!("        jmp {target}"), format!("{skip}:")],
+        );
+    }
 }
 
 /// The identifiers in assembly text (not in comments).
@@ -777,18 +930,55 @@ pub fn prune(lib: &str, program: &str) -> String {
 /// ```
 ///
 /// is removed and the following `(zp_pN),y` accesses become `(P),y`, when P
-/// is in the zero page (`in_zp`), is not written before the scratch pointer
-/// is set up again, and nothing else (a runtime routine) reads the scratch
-/// pointer in between.
+/// is in the zero page (`in_zp`) and, as far as the scratch pointer holds P
+/// (the region),
+/// * P is not written,
+/// * nothing else reads the scratch pointer (a routine that is called),
+/// * the code is straight, apart from branches inside the region (to `_C`
+///   labels of the code generator and to `@labels` of an `asm!` block).
+///
+/// The region ends at the next setup, at a return or at any other label:
+/// neither the code generator nor an `asm!` block relies on a scratch
+/// pointer beyond its statement.
 pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-    let ins = |l: &str| -> Option<(String, String)> {
-        let t = l.trim();
-        if t.is_empty() || t.starts_with(';') || !l.starts_with(' ') {
-            return None;
+    // The label and the instruction of a line.
+    type Parsed = (Option<String>, Option<(String, String)>);
+    let parse = |l: &str| -> Parsed {
+        let t = l.split(';').next().unwrap_or("").trim();
+        if t.is_empty() {
+            return (None, None);
         }
-        let (op, arg) = t.split_once(' ').unwrap_or((t, ""));
-        Some((op.to_owned(), arg.trim().to_owned()))
+        let (label, rest) = if l.starts_with(' ') || l.starts_with('\t') {
+            (None, t)
+        } else {
+            match t.split_once(':') {
+                Some((n, r)) if !n.contains(char::is_whitespace) => (Some(n.to_owned()), r.trim()),
+                _ => (Some(t.to_owned()), ""),
+            }
+        };
+        let ins = (!rest.is_empty()).then(|| {
+            let (op, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            (op.to_ascii_lowercase(), arg.trim().to_owned())
+        });
+        (label, ins)
+    };
+    let ins = |l: &str| -> Option<(String, String)> {
+        match parse(l) {
+            (None, i) => i,
+            _ => None,
+        }
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    // A function of the code generator: it sets the pointers up itself.
+    let generated = |arg: &str| arg.strip_prefix('F').is_some_and(digits);
+    // A label inside a function that the code generator made.
+    let local = |arg: &str| {
+        arg.strip_prefix("_L").is_some_and(digits)
+            || arg.strip_prefix('F').and_then(|r| r.split_once("_b")).is_some_and(|(id, b)| digits(id) && digits(b))
+    };
+    let word = |line: &str, name: &str| {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '@')).any(|w| w == name)
     };
     let mut i = 0;
     while i + 3 < lines.len() {
@@ -799,10 +989,10 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
             i += 1;
             continue;
         };
-        if !(o0 == "lda"
-            && o1 == "sta"
-            && o2 == "lda"
-            && o3 == "sta"
+        // through A, or through X (the data-flow pass, in front of an
+        // access with an index in Y)
+        let via_x = o0 == "ldx" && o1 == "stx" && o2 == "ldx" && o3 == "stx";
+        if !(((o0 == "lda" && o1 == "sta" && o2 == "lda" && o3 == "sta") || via_x)
             && ZP.contains(&z.as_str())
             && *p1 == format!("{p}+1")
             && *z1 == format!("{z}+1")
@@ -813,26 +1003,38 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
         }
         let (p, z) = (p.clone(), z.clone());
         let through = format!("({z}),y");
+        let sets_up =
+            |op: &str, arg: &str| matches!(op, "sta" | "stx") && (arg == z || arg == format!("{z}+1"));
         // The region in which the scratch pointer holds P.
         let mut end = i + 4;
         let mut ok = true;
+        let mut loops: Vec<(usize, String)> = Vec::new();
+        let mut seen_label = false;
         while end < lines.len() {
-            let Some((op, arg)) = ins(&lines[end]) else {
-                let t = lines[end].trim();
-                if t.is_empty() || t.starts_with(';') || t.starts_with("_C") {
-                    end += 1;
-                    continue;
+            let (label, instr) = parse(&lines[end]);
+            if let Some(name) = label {
+                if name.starts_with('@') {
+                    loops.push((end, name));
+                } else if !name.starts_with("_C") {
+                    break; // a label
                 }
-                break; // a label
-            };
-            if op == "sta" && (arg == z || arg == format!("{z}+1")) {
-                break; // the next setup
+                seen_label = true;
             }
-            if matches!(op.as_str(), "rts" | "jmp") {
+            let Some((op, arg)) = instr else {
+                end += 1;
+                continue;
+            };
+            if sets_up(&op, &arg)
+                || matches!(op.as_str(), "rts" | "rti")
+                || (op == "jmp" && (generated(&arg) || local(&arg)))
+            {
                 break;
             }
-            let generated = arg.strip_prefix('F').is_some_and(|r| r.chars().all(|c| c.is_ascii_digit()));
-            if (op == "jsr" && !generated) || (arg.contains(z.as_str()) && arg != through) {
+            // A call (or a jump to a routine: `jsr` / `rts`) may read the
+            // scratch pointer; so does any other use of it.
+            if (matches!(op.as_str(), "jsr" | "jmp") && !generated(&arg))
+                || (arg.contains(z.as_str()) && arg != through)
+            {
                 ok = false;
                 break;
             }
@@ -841,23 +1043,99 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
                 "sta" | "stx" | "sty" | "inc" | "dec" | "asl" | "lsr" | "rol" | "ror"
             );
             if writes && (arg == p || arg.starts_with(&format!("{p}+"))) {
-                ok = false;
+                // P changes: the region ends here, if the code was straight
+                // so far and what follows does not use the scratch pointer
+                // (`*p = x; p += 1`).
+                ok = !seen_label;
+                for l in &lines[end + 1..] {
+                    let (label, instr) = parse(l);
+                    if label.is_some() {
+                        break;
+                    }
+                    let Some((op, arg)) = instr else { continue };
+                    if sets_up(&op, &arg)
+                        || matches!(op.as_str(), "rts" | "rti")
+                        || (op == "jmp" && (generated(&arg) || local(&arg)))
+                    {
+                        break;
+                    }
+                    if (matches!(op.as_str(), "jsr" | "jmp") && !generated(&arg)) || arg.contains(z.as_str()) {
+                        ok = false;
+                        break;
+                    }
+                }
                 break;
             }
             end += 1;
         }
-        // The removed loads also set A and the flags: what follows must load
-        // A again before using either.
+        // The `@labels` in the region: only branched to from inside it.
+        for (at, name) in &loops {
+            if !ok {
+                break;
+            }
+            let is_scope_end = |l: &str| parse(l).0.is_some_and(|n| !n.starts_with('@'));
+            let lo = (0..*at).rev().find(|&k| is_scope_end(&lines[k])).map_or(0, |k| k + 1);
+            let hi = (*at + 1..lines.len()).find(|&k| is_scope_end(&lines[k])).unwrap_or(lines.len());
+            for k in (lo..hi).filter(|&k| k != *at && !(i + 4..end).contains(&k)) {
+                if word(&lines[k], name) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // A branch from the region to an `@label` outside it: the code
+        // there may use the pointer too.
         if ok {
+            for l in &lines[i + 4..end] {
+                if let Some((_, arg)) = parse(l).1
+                    && arg.starts_with('@')
+                    && !loops.iter().any(|(_, n)| *n == arg)
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // The removed loads also set A (or X) and the flags: what follows
+        // must load the register again before using either (labels on the
+        // way do not matter: this is about the code that runs after the
+        // setup).
+        if ok && via_x {
+            // The next instruction sets the flags, and X is not used up to
+            // its next load, the end of the statement (a label) or the end
+            // of the function.
+            let mut first = true;
+            for l in &lines[i + 4..] {
+                let (label, instr) = parse(l);
+                if label.is_some_and(|n| !n.starts_with('@') && !n.starts_with("_C")) {
+                    break;
+                }
+                let Some((op, arg)) = instr else { continue };
+                let arg = arg.to_ascii_lowercase();
+                if std::mem::take(&mut first) && !matches!(op.as_str(), "lda" | "ldy" | "ldx" | "tay" | "tya" | "pla") {
+                    ok = false;
+                    break;
+                }
+                // (a function of the program may take X as an argument)
+                let routine = matches!(op.as_str(), "jsr" | "jmp") && !local(&arg);
+                if matches!(op.as_str(), "ldx" | "tax" | "tsx" | "rts" | "rti")
+                    || (matches!(op.as_str(), "jsr" | "jmp") && !routine && !arg.starts_with('@'))
+                {
+                    break;
+                }
+                if routine
+                    || matches!(op.as_str(), "txa" | "txs" | "stx" | "inx" | "dex" | "cpx")
+                    || arg.ends_with(",x")
+                    || arg.ends_with(",x)")
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        } else if ok {
             ok = false;
             for l in &lines[i + 4..] {
-                let Some((op, _)) = ins(l) else {
-                    let t = l.trim();
-                    if t.is_empty() || t.starts_with(';') || t.starts_with("_C") {
-                        continue;
-                    }
-                    break; // a label
-                };
+                let Some((op, _)) = parse(l).1 else { continue };
                 match op.as_str() {
                     "lda" | "pla" | "txa" | "tya" => {
                         ok = true;
@@ -978,7 +1256,7 @@ pub fn touches_hw(text: &str) -> bool {
 }
 
 /// `X+2+1` -> (`X`, 3); `None` if the operand is not a symbol plus offsets.
-fn sym_off(arg: &str) -> Option<(&str, u64)> {
+pub fn sym_off(arg: &str) -> Option<(&str, u64)> {
     let mut parts = arg.split('+');
     let base = parts.next()?;
     let mut chars = base.chars();

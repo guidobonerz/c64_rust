@@ -20,7 +20,7 @@ fn main() {
 
 ```
 $ cargo c64 build --release
-    wrote .../target/mos-c64/release/hello.prg        (583 bytes)
+    wrote .../target/mos-c64/release/hello.prg        (536 bytes)
 $ cargo c64 run                                       build and start the emulator
 $ cargo c64 asm                                       print the generated assembly
 ```
@@ -244,19 +244,19 @@ c64-uci = { path = "../c64_rust/lib/c64-uci" }
 | Example | Shows | Main modules | Bytes |
 |---|---|---|---:|
 | `border` | the smallest program, without the library | | 20 |
-| `hello` | printing, a loop, the border colour | `hw`, `fmt` | 583 |
-| `joystick` | reading the joystick | `input` | 1067 |
-| `ui` | boxes on the text screen | `ui`, `text` | 1439 |
-| `music` | notes and a SID tune | `sound` | 1476 |
-| `sprites` | a moving sprite | `sprite` | 1535 |
-| `rasterbars` | a stable raster interrupt in assembly, colours from Rust | `rat_source!`, `mem` | 1733 |
-| `scroller` | a horizontal soft scroll with two raster interrupts | `irq`, `mem` | 1885 |
-| `drawing` | lines, a rectangle and circles on the hires bitmap | `gfx` | 2663 |
-| `diagonal` | the whole screen scrolling diagonally, custom character set | `hw`, `mem` | 3155 |
-| `dir` | the disk directory | `dos` | 4109 |
-| `wic64` | the WiFi module | `c64-wic64` | 3392 |
-| `uci` | the Ultimate command interface | `c64-uci` | 4466 |
-| `sd2iec` | directories and disk images | `c64-sd2iec` | 7626 |
+| `hello` | printing, a loop, the border colour | `hw`, `fmt` | 536 |
+| `joystick` | reading the joystick | `input` | 950 |
+| `ui` | boxes on the text screen | `ui`, `text` | 1280 |
+| `music` | notes and a SID tune | `sound` | 1219 |
+| `sprites` | a moving sprite | `sprite` | 1347 |
+| `rasterbars` | a stable raster interrupt in assembly, colours from Rust | `rat_source!`, `mem` | 1327 |
+| `scroller` | a horizontal soft scroll with two raster interrupts | `irq`, `mem` | 1552 |
+| `drawing` | lines, a rectangle and circles on the hires bitmap | `gfx` | 2491 |
+| `diagonal` | the whole screen scrolling diagonally, custom character set | `hw`, `mem` | 1510 |
+| `dir` | the disk directory | `dos` | 2462 |
+| `wic64` | the WiFi module | `c64-wic64` | 2340 |
+| `uci` | the Ultimate command interface | `c64-uci` | 2856 |
+| `sd2iec` | directories and disk images | `c64-sd2iec` | 4851 |
 
 ```
 cd examples/drawing
@@ -313,17 +313,19 @@ rust64 `--release` against oscar64 `-Os`; less is better in every column.
 
 | Program | Work is done by | `.prg` bytes rust64 | oscar64 | rust64 is | Cycles rust64 | oscar64 | rust64 needs |
 |---|---|---:|---:|---|---:|---:|---|
-| drawing, clipped | library assembly | **2663** | 3147 | 15% smaller | **914 677** | 968 876 | 5.6% fewer |
-| drawing, unclipped | library assembly | **2275** | 2046 | 11% larger | **891 912** | 884 436 | 0.8% more |
-| scroller | interrupts, one block copy | **1885** | 1355 | 39% larger | **317** | 385 | 18% fewer |
-| rasterbars | small fills and copies | **1733** | 1096 | 58% larger | **2810** | 1877 | 50% more |
-| diagonal | compiled code, block copies | **3155** | 1126 | 2.8 times as large | **3152** | 2485 | 27% more |
+| drawing, clipped | library assembly | **2491** | 3147 | 21% smaller | **905 328** | 968 876 | 6.6% fewer |
+| drawing, unclipped | library assembly | **2103** | 2046 | 3% larger | **881 930** | 884 436 | 0.3% fewer |
+| scroller | interrupts, one block copy | **1552** | 1355 | 15% larger | **253** | 385 | 34% fewer |
+| rasterbars | small fills and copies | **1327** | 1096 | 21% larger | **1947** | 1877 | 4% more |
+| diagonal | compiled code, block copies | **1510** | 1126 | 34% larger | **2356** | 2485 | 5% fewer |
 
 Cycles: the whole program for drawing, the average frame for the others.
 
 **The result in one sentence:** where the work is done by the library's
 assembly, rust64 is level with oscar64 or ahead; where it is done by compiled
-code, oscar64 is ahead, in size by a wide margin.
+code, oscar64's programs are 13–25% smaller, and the two are close in speed
+(per frame rust64 needs 34% and 5% fewer cycles for scroller and diagonal
+and 4% more for rasterbars).
 
 #### What was compared
 
@@ -384,32 +386,32 @@ colour matrix and switches the mode; *cells* is the loop over
 
 | Build | `.prg` bytes | rust64 is | setup | lines | rect | circles | cells | **total** | seconds | rust64 needs |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **rust64** `--release`, clipped | **2663** | | 110 481 | 451 360 | 15 123 | 331 797 | 5 916 | **914 677** | 0.93 | |
-| oscar64 `-O1`, clipped | 4153 | 36% smaller | 103 501 | 388 147 | 31 470 | 461 001 | 1 188 | 985 307 | 1.00 | 7.2% fewer cycles |
-| oscar64 `-Os`, clipped | 3147 | 15% smaller | 108 050 | 371 991 | 28 068 | 459 661 | 1 106 | 968 876 | 0.98 | 5.6% fewer |
-| oscar64 `-O2`, clipped | 3202 | 17% smaller | 103 117 | 378 440 | 29 725 | 458 098 | 1 063 | 970 443 | 0.98 | 5.7% fewer |
-| oscar64 `-O3`, clipped | 3658 | 27% smaller | 103 301 | 371 179 | 27 457 | 415 822 | 1 132 | 918 891 | 0.93 | 0.5% fewer |
-| **rust64** `--release`, unclipped | **2275** | | 110 481 | 449 609 | 14 775 | 310 834 | 6 213 | **891 912** | 0.91 | |
-| oscar64 `-O1`, unclipped | 2724 | 16% smaller | 103 454 | 370 254 | 27 687 | 390 819 | 1 102 | 893 316 | 0.91 | 0.2% fewer |
-| oscar64 `-Os`, unclipped | 2046 | 11% larger | 108 035 | 363 284 | 27 012 | 384 917 | 1 188 | 884 436 | 0.90 | 0.8% more |
-| oscar64 `-O2`, unclipped | 2004 | 14% larger | 103 306 | 362 185 | 27 085 | 384 992 | 1 192 | 878 760 | 0.89 | 1.5% more |
-| oscar64 `-O3`, unclipped | 2297 | 1% smaller | 103 006 | 362 083 | 26 993 | 342 487 | 1 044 | 835 613 | 0.85 | 6.7% more |
+| **rust64** `--release`, clipped | **2491** | | 107 973 | 449 461 | 15 037 | 331 192 | 1 665 | **905 328** | 0.92 | |
+| oscar64 `-O1`, clipped | 4153 | 40% smaller | 103 501 | 388 147 | 31 470 | 461 001 | 1 188 | 985 307 | 1.00 | 8.1% fewer cycles |
+| oscar64 `-Os`, clipped | 3147 | 21% smaller | 108 050 | 371 991 | 28 068 | 459 661 | 1 106 | 968 876 | 0.98 | 6.6% fewer |
+| oscar64 `-O2`, clipped | 3202 | 22% smaller | 103 117 | 378 440 | 29 725 | 458 098 | 1 063 | 970 443 | 0.98 | 6.7% fewer |
+| oscar64 `-O3`, clipped | 3658 | 32% smaller | 103 301 | 371 179 | 27 457 | 415 822 | 1 132 | 918 891 | 0.93 | 1.5% fewer |
+| **rust64** `--release`, unclipped | **2103** | | 107 973 | 447 643 | 14 428 | 309 959 | 1 927 | **881 930** | 0.90 | |
+| oscar64 `-O1`, unclipped | 2724 | 23% smaller | 103 454 | 370 254 | 27 687 | 390 819 | 1 102 | 893 316 | 0.91 | 1.3% fewer |
+| oscar64 `-Os`, unclipped | 2046 | 3% larger | 108 035 | 363 284 | 27 012 | 384 917 | 1 188 | 884 436 | 0.90 | 0.3% fewer |
+| oscar64 `-O2`, unclipped | 2004 | 5% larger | 103 306 | 362 185 | 27 085 | 384 992 | 1 192 | 878 760 | 0.89 | 0.4% more |
+| oscar64 `-O3`, unclipped | 2297 | 8% smaller | 103 006 | 362 083 | 26 993 | 342 487 | 1 044 | 835 613 | 0.85 | 5.5% more |
 
-(The rust64 dev profile, with overflow and UB checks, gives 5244 bytes.)
+(The rust64 dev profile, with overflow and UB checks, gives 3499 bytes.)
 
 **rasterbars, scroller, diagonal** — size, and CPU cycles per frame.
 
 | Program | Build | `.prg` bytes | average frame | worst frame | other |
 |---|---|---:|---:|---:|---|
-| rasterbars | **rust64** `--release` | **1733** | **2810** | | |
+| rasterbars | **rust64** `--release` | **1327** | **1947** | | |
 | | oscar64 `-Os` | 1096 | 1877 | | |
 | | oscar64 `-O2` | 1136 | 1737 | | |
 | | oscar64 `-O3` | 1151 | 1684 | | |
-| scroller | **rust64** `--release` | **1885** | **317** | **1174** | interrupts per frame: **983** |
+| scroller | **rust64** `--release` | **1552** | **253** | **939** | interrupts per frame: **980** |
 | | oscar64 `-Os` | 1355 | 385 | 1695 | 826 |
 | | oscar64 `-O2` | 1498 | 369 | 1621 | 824 |
 | | oscar64 `-O3` | 1498 | 385 | 1694 | 817 |
-| diagonal | **rust64** `--release` | **3155** | **3152** | **7088** | start-up: **294 349** |
+| diagonal | **rust64** `--release` | **1510** | **2356** | **5369** | start-up: **87 290** |
 | | oscar64 `-Os` | 1126 | 2485 | 5634 | 69 490 |
 | | oscar64 `-O2` | 1161 | 2484 | 5630 | 67 915 |
 | | oscar64 `-O3` | 1161 | 2398 | 5464 | 68 075 |
@@ -419,17 +421,17 @@ colour matrix and switches the mode; *cells* is the loop over
 Where the library's assembly does the work (drawing, and the scroller's block copy and interrupts):
 
 * **Clipped, rust64 is ahead.** Against oscar64's `-Os` and `-O2` it is
-  about 6% faster and 15–17% smaller; against `-O3` it is as fast and 27%
-  smaller.
-* **Unclipped, oscar64 is slightly ahead.** Against `-Os` and `-O2` rust64
-  is 1–2% slower and 11–14% larger; against `-O3` it is 7% slower and the
-  same size.
+  about 7% faster and 21–22% smaller; against `-O3` it is 1.5% faster and
+  32% smaller.
+* **Unclipped, the two are level.** Against `-Os` and `-O2` rust64 is as
+  fast (within half a percent) and 3–5% larger; against `-O3` it is 6%
+  slower and 8% smaller.
 * **What dropping the checks buys** is different on the two sides. oscar64
   saves 1100–1400 bytes and about 9% of the time. rust64 saves 388 bytes
-  and 2.5%: its line loop never checked each pixel (only the two ends), so
+  and 2.6%: its line loop never checked each pixel (only the two ends), so
   the gain is in the circles (6%) and in the code for lines that leave the
   screen, which is no longer in the program.
-* **Lines: oscar64 needs 14–20% fewer cycles.** Its `bmu_line` assembles a
+* **Lines: oscar64 needs 14–19% fewer cycles.** Its `bmu_line` assembles a
   loop specialized for each line (direction, slope, pattern) at run time and
   then runs that. rust64's `line` checks the two ends against the screen and
   then runs one of two fixed Bresenham loops in assembly; it modifies no
@@ -437,45 +439,48 @@ Where the library's assembly does the work (drawing, and the scroller's block co
 * **Rectangle: rust64 is twice as fast**, because horizontal edges are stored
   a byte at a time, while the C version draws four general lines.
 * **Circles: rust64 needs 20–28% fewer cycles than C when both clip, and
-  9–20% fewer when neither does** — hand-written assembly against compiled C
+  9–21% fewer when neither does** — hand-written assembly against compiled C
   calling `bm_set` for every pixel.
-* **Setup** is two memory fills on both sides; rust64 is 2–7% slower there.
-* **scroller: rust64's main loop is faster** (14–18% fewer cycles on average,
-  28–31% fewer in the worst frame, the one that moves the 39 bytes of the
-  row: `mem::copy` in rust64, `memmove` in C).
-* **scroller interrupts: about level.** rust64 needs 983 cycles per frame,
+* **Setup** is two memory fills on both sides; rust64 is level with `-Os`
+  and up to 5% slower than the other levels.
+* **scroller: rust64's main loop is faster** (31–34% fewer cycles on average,
+  42–45% fewer in the worst frame, the one that moves the 39 bytes of the
+  row: a copy loop in place in rust64, `memmove` in C).
+* **scroller interrupts: about level.** rust64 needs 981 cycles per frame,
   oscar64 about 820, and most of both is the KERNAL's keyboard scan. A Rust
   function as a handler goes through a dispatcher that saves registers;
   oscar64's handler is a handful of generated instructions.
 
 Where compiled code does the work:
 
-* **Size: oscar64 wins all three effect programs.** rust64's are 51–58%
-  larger for rasterbars, 26–39% larger for scroller and 2.7–2.8 times as
-  large for diagonal.
-* **diagonal is the clearest case.** In rust64's listing the function `init`
-  alone is 464 instructions and `main` another 270: nested loops over arrays
-  with `iter_mut().enumerate()`, a `%`, a `match` and 16-bit address
-  arithmetic, all with the values in memory. The start-up, which is that
-  code, takes 4.3 times as long as in C; the per-frame work, mostly block
-  copies, 27–31% longer.
-* **rasterbars: rust64 needs 50–67% more cycles per frame** for one fill and
-  three small copies. rust64 calls its general fill and copy routines four
-  times, with the arguments passed through memory; oscar64 expands `memset`
-  and `memcpy` of a known size in place (its program has no such routines).
-  Part of rust64's size is not code: `raster.rat` aligns its timed code to a
-  page and keeps the colour table in the program file, while the C version
-  has the table outside the file.
+* **Size: oscar64 wins all three effect programs.** rust64's are 15–21%
+  larger for rasterbars, 4–15% larger for scroller and 30–34% larger for
+  diagonal.
+* **diagonal: 2–5% less time per frame, but a start-up that takes 1.3
+  times as long.** The per-frame work is mostly block copies of 40 bytes:
+  a loop in place on both sides, and `mem::copy` moves two bytes per round
+  when the length is even. The start-up is compiled code: in Rust nested
+  loops over arrays with `iter_mut().enumerate()`, where the iterators'
+  16-bit pointers are compared with their ends a byte at a time; the C
+  port counts with `char` and indexes.
+* **rasterbars: rust64 needs 4–16% more cycles per frame** for one fill and
+  three small copies. Both sides expand them in place; rust64 goes through
+  a pointer (`sta (ptr),y`, two bytes per round: 9.5 cycles per byte),
+  oscar64 knows the address
+  of the table (`sta table,x`). Part of rust64's size is not code:
+  `raster.rat` aligns its timed code to a page and keeps the colour table
+  in the program file, while the C version has the table outside the file.
 * **The *cells* loop of drawing** is the only phase of that program that is
-  purely compiler output on both sides, and there oscar64 is 5 to 6 times as
-  fast (26–30 cycles per iteration against 148). rust64 keeps every value in
-  memory, computes the 16-bit address and stores through a pointer; oscar64
-  keeps the counter in X and stores with `sta $43c0,x`. The loop is 0.6% of
-  the program's run time, so it does not show in the total.
+  purely compiler output on both sides, and there oscar64 needs 26–30
+  cycles per iteration and rust64 42. Both keep the counter in an index
+  register, store with the other one (`sta matrix+$300,x`) and test at
+  the end of the loop; rust64 keeps the colour in a temporary in memory
+  while it computes the address, and compares through A (`tya` / `cmp`).
 
-The open optimizations (values in registers, loop counters in X/Y, passing
-arguments in registers, expanding small fills and copies in place) are
-exactly what these programs need.
+What rust64 does about compiled code is in the guide (chapter 10: a
+data-flow pass over the assembly of each function). The open optimizations
+(iterator pointers as index registers, a counter in a register where a
+block copy needs both) are what these programs still need.
 
 #### Caveats
 
@@ -522,7 +527,7 @@ back out of the emulator's screenshot, `bench/drawing/screen.js`).
 
 | Path | Contents |
 |---|---|
-| `crates/rustc_codegen_rust64` | the backend: `codegen.rs` (MIR to 6510, frames, calls, data), `asm.rs` (operands, byte-wise emission), `runtime.rat` (start/exit, panic, memcpy, mul/div) |
+| `crates/rustc_codegen_rust64` | the backend: `codegen.rs` (MIR to 6510, frames, calls, data), `asm.rs` (operands, byte-wise emission, passes over the text), `opt.rs` (the data-flow pass over each function), `runtime.rat` (start/exit, panic, memcpy, mul/div) |
 | `crates/cargo-c64` | the `cargo c64` command and the end-to-end test harness |
 | `target-spec/mos-c64.json` | the target |
 | `lib/c64`, `lib/c64-macros` | the library (Rust and `src/rat/*.rat`) and its proc macros |
@@ -542,7 +547,7 @@ back out of the emulator's screenshot, `bench/drawing/screen.js`).
 | 2. Language breadth: enums, structs, slices, closures, iterators, panics | done |
 | 3. Library I: `hw`, `mem`, `sys`, `kernal`, `text`, `fmt`, `input`, assembly, `at`/`zp`, PETSCII | done |
 | 4. Library II: `sprite`, `gfx`, `sound`, `irq`, `dos`, function pointers, D64 | done |
-| 5. Optimization: frame overlay, zero-page allocation, 8-bit narrowing, block layout, peephole, pruning | mostly done; open: values in registers, X/Y loop counters, link-step inlining |
+| 5. Optimization: frame overlay, zero-page allocation, block layout, data-flow pass (values, ranges, liveness, copies, index registers, loops, arguments in registers), inlining of small functions, pruning | done |
 | 6. Tooling: `cargo c64 new/test`, Rust spans for assembler errors, memory map, debugger labels | open |
 | 7. Extensions: recursion on a software stack, `alloc`, `dyn Trait`, `f32`, cartridges | open |
 

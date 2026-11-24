@@ -74,11 +74,10 @@ rt_memset:
         inc zp_p1+1
         dex
         bne @page
-@rest:  ldx rt_n
+@rest:  ldy rt_n
         beq @done
-@byte:  sta (zp_p1),y
-        iny
-        dex
+@byte:  dey
+        sta (zp_p1),y
         bne @byte
 @done:  rts
 
@@ -197,6 +196,46 @@ rt_mul:
         bne @sha
         beq @bit
 @done:  rts
+
+; Unsigned rt_a / rt_b, one byte: quotient in rt_a, remainder in rt_r.
+rt_udiv8:
+        lda #0
+        ldx #8
+@bit:   asl rt_a
+        rol
+        cmp rt_b
+        bcc @next
+        sbc rt_b
+        inc rt_a
+@next:  dex
+        bne @bit
+        sta rt_r
+        rts
+
+; Unsigned rt_a / rt_b, two bytes: quotient in rt_a, remainder in rt_r.
+rt_udiv16:
+        lda #0
+        sta rt_r+1
+        ldx #16
+@bit:   asl rt_a
+        rol rt_a+1
+        rol
+        rol rt_r+1
+        tay
+        cmp rt_b
+        lda rt_r+1
+        sbc rt_b+1
+        bcc @keep
+        sta rt_r+1
+        tya
+        sbc rt_b
+        tay
+        inc rt_a
+@keep:  tya
+        dex
+        bne @bit
+        sta rt_r
+        rts
 
 ; Unsigned rt_a / rt_b: quotient in rt_a, remainder in rt_r (rt_n bytes).
 rt_udiv:

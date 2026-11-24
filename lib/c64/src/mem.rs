@@ -52,24 +52,78 @@ pub unsafe fn bytes(a: u16, n: u16) -> &'static mut [u8] {
 pub fn copy(dst: u16, src: u16, n: u16) {
     #[cfg(target_os = "c64")]
     unsafe {
-        crate::asm!(
-            "lda {src}",
-            "sta zp_p0",
-            "lda {src}+1",
-            "sta zp_p0+1",
-            "lda {dst}",
-            "sta zp_p1",
-            "lda {dst}+1",
-            "sta zp_p1+1",
-            "lda {n}",
-            "sta rt_n",
-            "lda {n}+1",
-            "sta rt_n+1",
-            "jsr rt_memcpy",
-            src = in(reg) src,
-            dst = in(reg) dst,
-            n = in(reg) n,
-        )
+        if n == 0 {
+            // nothing
+        } else if n < 256 && n & 1 == 0 {
+            // An even number of bytes up to 254: two per round (15.5
+            // cycles a byte instead of 18). When `n` is a constant, only
+            // one of these loops is left.
+            let pairs = n >> 1;
+            crate::asm!(
+                "lda {src}",
+                "sta zp_p0",
+                "lda {src}+1",
+                "sta zp_p0+1",
+                "lda {dst}",
+                "sta zp_p1",
+                "lda {dst}+1",
+                "sta zp_p1+1",
+                "ldx {pairs}",
+                "ldy #0",
+                "@copy: lda (zp_p0),y",
+                "sta (zp_p1),y",
+                "iny",
+                "lda (zp_p0),y",
+                "sta (zp_p1),y",
+                "iny",
+                "dex",
+                "bne @copy",
+                src = in(reg) src,
+                dst = in(reg) dst,
+                pairs = in(reg) pairs,
+            )
+        } else if n < 256 {
+            // Up to 255 bytes: a loop in place, without the call.
+            crate::asm!(
+                "lda {src}",
+                "sta zp_p0",
+                "lda {src}+1",
+                "sta zp_p0+1",
+                "lda {dst}",
+                "sta zp_p1",
+                "lda {dst}+1",
+                "sta zp_p1+1",
+                "ldx {n}",
+                "ldy #0",
+                "@copy: lda (zp_p0),y",
+                "sta (zp_p1),y",
+                "iny",
+                "dex",
+                "bne @copy",
+                src = in(reg) src,
+                dst = in(reg) dst,
+                n = in(reg) n,
+            )
+        } else {
+            crate::asm!(
+                "lda {src}",
+                "sta zp_p0",
+                "lda {src}+1",
+                "sta zp_p0+1",
+                "lda {dst}",
+                "sta zp_p1",
+                "lda {dst}+1",
+                "sta zp_p1+1",
+                "lda {n}",
+                "sta rt_n",
+                "lda {n}+1",
+                "sta rt_n+1",
+                "jsr rt_memcpy",
+                src = in(reg) src,
+                dst = in(reg) dst,
+                n = in(reg) n,
+            )
+        }
     }
     #[cfg(not(target_os = "c64"))]
     for i in 0..n {
@@ -81,21 +135,61 @@ pub fn copy(dst: u16, src: u16, n: u16) {
 pub fn fill(dst: u16, n: u16, v: u8) {
     #[cfg(target_os = "c64")]
     unsafe {
-        crate::asm!(
-            "lda {dst}",
-            "sta zp_p1",
-            "lda {dst}+1",
-            "sta zp_p1+1",
-            "lda {n}",
-            "sta rt_n",
-            "lda {n}+1",
-            "sta rt_n+1",
-            "lda {v}",
-            "jsr rt_memset",
-            dst = in(reg) dst,
-            n = in(reg) n,
-            v = in(reg) v,
-        )
+        if n == 0 {
+            // nothing
+        } else if n < 256 && n & 1 == 0 {
+            // An even number of bytes up to 254: two per round (9.5 cycles
+            // a byte instead of 11). When `n` is a constant, only one of
+            // these loops is left.
+            crate::asm!(
+                "lda {dst}",
+                "sta zp_p1",
+                "lda {dst}+1",
+                "sta zp_p1+1",
+                "lda {v}",
+                "ldy {n}",
+                "@fill: dey",
+                "sta (zp_p1),y",
+                "dey",
+                "sta (zp_p1),y",
+                "bne @fill",
+                dst = in(reg) dst,
+                n = in(reg) n,
+                v = in(reg) v,
+            )
+        } else if n < 256 {
+            // Up to 255 bytes: a loop in place, without the call.
+            crate::asm!(
+                "lda {dst}",
+                "sta zp_p1",
+                "lda {dst}+1",
+                "sta zp_p1+1",
+                "lda {v}",
+                "ldy {n}",
+                "@fill: dey",
+                "sta (zp_p1),y",
+                "bne @fill",
+                dst = in(reg) dst,
+                n = in(reg) n,
+                v = in(reg) v,
+            )
+        } else {
+            crate::asm!(
+                "lda {dst}",
+                "sta zp_p1",
+                "lda {dst}+1",
+                "sta zp_p1+1",
+                "lda {n}",
+                "sta rt_n",
+                "lda {n}+1",
+                "sta rt_n+1",
+                "lda {v}",
+                "jsr rt_memset",
+                dst = in(reg) dst,
+                n = in(reg) n,
+                v = in(reg) v,
+            )
+        }
     }
     #[cfg(not(target_os = "c64"))]
     for i in 0..n {

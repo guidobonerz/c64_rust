@@ -3,9 +3,12 @@
 //! The model (see PLAN.md, section 3):
 //!
 //! * Every function has a static frame in the BSS: its locals and
-//!   temporaries live at fixed addresses. The caller copies the arguments
-//!   into the callee's argument locals (`L<callee>_<n>`) and the result out
-//!   of `L<callee>_0`. Recursion is rejected.
+//!   temporaries live at fixed addresses. The first three bytes of the
+//!   arguments are passed in A, X and Y (the callee stores them into its
+//!   argument locals, unless it can use them as they are); the caller
+//!   copies the rest into the callee's argument locals (`L<callee>_<n>`).
+//!   A result of up to three bytes comes back in A, X and Y, a larger one
+//!   in `L<callee>_0`. Recursion is rejected.
 //! * All values live in memory; operations work byte by byte through the
 //!   accumulator. Memory behind pointers is reached with `(zp),y`.
 //! * Constants and statics become data; pointers in them become `.word`
@@ -35,6 +38,7 @@ use rustc_middle::ty::{self, Instance, InstanceKind, ShimKind, Ty, TyCtxt, TypeF
 use rustc_span::Span;
 
 use crate::asm::{Addr, Asm, Val};
+use crate::inline::Func;
 use crate::runtime::RUNTIME;
 
 /// Layout queries for fully monomorphized types.
@@ -141,6 +145,8 @@ struct Program<'tcx> {
     /// Code that initializes the zero-page statics.
     zp_init: Asm,
     fixed: Vec<Fixed>,
+    /// Statics that are all zero: label, size, name (see `emit_static`).
+    zero_statics: Vec<(String, u64, String)>,
     /// Addresses of `at` statics without data (the program must end below
     /// them if they are in RAM).
     fixed_vars: Vec<(u64, String)>,
@@ -149,6 +155,9 @@ struct Program<'tcx> {
     /// registers of the runtime, the registers of calls through pointers
     /// (`rt_args`, `rt_ret`), assembly functions (their argument areas).
     ptr_ctx: PtrCtx,
+    /// The bytes of the arguments of each function that has been called
+    /// or compiled (the first three are passed in registers).
+    arg_bytes: FxIndexMap<usize, u64>,
 }
 
 impl<'tcx> Program<'tcx> {
@@ -248,8 +257,10 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         zp_next: ZP_FIRST,
         zp_init: Asm::default(),
         fixed: Vec::new(),
+        zero_statics: Vec::new(),
         fixed_vars: Vec::new(),
         ptr_ctx: PtrCtx::default(),
+        arg_bytes: FxIndexMap::default(),
     };
 
     let mut main = None;
@@ -302,9 +313,142 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
             ns += 1;
         }
     }
+    // Statics that are all zero go to the BSS and are cleared at the
+    // start, if that takes less room than their bytes in the file.
+    let zero_statics = std::mem::take(&mut p.zero_statics);
+    let zero_total: u64 = zero_statics.iter().map(|z| z.1).sum();
+    let zero = if zero_total > if zero_total < 256 { 10 } else { 30 } { zero_total } else { 0 };
+    if zero > 0 {
+        let _ = writeln!(p.defs, "rt_zero = __bss + {}", p.bss);
+    }
+    for (label, size, name) in zero_statics {
+        if zero > 0 {
+            let _ = writeln!(p.defs, "{label} = __bss + {}            ; {name}", p.bss);
+            p.bss += size;
+        } else {
+            data.comment(format!("static {name}"));
+            data.label(&label);
+            for row in 0..size.div_ceil(16) {
+                let n = (size - 16 * row).min(16) as usize;
+                data.ins(format!(".byte {}", vec!["$00"; n].join(",")));
+            }
+        }
+    }
     // Pointer entries can reach new functions only through data, which is
     // done; the entries themselves call already compiled functions.
     let wrappers = fn_ptr_entries(&mut p);
+
+    // The library assembly: the runtime, the rat sources and the generated
+    // helpers. Only what the program refers to is kept (asm::prune).
+    let mut lib = String::new();
+    lib.push_str(RUNTIME);
+    lib.push_str(&p.rat);
+    lib.push_str("\nrt_loc: .res 16                  ; dummy core::panic::Location\n");
+    lib.push_str("\n; ---- exported to assembly ----\n");
+    lib.push_str(&p.exports);
+    lib.push_str(&exported_data.text);
+    lib.push_str("\n; ---- constants ----\n");
+    lib.push_str(&const_data.text);
+    lib.push_str(&ctx_save(p.ptr_ctx));
+
+    // Arguments nobody reads are not passed; what that frees in the
+    // callers is cleaned up function by function.
+    {
+        let program = format!("{}{}{}", p.asm.text, wrappers, data.text);
+        let kept = crate::asm::prune(&lib, &program);
+        let code = crate::asm::drop_dead_args(&p.asm.text, &[&wrappers, &data.text, &kept], &|name| {
+            // F<id>v<n>, F<id>t, L<id>_<n>
+            let id = name
+                .strip_prefix('F')
+                .and_then(|r| r.split_once(['v', 't']))
+                .or_else(|| name.strip_prefix('L').and_then(|r| r.split_once('_')))
+                .and_then(|(id, _)| id.parse::<usize>().ok())?;
+            let &(o, n) = p.layouts.get(&id)?.0.get(name)?;
+            Some((id, o, n))
+        });
+        let mut text = String::with_capacity(code.len());
+        let mut chunks: Vec<(usize, String)> = Vec::new();
+        for line in code.lines() {
+            if let Some(id) = line
+                .strip_prefix('F')
+                .and_then(|r| r.strip_suffix(':'))
+                .and_then(|r| r.parse::<usize>().ok())
+            {
+                chunks.push((id, String::new()));
+            }
+            let chunk = match chunks.last_mut() {
+                Some((_, chunk)) => chunk,
+                None => &mut text,
+            };
+            chunk.push_str(line);
+            chunk.push('\n');
+        }
+        // (the comment lines at the end of a function's text belong to the
+        // next one)
+        let mut funcs: Vec<Func> = Vec::new();
+        let mut pre: Vec<String> = Vec::new();
+        for (id, chunk) in chunks {
+            let mut lines: Vec<String> = optimize_fn(&mut p, &chunk, id, &[]).lines().map(str::to_owned).collect();
+            let mut tail = Vec::new();
+            while lines.last().is_some_and(|l| l.trim().is_empty() || l.trim().starts_with(';')) {
+                tail.push(lines.pop().unwrap());
+            }
+            tail.reverse();
+            funcs.push(Func { id, pre: std::mem::replace(&mut pre, tail), lines, live: true });
+        }
+        if std::env::var_os("RUST64_NO_OPT").is_none() && std::env::var_os("RUST64_NO_INLINE").is_none() {
+            let fixed: Vec<&str> = p.fixed.iter().map(|f| f.text.as_str()).collect();
+            let mut others: Vec<&str> = vec![&wrappers, &data.text, &lib];
+            others.extend(fixed);
+            let pinned = inline_roots(&p, main_id, &others);
+            inline_fns(&mut p, &mut funcs, pinned);
+        }
+        for f in funcs.iter().filter(|f| f.live) {
+            for l in f.pre.iter().chain(&f.lines) {
+                text.push_str(l);
+                text.push('\n');
+            }
+        }
+        for l in &pre {
+            text.push_str(l);
+            text.push('\n');
+        }
+        p.asm.text = text;
+    }
+
+    // Argument and result areas of the assembly functions: one block, so
+    // that interrupt dispatchers can save it (rt_ctx_save). Only for the
+    // functions the program uses: the code calls them, or assembly that is
+    // kept refers to their areas.
+    let used_areas: FxIndexSet<String> = {
+        let program = format!("{}{}{}", p.asm.text, wrappers, data.text);
+        let kept = crate::asm::prune(&lib, &program);
+        let mut used = FxIndexSet::default();
+        for text in [&program, &kept] {
+            for line in text.lines() {
+                let line = line.split(';').next().unwrap_or("");
+                for w in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if w.ends_with("__args") || w.ends_with("__res") {
+                        used.insert(w.to_owned());
+                    }
+                }
+            }
+        }
+        used
+    };
+    let _ = writeln!(p.defs, "rt_fsave = __bss + {}", p.bss);
+    for (sym, &(args, res)) in &p.foreign {
+        for (suffix, n) in [("args", args), ("res", res)] {
+            if n > 0 && used_areas.contains(&format!("{sym}__{suffix}")) {
+                let _ = writeln!(p.defs, "{sym}__{suffix} = __bss + {}", p.bss);
+                p.bss += n;
+            }
+        }
+    }
+    let _ = writeln!(p.defs, "rt_fsave_end = __bss + {}", p.bss);
+    let _ = writeln!(p.defs, "rt_ctxbuf = __bss + {}", p.bss);
+    p.bss += 256 + 8;
+
 
     // Frames. Functions that are never active at the same time share
     // memory: a frame lies above the frames of everything the function
@@ -313,7 +457,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     // region of its own above the main program's: a handler may interrupt
     // anything. What fits into the rest of the zero page goes there: the
     // leaves first, which are called most.
-    let frames = std::mem::take(&mut p.frames);
+    let frames = compact_frames(&mut p, &[&wrappers, &data.text, &lib]);
     let n = p.funcs.len();
     let mut size = vec![0u64; n];
     for (id, sz, _) in &frames {
@@ -362,94 +506,6 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     }
     p.bss += top;
 
-    // The library assembly: the runtime, the rat sources and the generated
-    // helpers. Only what the program refers to is kept (asm::prune).
-    let mut lib = String::new();
-    lib.push_str(RUNTIME);
-    lib.push_str(&p.rat);
-    lib.push_str("\nrt_loc: .res 16                  ; dummy core::panic::Location\n");
-    lib.push_str("\n; ---- exported to assembly ----\n");
-    lib.push_str(&p.exports);
-    lib.push_str(&exported_data.text);
-    lib.push_str("\n; ---- constants ----\n");
-    lib.push_str(&const_data.text);
-    lib.push_str(&ctx_save(p.ptr_ctx));
-
-    // Arguments nobody reads are not passed; what that frees in the
-    // callers is cleaned up function by function.
-    {
-        let program = format!("{}{}{}", p.asm.text, wrappers, data.text);
-        let kept = crate::asm::prune(&lib, &program);
-        let code = crate::asm::drop_dead_args(&p.asm.text, &[&wrappers, &data.text, &kept], &|name| {
-            // F<id>v<n>, F<id>t, L<id>_<n>
-            let id = name
-                .strip_prefix('F')
-                .and_then(|r| r.split_once(['v', 't']))
-                .or_else(|| name.strip_prefix('L').and_then(|r| r.split_once('_')))
-                .and_then(|(id, _)| id.parse::<usize>().ok())?;
-            let &(o, n) = p.layouts.get(&id)?.0.get(name)?;
-            Some((id, o, n))
-        });
-        let mut text = String::with_capacity(code.len());
-        let mut chunk = String::new();
-        let mut cur: Option<usize> = None;
-        let flush = |p: &mut Program<'_>, chunk: &mut String, cur: Option<usize>, text: &mut String| {
-            match cur {
-                Some(id) => text.push_str(&optimize_fn(p, chunk, id)),
-                None => text.push_str(chunk),
-            }
-            chunk.clear();
-        };
-        for line in code.lines() {
-            if let Some(id) = line
-                .strip_prefix('F')
-                .and_then(|r| r.strip_suffix(':'))
-                .and_then(|r| r.parse::<usize>().ok())
-            {
-                flush(&mut p, &mut chunk, cur, &mut text);
-                cur = Some(id);
-            }
-            chunk.push_str(line);
-            chunk.push('\n');
-        }
-        flush(&mut p, &mut chunk, cur, &mut text);
-        p.asm.text = text;
-    }
-
-    // Argument and result areas of the assembly functions: one block, so
-    // that interrupt dispatchers can save it (rt_ctx_save). Only for the
-    // functions the program uses: the code calls them, or assembly that is
-    // kept refers to their areas.
-    let used_areas: FxIndexSet<String> = {
-        let program = format!("{}{}{}", p.asm.text, wrappers, data.text);
-        let kept = crate::asm::prune(&lib, &program);
-        let mut used = FxIndexSet::default();
-        for text in [&program, &kept] {
-            for line in text.lines() {
-                let line = line.split(';').next().unwrap_or("");
-                for w in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-                    if w.ends_with("__args") || w.ends_with("__res") {
-                        used.insert(w.to_owned());
-                    }
-                }
-            }
-        }
-        used
-    };
-    let _ = writeln!(p.defs, "rt_fsave = __bss + {}", p.bss);
-    for (sym, &(args, res)) in &p.foreign {
-        for (suffix, n) in [("args", args), ("res", res)] {
-            if n > 0 && used_areas.contains(&format!("{sym}__{suffix}")) {
-                let _ = writeln!(p.defs, "{sym}__{suffix} = __bss + {}", p.bss);
-                p.bss += n;
-            }
-        }
-    }
-    let _ = writeln!(p.defs, "rt_fsave_end = __bss + {}", p.bss);
-    let _ = writeln!(p.defs, "rt_ctxbuf = __bss + {}", p.bss);
-    p.bss += 256 + 8;
-
-
     let mut out = String::new();
     let _ = writeln!(out, "\nrt_main = F{main_id}");
     let zp_init = !p.zp_init.text.is_empty();
@@ -466,6 +522,8 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
             .and_then(|(id, _)| id.parse::<usize>().ok())
             .is_some_and(|id| zp_ids.contains(&id))
     });
+    // (a value that was stored for the pointer setup and loaded again)
+    let code = crate::asm::peephole(&code);
     // Branch distances with the real sizes: frames in the zero page are
     // known now.
     let code = crate::asm::relax_with(
@@ -546,12 +604,95 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         .filter(|(id, _)| refers(*id))
         .map(|&(_, end)| end)
         .fold(p.zp_next, u64::max);
-    let start = start_exit(zp_end - ZP_FIRST, hw, exit_used, zp_init);
+    let start = start_exit(zp_end - ZP_FIRST, hw, exit_used, zp_init, zero);
     let lib = crate::asm::prune(&lib, &format!("{start}{out}"));
     format!(
         "; generated by rust64\n.basicupstart rt_start\n\n; ---- frames in the zero page ----\n\
          {zp_frames}\n{start}{lib}{out}"
     )
+}
+
+/// The frames with only the bytes the final code refers to: after the
+/// optimizations most temporaries and many locals are not used any more.
+/// The bytes that are left keep their order and move together, so more
+/// frames fit into the zero page. `others` is the text besides the code:
+/// the wrappers, then the data and the library assembly.
+///
+/// A plain operand `name+k` keeps the bytes from the start of `name` up to
+/// the one it names (the callers of a function with spread arguments store
+/// through the name of the first one); a name used in any other way keeps
+/// all its bytes.
+fn compact_frames(p: &mut Program<'_>, others: &[&String]) -> Vec<(usize, u64, String)> {
+    let frames = std::mem::take(&mut p.frames);
+    let mut names: FxIndexMap<String, (usize, u64, u64)> = FxIndexMap::default();
+    for (&id, (layout, _)) in &p.layouts {
+        for (name, &(o, n)) in layout {
+            names.insert(name.clone(), (id, o, n));
+        }
+    }
+    let mut keep: FxIndexMap<usize, Vec<bool>> =
+        frames.iter().map(|(id, sz, _)| (*id, vec![false; *sz as usize])).collect();
+    let mut used: FxIndexSet<String> = FxIndexSet::default();
+    let mut mark = |name: &str, upto: Option<u64>| {
+        let Some(&(id, o, n)) = names.get(name) else { return };
+        let Some(v) = keep.get_mut(&id) else { return };
+        used.insert(name.to_owned());
+        let end = match upto {
+            Some(k) => o + k + 1,
+            None => o + n,
+        };
+        for b in o..end.min(v.len() as u64) {
+            v[b as usize] = true;
+        }
+    };
+    let words = |t: &str, mark: &mut dyn FnMut(&str, Option<u64>)| {
+        for w in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if !w.is_empty() {
+                mark(w, None);
+            }
+        }
+    };
+    for line in p.asm.text.lines().chain(others[0].lines()) {
+        let t = line.split(';').next().unwrap_or("");
+        if line.starts_with(' ')
+            && let Some((_, arg)) = t.trim().split_once(' ')
+            && let Some((b, k)) = crate::asm::sym_off(arg.trim())
+        {
+            mark(b, Some(k));
+            continue;
+        }
+        words(t, &mut mark);
+    }
+    for text in &others[1..] {
+        for line in text.lines() {
+            words(line.split(';').next().unwrap_or(""), &mut mark);
+        }
+    }
+    let mut out = Vec::with_capacity(frames.len());
+    for (id, _, _) in frames {
+        let kept = &keep[&id];
+        // the new place of each byte
+        let mut pos = Vec::with_capacity(kept.len() + 1);
+        let mut n = 0u64;
+        for &k in kept {
+            pos.push(n);
+            n += k as u64;
+        }
+        pos.push(n);
+        let mut defs = String::new();
+        let mut entries: Vec<(&String, u64)> = p.layouts[&id]
+            .0
+            .iter()
+            .filter(|(name, _)| used.contains(*name))
+            .map(|(name, &(o, _))| (name, o))
+            .collect();
+        entries.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+        for (name, o) in entries {
+            let _ = writeln!(defs, "{name} = F{id}f+{}", pos[o as usize]);
+        }
+        out.push((id, n, defs));
+    }
+    out
 }
 
 /// The start and exit code of the program.
@@ -566,17 +707,50 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
 /// * `exit_used`: something jumps to `rt_exit` (`sys::exit`, a panic), from
 ///   any depth of calls: the stack pointer is saved.
 /// * `zp_init`: there are zero-page statics to initialize.
+/// * `zero`: the bytes of the statics in the BSS (`rt_zero`), cleared at
+///   the start.
 ///
 /// A program that needs none of this starts directly with `main`, whose
 /// `rts` returns to BASIC.
-fn start_exit(zp: u64, hw: bool, exit_used: bool, zp_init: bool) -> String {
+fn start_exit(zp: u64, hw: bool, exit_used: bool, zp_init: bool, zero: u64) -> String {
     let mut a = Asm::default();
     a.raw("\n; ---- start and exit ----");
-    if zp == 0 && !hw && !exit_used && !zp_init {
+    if zp == 0 && !hw && !exit_used && !zp_init && zero == 0 {
         a.raw("rt_start = rt_main");
         return a.text;
     }
     a.label("rt_start");
+    // The statics in the BSS start as zero, at every start.
+    if zero >= 256 {
+        a.ins("lda #<rt_zero");
+        a.ins("sta zp_p1");
+        a.ins("lda #>rt_zero");
+        a.ins("sta zp_p1+1");
+        a.ins("lda #0");
+        a.ins("tay");
+        a.ins(format!("ldx #{}", zero >> 8));
+        a.raw("@zpage:");
+        a.ins("sta (zp_p1),y");
+        a.ins("iny");
+        a.ins("bne @zpage");
+        a.ins("inc zp_p1+1");
+        a.ins("dex");
+        a.ins("bne @zpage");
+        if zero & 0xff != 0 {
+            a.raw("@zrest:");
+            a.ins("sta (zp_p1),y");
+            a.ins("iny");
+            a.ins(format!("cpy #{}", zero & 0xff));
+            a.ins("bne @zrest");
+        }
+    } else if zero > 0 {
+        a.ins("lda #0");
+        a.ins(format!("ldx #{zero}"));
+        a.raw("@zero:");
+        a.ins("sta rt_zero-1,x");
+        a.ins("dex");
+        a.ins("bne @zero");
+    }
     if zp > 0 {
         a.ins(format!("ldx #{zp}"));
         a.raw("@save:");
@@ -732,6 +906,17 @@ fn emit_static(p: &mut Program<'_>, data: &mut Asm, ns: usize) {
             }
         }
         _ => {
+            // All zero (or not initialized) and no pointers: the static
+            // can live in the BSS, which is not in the program file.
+            let bytes = a.inspect_with_uninit_and_ptr_outside_interpreter(0..a.len());
+            if size > 0
+                && a.provenance().ptrs().is_empty()
+                && bytes.iter().all(|&b| b == 0)
+                && !p.exported_statics.contains(&ns)
+            {
+                p.zero_statics.push((label, size, name));
+                return;
+            }
             data.comment(format!("static {name}"));
             emit_alloc(p, data, &label, a);
         }
@@ -779,11 +964,30 @@ fn fn_ptr_entries(p: &mut Program<'_>) -> String {
                 p.name(id)
             ))
         }
+        // the first three argument bytes also in A, X and Y
+        let mut regs: Vec<String> = Vec::new();
+        'bytes: for (i, ty) in args.iter().enumerate() {
+            for o in 0..p.cx.layout_of(*ty).size.bytes() {
+                if regs.len() == 3 {
+                    break 'bytes;
+                }
+                regs.push(format!("L{id}_{}+{o}", i + 1));
+            }
+        }
+        for (load, b) in ["lda", "ldx", "ldy"].iter().zip(&regs) {
+            a.ins(format!("{load} {b}"));
+        }
         if ret == 0 {
             a.ins(format!("jmp F{id}"));
         } else {
             a.ins(format!("jsr F{id}"));
-            a.copy(&Addr::Abs("rt_ret".into()), &Val::Mem(Addr::Abs(format!("L{id}_0"))), ret);
+            if ret <= 3 {
+                for (i, store) in ["sta", "stx", "sty"].iter().enumerate().take(ret as usize) {
+                    a.ins(format!("{store} rt_ret+{i}"));
+                }
+            } else {
+                a.copy(&Addr::Abs("rt_ret".into()), &Val::Mem(Addr::Abs(format!("L{id}_0"))), ret);
+            }
             a.ins("rts");
         }
     }
@@ -1273,7 +1477,7 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
     f.lazy_cand = f.lazy_locals();
     f.body();
     f.finish();
-    let opt = optimize_fn(f.p, &f.p.asm.text[start..].to_owned(), id);
+    let opt = optimize_fn(f.p, &f.p.asm.text[start..].to_owned(), id, &[]);
     f.p.asm.text.truncate(start);
     f.p.asm.text.push_str(&opt);
     if ctx == CTX_PTR {
@@ -1320,11 +1524,187 @@ fn const_byte(p: &mut Program<'_>, label: &str, off: u64) -> Option<String> {
     Some(format!("#${:02x}", b[0]))
 }
 
-/// The assembly-level passes over the text of one function.
-fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize) -> String {
+/// The functions that must stay functions: the program's entry, those
+/// whose address is taken, and those that the text besides the code
+/// (`others`) names.
+fn inline_roots(p: &Program<'_>, main_id: usize, others: &[&str]) -> std::collections::HashSet<usize> {
+    let mut pinned = std::collections::HashSet::new();
+    pinned.insert(main_id);
+    pinned.extend(p.addr_taken.keys().copied());
+    for text in others {
+        crate::inline::named(text, &mut pinned);
+    }
+    pinned
+}
+
+/// Replaces calls by the text of the called function (see `inline.rs`),
+/// where that makes the program smaller or no larger and faster:
+///
+/// * a function with one call in the whole program,
+/// * a function whose text is not longer than what its calls save: with
+///   `n` calls of a text of `b` bytes, `n * (b - 3) <= b + 1` (a `jsr` is
+///   three bytes, and the function with its `rts` goes away).
+///
+/// All calls of a function are replaced or none, so the function itself
+/// always goes away. The functions are looked at callees first: the text
+/// of a function is final (its own calls replaced, optimized again) when it
+/// is its turn.
+///
+/// A caller is optimized again with the text in it. The frame of the
+/// inlined function still exists (`Program::calls` and the frames are as
+/// before); if all of the function's text is now in one function, that
+/// function is the only one to use the frame, and its bytes are followed
+/// like those of the function's own frame (`optimize_fn`, `extra`).
+fn inline_fns(p: &mut Program<'_>, funcs: &mut [Func], mut pinned: std::collections::HashSet<usize>) {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let index: HashMap<usize, usize> = funcs.iter().enumerate().map(|(i, f)| (f.id, i)).collect();
+    // callees first
+    let callees: HashMap<usize, Vec<usize>> = funcs
+        .iter()
+        .map(|f| (f.id, crate::inline::sites(f, &mut pinned).iter().map(|s| s.callee).collect()))
+        .collect();
+    fn visit(f: usize, callees: &HashMap<usize, Vec<usize>>, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
+        if !seen.insert(f) {
+            return;
+        }
+        for &c in callees.get(&f).into_iter().flatten() {
+            visit(c, callees, seen, order);
+        }
+        order.push(f);
+    }
+    let (mut seen, mut order) = (HashSet::new(), Vec::new());
+    for f in funcs.iter() {
+        visit(f.id, &callees, &mut seen, &mut order);
+    }
+    // an inlined function -> the functions that have its text now
+    let mut holders: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    let mut dirty: HashSet<usize> = HashSet::new();
+    for c in order {
+        let Some(&ci) = index.get(&c) else { continue };
+        if dirty.contains(&c) {
+            let mut extra: Vec<usize> =
+                holders.iter().filter(|(_, h)| h.len() == 1 && h.contains(&c)).map(|(&d, _)| d).collect();
+            extra.sort_unstable();
+            let text = funcs[ci].lines.join("\n") + "\n";
+            funcs[ci].lines = optimize_fn(p, &text, c, &extra).lines().map(str::to_owned).collect();
+        }
+        if pinned.contains(&c) {
+            continue;
+        }
+        let Some(body) = crate::inline::body(&funcs[ci]) else { continue };
+        let mut calls: Vec<(usize, Vec<crate::inline::Site>)> = Vec::new();
+        for (i, f) in funcs.iter().enumerate() {
+            if f.live && i != ci {
+                let found: Vec<_> =
+                    crate::inline::sites(f, &mut pinned).into_iter().filter(|s| s.callee == c).collect();
+                if !found.is_empty() {
+                    calls.push((i, found));
+                }
+            }
+        }
+        let n: i64 = calls.iter().map(|(_, s)| s.len() as i64).sum();
+        if pinned.contains(&c) || n == 0 || (n > 1 && n * (body.inline_size - 3) > body.size) {
+            continue;
+        }
+        let mut into = BTreeSet::new();
+        for (i, found) in calls {
+            let caller = funcs[i].id;
+            for site in found.iter().rev() {
+                let text = crate::inline::paste(&body, caller, site.tail);
+                funcs[i].lines.splice(site.line..=site.line, text);
+            }
+            crate::asm::widen(&mut funcs[i].lines);
+            dirty.insert(caller);
+            into.insert(caller);
+        }
+        funcs[ci].live = false;
+        for h in holders.values_mut() {
+            if h.remove(&c) {
+                h.extend(into.iter().copied());
+            }
+        }
+        holders.insert(c, into);
+    }
+}
+
+/// The assembly-level passes over the text of one function. `extra` are
+/// functions whose text is in this one and nowhere else (`inline_fns`): the
+/// bytes of their frames are followed like those of the function's own.
+fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> String {
     let opt = crate::asm::relax(text);
-    let Some((layout, args_end)) = p.layouts.get(&id).cloned() else { return opt };
-    let opt = crate::asm::forward(&opt, id, &layout, args_end, &mut |l, o| const_byte(p, l, o));
+    let Some((mut layout, args_end)) = p.layouts.get(&id).cloned() else { return opt };
+    let mut base = layout.values().map(|&(o, n)| o + n).max().unwrap_or(0);
+    for d in extra {
+        let Some((other, _)) = p.layouts.get(d) else { continue };
+        for (name, &(o, n)) in other {
+            layout.insert(name.clone(), (base + o, n));
+        }
+        base += other.values().map(|&(o, n)| o + n).max().unwrap_or(0);
+    }
+    let mut opt = crate::asm::forward(&opt, id, &layout, args_end, &mut |l, o| const_byte(p, l, o));
+    if std::env::var_os("RUST64_NO_OPT").is_none() {
+        // Statics at a fixed address may be hardware registers.
+        let tcx = p.tcx;
+        let statics = &p.statics;
+        let is_io = |name: &str| {
+            name.strip_prefix('S').and_then(|n| n.parse::<usize>().ok()).is_some_and(|n| {
+                statics.get_index(n).is_none_or(|&d| {
+                    tcx.codegen_fn_attrs(d).link_section.is_some_and(|s| s.as_str().starts_with("at:"))
+                })
+            })
+        };
+        // The bytes of the arguments of a function, in assembly or of this
+        // program (the first three are in A, X and Y); the runtime's
+        // routines take theirs in memory, but `rt_memset` the value in A.
+        // Data that the program never changes: constants, and statics that
+        // are not `mut`, have no interior mutability and are not exported
+        // to assembly.
+        let (allocs, exported) = (&p.allocs, &p.exported_statics);
+        let is_const = |name: &str| {
+            let index = |prefix: char| name.strip_prefix(prefix).and_then(|n| n.parse::<usize>().ok());
+            if let Some(n) = index('S') {
+                return statics.get_index(n).is_some_and(|&d| {
+                    !exported.contains(&n)
+                        && !tcx.is_mutable_static(d)
+                        && tcx.codegen_fn_attrs(d).link_section.is_none()
+                        && tcx
+                            .type_of(d)
+                            .instantiate_identity()
+                            .skip_normalization()
+                            .is_freeze(tcx, TypingEnv::fully_monomorphized())
+                });
+            }
+            index('A').and_then(|n| allocs.get_index(n)).is_some_and(|&id| {
+                matches!(tcx.global_alloc(id), GlobalAlloc::Memory(m) if !m.inner().mutability.is_mut())
+            })
+        };
+        let (foreign, arg_bytes) = (&p.foreign, &p.arg_bytes);
+        let call_args = |sym: &str| match foreign.get(sym) {
+            Some(&(args, _)) => Some(args),
+            // a function of this program (`None`: not compiled or called
+            // yet, so it counts as taking all three registers)
+            None if sym.strip_prefix('F').is_some_and(|n| n.parse::<usize>().is_ok()) => {
+                arg_bytes.get(&sym[1..].parse::<usize>().unwrap()).copied()
+            }
+            None if sym == "rt_memset" => Some(1),
+            None if sym.starts_with("rt_") => Some(0),
+            None => None,
+        };
+        for _ in 0..4 {
+            let next = crate::asm::relax(&crate::opt::optimize(
+                &crate::asm::relax(&opt),
+                id,
+                &layout,
+                &is_io,
+                &is_const,
+                &call_args,
+            ));
+            if next == opt {
+                break;
+            }
+            opt = next;
+        }
+    }
     crate::asm::peephole(&crate::asm::relax(&opt))
 }
 
@@ -1485,6 +1865,24 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         self.a().comment(format!("fn {name}"));
         let label = format!("F{}", self.id);
         self.a().label(&label);
+        // The first three argument bytes arrive in A, X and Y. (Stores of
+        // bytes that the function reads from the register, or not at all,
+        // go in `opt.rs`.)
+        let mut k = 0;
+        let mut total = 0;
+        for l in 1..=self.mir.arg_count {
+            let local = Local::from_usize(l);
+            let size = self.layout(self.local_ty(local)).size.bytes();
+            total += size;
+            for o in 0..size {
+                if k < 3 {
+                    let at = self.local_addr(local);
+                    self.a().ins(format!("{} {at}+{o}", ["sta", "stx", "sty"][k]));
+                    k += 1;
+                }
+            }
+        }
+        self.p.arg_bytes.insert(self.id, total);
         let order = self.block_order();
         let panics = self.panic_blocks();
         for (k, &bb) in order.iter().enumerate() {
@@ -1516,41 +1914,97 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         }
     }
 
-    /// The order in which the blocks are emitted: each block is followed by
+    /// The order in which the blocks are emitted: reverse postorder, where
     /// the successor that control usually continues with (the target of a
-    /// goto, call or assert, the "otherwise" branch of a switch), if that
-    /// is not placed yet, so that most jumps disappear. Unreachable and
-    /// cleanup blocks (panic = abort: no unwinding) are left out.
+    /// goto, call or assert; of a switch the branch that stays in the
+    /// innermost loop, else the "otherwise" branch) is visited last and so
+    /// follows its block directly. That keeps the body of a
+    /// loop together with the exit after it, and puts both sides of an `if`
+    /// and the cases of a `match` before the code they join in, so most
+    /// jumps disappear and most branches are short. Unreachable and cleanup
+    /// blocks (panic = abort: no unwinding) are left out.
     fn block_order(&self) -> Vec<BasicBlock> {
         let blocks = &self.mir.basic_blocks;
         let reachable = self.reachable_blocks();
+        let panics = self.panic_blocks();
         let ok = |b: BasicBlock| reachable[b.as_usize()] && !blocks[b].is_cleanup;
-        let mut placed = vec![false; blocks.len()];
-        let mut order = Vec::with_capacity(blocks.len());
-        for start in blocks.indices() {
-            let mut cur = start;
-            while ok(cur) && !std::mem::replace(&mut placed[cur.as_usize()], true) {
-                order.push(cur);
-                let next = match &blocks[cur].terminator().kind {
-                    TerminatorKind::Goto { target, .. }
-                    | TerminatorKind::Assert { target, .. }
-                    | TerminatorKind::Drop { target, .. }
-                    | TerminatorKind::FalseEdge { real_target: target, .. }
-                    | TerminatorKind::FalseUnwind { real_target: target, .. } => Some(*target),
-                    TerminatorKind::Call { target, .. } => *target,
-                    TerminatorKind::SwitchInt { discr, targets } => Some(match self.const_bits(discr) {
-                        Some(c) => targets.target_for_value(c),
-                        None => targets.otherwise(),
-                    }),
-                    _ => None,
-                };
-                match next {
-                    Some(n) => cur = n,
-                    None => break,
+        // In how many loops each block is: a loop is what can reach a
+        // jump back to a block that dominates it, without passing that
+        // block.
+        let mut depth = vec![0u32; blocks.len()];
+        {
+            let dom = blocks.dominators();
+            let preds = blocks.predecessors();
+            let mut loops: FxIndexMap<BasicBlock, Vec<bool>> = FxIndexMap::default();
+            for (u, data) in blocks.iter_enumerated() {
+                if !ok(u) || !dom.is_reachable(u) {
+                    continue;
+                }
+                for h in data.terminator().successors() {
+                    if !ok(h) || !dom.dominates(h, u) {
+                        continue;
+                    }
+                    let inside = loops.entry(h).or_insert_with(|| vec![false; blocks.len()]);
+                    inside[h.as_usize()] = true;
+                    let mut work = vec![u];
+                    while let Some(x) = work.pop() {
+                        if !std::mem::replace(&mut inside[x.as_usize()], true) {
+                            work.extend(preds[x].iter().copied().filter(|&q| ok(q)));
+                        }
+                    }
+                }
+            }
+            for inside in loops.values() {
+                for (d, i) in depth.iter_mut().zip(inside) {
+                    *d += *i as u32;
                 }
             }
         }
-        order
+        // The successors of a block, the preferred one last.
+        let succs = |bb: BasicBlock| -> Vec<BasicBlock> {
+            let mut v: Vec<BasicBlock> = match &blocks[bb].terminator().kind {
+                TerminatorKind::Goto { target, .. }
+                | TerminatorKind::Assert { target, .. }
+                | TerminatorKind::Drop { target, .. }
+                | TerminatorKind::FalseEdge { real_target: target, .. }
+                | TerminatorKind::FalseUnwind { real_target: target, .. } => vec![*target],
+                TerminatorKind::Call { target, .. } => target.iter().copied().collect(),
+                TerminatorKind::InlineAsm { targets, .. } => targets.iter().rev().copied().collect(),
+                TerminatorKind::SwitchInt { discr, targets } => match self.const_bits(discr) {
+                    Some(c) => vec![targets.target_for_value(c)],
+                    None => {
+                        let mut v: Vec<BasicBlock> = targets.iter().map(|(_, t)| t).collect();
+                        v.reverse();
+                        v.push(targets.otherwise());
+                        v
+                    }
+                },
+                _ => Vec::new(),
+            };
+            v.retain(|&t| ok(t));
+            // panics away from the code that runs; the body of a loop
+            // before its exit
+            v.sort_by_key(|&t| (!panics[t.as_usize()], depth[t.as_usize()]));
+            v
+        };
+        let mut seen = vec![false; blocks.len()];
+        let mut post = Vec::with_capacity(blocks.len());
+        let entry = BasicBlock::from_usize(0);
+        let mut stack = vec![(entry, succs(entry), 0usize)];
+        seen[0] = true;
+        while let Some((bb, list, i)) = stack.last_mut() {
+            if let Some(&t) = list.get(*i) {
+                *i += 1;
+                if !std::mem::replace(&mut seen[t.as_usize()], true) {
+                    stack.push((t, succs(t), 0));
+                }
+            } else {
+                post.push(*bb);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        post
     }
 
     /// The value of an operand that is known to be constant: a constant, a
@@ -1934,7 +2388,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 Target::Block(targets.target_for_value(1)),
                 Target::Block(targets.target_for_value(0)),
             ),
-            TerminatorKind::Assert { cond, expected, target, .. } if is_t(cond) => {
+            // (an overflow check that is switched off is no branch at all)
+            TerminatorKind::Assert { cond, expected, target, msg, .. }
+                if is_t(cond) && !self.overflow_check_off(msg) =>
+            {
                 if *expected {
                     (Target::Block(*target), Target::Panic)
                 } else {
@@ -1944,6 +2401,14 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             _ => return None,
         };
         Some((i, *op, &ops.0, &ops.1, t_true, t_false))
+    }
+
+    /// An overflow check in code that is compiled without them: functions
+    /// with `#[rustc_inherit_overflow_checks]` (the arithmetic of `core`,
+    /// the counters of its iterators) carry the check in their MIR, and
+    /// the crate that is compiled decides (as in rustc's own backends).
+    fn overflow_check_off(&self, msg: &rustc_middle::mir::AssertMessage<'tcx>) -> bool {
+        !self.tcx().sess.overflow_checks() && msg.is_optional_overflow_check()
     }
 
     fn jump(&mut self, t: Target, next: Option<BasicBlock>) {
@@ -2545,6 +3010,18 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         Some(x)
     }
 
+    /// Whether an operand names a byte of a frame (`F<id>v<n>`, `F<id>t`).
+    ///
+    /// A 16-bit `x += k` on a frame variable is emitted as a plain addition:
+    /// the data-flow pass may move it to the end of a loop (`opt.rs`,
+    /// `sink_add`) and makes `inc x` / `bne` / `inc x+1` of it afterwards.
+    fn in_frame(e: &str) -> bool {
+        e.strip_prefix('F').is_some_and(|r| {
+            let digits = r.bytes().take_while(u8::is_ascii_digit).count();
+            digits > 0 && matches!(r.as_bytes().get(digits), Some(b'v' | b't'))
+        })
+    }
+
     /// Adds 1 (any size) or subtracts 1 (1 or 2 bytes) in place.
     fn inc_dec(a: &mut Asm, d: &str, n: u64, add: bool) {
         if n == 1 {
@@ -2578,6 +3055,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             return false;
         };
         if s != d || n < 2 || (!add && n > 2) || vb.byte_is(0, 0) || !(1..n).all(|i| vb.byte_is(i, 0)) {
+            return false;
+        }
+        if add && n == 2 && Self::in_frame(d) {
             return false;
         }
         let b0 = vb.byte(0).unwrap();
@@ -2622,6 +3102,24 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 }
             }
         }
+    }
+
+    /// `dst = v << k` or `v >> k` for one byte: in the accumulator.
+    fn shift_byte(a: &mut Asm, dst: &Addr, v: &Val, k: u64, left: bool, signed: bool) {
+        a.setup_val(v, 0);
+        a.setup(dst, 2);
+        a.lda(v, 0, 0);
+        for _ in 0..k {
+            if left {
+                a.ins("asl");
+            } else if signed {
+                a.ins("cmp #$80");
+                a.ins("ror");
+            } else {
+                a.ins("lsr");
+            }
+        }
+        a.sta(dst, 0, 2);
     }
 
     fn ptr_bytes(label: &str, off: u64) -> Vec<String> {
@@ -2723,6 +3221,20 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// `rt_memcpy` of `count * elem` bytes between the pointer values
     /// `dst` and `src`.
     fn memcpy_dyn(&mut self, dst: &Val, src: &Val, count: &Val, csize: u64, elem: u64) {
+        // A known size: a loop in place.
+        if let Some(c) = Self::imm_value(count, csize.min(8)) {
+            let n = c.wrapping_mul(elem) & 0xffff;
+            if n == 0 {
+                return;
+            }
+            if n <= 256 {
+                let s = self.deref_val(src);
+                let d = self.deref_val(dst);
+                if self.a().copy_block(&d, &s, n) {
+                    return;
+                }
+            }
+        }
         let n = self.scaled(count, csize, elem);
         let s = self.deref_val(src);
         let d = self.deref_val(dst);
@@ -2750,6 +3262,11 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let (v, el) = self.operand(op);
                 let es = el.size.bytes();
                 if count == 0 || es == 0 {
+                    return;
+                }
+                if es == 1 && (2..256).contains(&count) {
+                    // a few bytes: a loop in place
+                    self.a().fill_block(&dst, &v, count);
                     return;
                 }
                 self.a().copy(&dst, &v, es);
@@ -2940,6 +3457,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             && n <= 8
         {
             let k = c.trailing_zeros() as u64;
+            if op != Rem && n == 1 {
+                Self::shift_byte(&mut self.p.asm, dst, &va, k, op != Div, false);
+                return;
+            }
             if op != Rem
                 && let Addr::Abs(d) = dst
             {
@@ -2983,6 +3504,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     && Self::imm_value(&vb, n) == Some(1)
                     && let (Val::Mem(Addr::Abs(s)), Addr::Abs(d)) = (&va, dst)
                     && s == d
+                    && !(add && n == 2 && Self::in_frame(d))
                 {
                     let d = d.clone();
                     Self::inc_dec(&mut self.p.asm, &d, n, add);
@@ -3114,6 +3636,13 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             }
             Shl | ShlUnchecked | Shr | ShrUnchecked => {
                 if let Some(k) = Self::imm_value(&vb, 1)
+                    && n == 1
+                {
+                    let left = matches!(op, Shl | ShlUnchecked);
+                    Self::shift_byte(&mut self.p.asm, dst, &va, k & 7, left, signed);
+                    return;
+                }
+                if let Some(k) = Self::imm_value(&vb, 1)
                     && let Addr::Abs(d) = dst
                 {
                     let d = d.clone();
@@ -3176,12 +3705,17 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 if !inline {
                     a.copy(&Addr::Abs("rt_a".into()), &va, n);
                     a.copy(&Addr::Abs("rt_b".into()), &vb, n);
-                    // One and two bytes have their own multiplication.
-                    if !mul || n > 2 {
+                    // One and two bytes have their own multiplication and
+                    // unsigned division.
+                    if n > 2 || (!mul && signed) {
                         a.ins(format!("lda #{n}"));
                         a.ins("sta rt_n");
                     }
                     let (routine, result) = match op {
+                        Div if !signed && n == 1 => ("rt_udiv8", "rt_a"),
+                        Rem if !signed && n == 1 => ("rt_udiv8", "rt_r"),
+                        Div if !signed && n == 2 => ("rt_udiv16", "rt_a"),
+                        Rem if !signed && n == 2 => ("rt_udiv16", "rt_r"),
                         Div => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_a"),
                         Rem => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_r"),
                         _ if n == 1 => ("rt_mul8", "rt_r"),
@@ -3206,6 +3740,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     if k == 1
                         && let (Val::Mem(Addr::Abs(s)), Addr::Abs(d)) = (&va, dst)
                         && s == d
+                        && !Self::in_frame(d)
                     {
                         let d = d.clone();
                         Self::inc_dec(&mut self.p.asm, &d, 2, true);
@@ -3488,12 +4023,77 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         }
     }
 
+    /// Returns: a result of up to three bytes in A, X and Y.
+    fn ret(&mut self) {
+        let result = Local::from_usize(0);
+        let size = self.layout(self.local_ty(result)).size.bytes();
+        if (1..=3).contains(&size) {
+            let at = self.local_addr(result);
+            for (i, load) in ["lda", "ldx", "ldy"].iter().enumerate().take(size as usize) {
+                self.a().ins(format!("{load} {at}+{i}"));
+            }
+        }
+        self.a().ins("rts");
+    }
+
+    /// A call of function `id` with the argument values `args` (value and
+    /// size, in the order of the callee's argument locals).
+    ///
+    /// The first three bytes of the arguments go into A, X and Y, the rest
+    /// into the callee's argument locals. The registers are loaded last,
+    /// from where the values are (a value behind a pointer is copied to a
+    /// temporary first). The result comes back in A, X and Y if it has up
+    /// to three bytes, else in the callee's result local.
+    fn call_fn(&mut self, id: usize, args: &[(Val, u64)], dest: Option<Place<'tcx>>) {
+        self.p.calls[self.id].push(id);
+        // where the result goes: found before the call, as the registers
+        // hold the result after it
+        let dest = dest.map(|d| {
+            let (a, l, _) = self.place(d);
+            (a, l.size.bytes())
+        });
+        let mut regs: Vec<String> = Vec::new();
+        let mut total = 0;
+        for (i, (v, n)) in args.iter().enumerate() {
+            let in_regs = (3 - regs.len() as u64).min(*n);
+            let mut v = v.clone();
+            if in_regs > 0 && v.byte(0).is_none() {
+                let t = Addr::Abs(self.temp(*n));
+                self.a().copy(&t, &v, *n);
+                v = Val::Mem(t);
+            }
+            for j in 0..in_regs {
+                regs.push(v.byte(j).unwrap());
+            }
+            if *n > in_regs {
+                let slot = Addr::Abs(format!("L{id}_{}", i + 1)).offset(in_regs);
+                self.a().copy(&slot, &v.offset(in_regs), n - in_regs);
+            }
+            total += n;
+        }
+        self.p.arg_bytes.insert(id, total);
+        for (load, b) in ["lda", "ldx", "ldy"].iter().zip(&regs) {
+            self.a().ins(format!("{load} {b}"));
+        }
+        self.a().ins(format!("jsr F{id}"));
+        let Some((d, size)) = dest else { return };
+        if size > 3 {
+            self.a().copy(&d, &Val::Mem(Addr::Abs(format!("L{id}_0"))), size);
+        } else if size > 0 {
+            let (at, tmp) = self.abs_dst(&d, size);
+            for (i, store) in ["sta", "stx", "sty"].iter().enumerate().take(size as usize) {
+                self.a().ins(format!("{store} {at}+{i}"));
+            }
+            self.flush(&d, tmp, size);
+        }
+    }
+
     fn terminator(&mut self, kind: &TerminatorKind<'tcx>, next: Option<BasicBlock>) {
         match kind {
             TerminatorKind::Goto { target, .. } => self.goto(*target, next),
             TerminatorKind::FalseEdge { real_target, .. }
             | TerminatorKind::FalseUnwind { real_target, .. } => self.goto(*real_target, next),
-            TerminatorKind::Return => self.a().ins("rts"),
+            TerminatorKind::Return => self.ret(),
             TerminatorKind::Unreachable
             | TerminatorKind::UnwindResume
             | TerminatorKind::UnwindTerminate(_) => self.a().ins("jmp rt_panic"),
@@ -3522,6 +4122,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 }
                 self.goto(targets.otherwise(), next);
             }
+            TerminatorKind::Assert { target, msg, .. } if self.overflow_check_off(msg) => {
+                self.goto(*target, next)
+            }
             TerminatorKind::Assert { cond, expected, target, .. } => {
                 let (v, _) = self.operand(cond);
                 let a = &mut self.p.asm;
@@ -3539,9 +4142,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 if !matches!(inst.def, InstanceKind::Shim(ShimKind::DropGlue(_, None))) {
                     let (a, _, _) = self.place(*place);
                     let id = self.p.func_id(inst, self.ctx);
-                    self.p.calls[self.id].push(id);
-                    self.a().addr_to(&a, &format!("L{id}_1"));
-                    self.a().ins(format!("jsr F{id}"));
+                    let t = self.temp(2);
+                    self.a().addr_to(&a, &t);
+                    self.call_fn(id, &[(Val::Mem(Addr::Abs(t)), 2)], None);
                 }
                 self.goto(*target, next);
             }
@@ -3555,7 +4158,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             TerminatorKind::TailCall { func, args, .. } => {
                 let args: Vec<Operand<'tcx>> = args.iter().map(|a| a.node.clone()).collect();
                 self.call(func, &args, Place::return_place());
-                self.a().ins("rts");
+                self.ret();
             }
             TerminatorKind::InlineAsm { template, operands, targets, .. } => {
                 self.inline_asm(template, operands);
@@ -3590,6 +4193,14 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let mut names: Vec<String> = Vec::with_capacity(operands.len());
         // (place, temporary, size) to copy after the block
         let mut after: Vec<(Place<'tcx>, String, u64)> = Vec::new();
+        // The block starts in front of the copies of its operands: what is
+        // in the registers there is not known to the block (the passes
+        // over the assembly count on that), but a value that is copied to
+        // an operand and loaded again is.
+        let id = self.id;
+        let n = self.a().new_label();
+        let n = n.trim_start_matches("_L").to_owned();
+        self.a().label(&format!("F{id}_i{n}"));
         for op in operands {
             let name = match op {
                 InlineAsmOperand::In { value, .. } => {
@@ -3655,11 +4266,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 InlineAsmTemplatePiece::Placeholder { operand_idx, .. } => text.push_str(&names[*operand_idx]),
             }
         }
-        let id = self.id;
         let a = &mut self.p.asm;
-        let n = a.new_label();
-        let n = n.trim_start_matches("_L");
-        a.label(&format!("F{id}_i{n}"));
         for line in text.lines() {
             let t = line.trim();
             if t.is_empty() {
@@ -3719,15 +4326,12 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             _ => {}
         }
         let id = self.p.func_id(inst, self.ctx);
-        self.p.calls[self.id].push(id);
-        for (i, arg) in args.iter().enumerate() {
+        let mut vals = Vec::with_capacity(args.len());
+        for arg in args {
             let (v, l) = self.operand(arg);
-            self.a().copy(&Addr::Abs(format!("L{id}_{}", i + 1)), &v, l.size.bytes());
+            vals.push((v, l.size.bytes()));
         }
-        self.a().ins(format!("jsr F{id}"));
-        let (d, dl, _) = self.place(dest);
-        let size = dl.size.bytes();
-        self.a().copy(&d, &Val::Mem(Addr::Abs(format!("L{id}_0"))), size);
+        self.call_fn(id, &vals, Some(dest));
     }
 
     /// A call through a function pointer: the arguments go one after the
@@ -3838,6 +4442,18 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let (val, _) = self.operand(&args[1]);
                 let (count, cl) = self.operand(&args[2]);
                 let elem = self.layout(dl.ty.builtin_deref(true).unwrap()).size.bytes();
+                // A known size below 256: a loop in place.
+                if let Some(c) = Self::imm_value(&count, cl.size.bytes().min(8)) {
+                    let n = c.wrapping_mul(elem) & 0xffff;
+                    if n == 0 {
+                        return true;
+                    }
+                    if n < 256 {
+                        let d = self.deref_val(&dst);
+                        self.a().fill_block(&d, &val, n);
+                        return true;
+                    }
+                }
                 let n = self.scaled(&count, cl.size.bytes(), elem);
                 let d = self.deref_val(&dst);
                 let a = &mut self.p.asm;
@@ -3966,6 +4582,22 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let r = Val::Mem(Addr::Abs("rt_r".into()));
                 self.extend(&d, &r, 1, dl.size.bytes(), false);
             }
+            "integer_min" | "integer_max" => {
+                let (va, l) = self.operand(&args[0]);
+                let (vb, _) = self.operand(&args[1]);
+                let n = l.size.bytes();
+                let signed = Self::is_signed(l.ty);
+                let (d, _, _) = self.place(dest);
+                self.compare(&va, &vb, n, signed); // C clear: a < b
+                let a = &mut self.p.asm;
+                let (lb, lend) = (a.new_label(), a.new_label());
+                a.ins(format!("{} {lb}", if name.as_str() == "integer_min" { "bcs" } else { "bcc" }));
+                a.copy(&d, &va, n);
+                a.ins(format!("jmp {lend}"));
+                a.label(&lb);
+                a.copy(&d, &vb, n);
+                a.label(&lend);
+            }
             "saturating_add" | "saturating_sub" => {
                 // Unsigned: on a carry (a borrow) the result is all ones
                 // (zero).
@@ -4057,16 +4689,13 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     self.span,
                 );
                 let id = self.p.func_id(callee, self.ctx);
-                self.p.calls[self.id].push(id);
                 let (tv, tl) = self.operand(&args[0]);
+                let mut vals = Vec::with_capacity(tl.fields.count());
                 for i in 0..tl.fields.count() {
                     let off = tl.fields.offset(i).bytes();
-                    let fsize = tl.field(&self.p.cx, i).size.bytes();
-                    self.a().copy(&Addr::Abs(format!("L{id}_{}", i + 1)), &tv.offset(off), fsize);
+                    vals.push((tv.offset(off), tl.field(&self.p.cx, i).size.bytes()));
                 }
-                self.a().ins(format!("jsr F{id}"));
-                let (d, dl, _) = self.place(dest);
-                self.a().copy(&d, &Val::Mem(Addr::Abs(format!("L{id}_0"))), dl.size.bytes());
+                self.call_fn(id, &vals, Some(dest));
             }
             "discriminant_value" => {
                 let (p, pl) = self.operand(&args[0]);

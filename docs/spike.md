@@ -32,10 +32,13 @@ mul/div/shift, loops, arrays, slices, iterators, closures, structs, enums,
 
 * Code quality, Phase 5: mostly done (known addresses, views instead of
   copies also across branches, compare-and-branch, X-indexed tables, frame
-  overlay with zero-page frames, block layout, branch relaxation, peephole,
-  pruning of unused runtime: the examples are 48-76% smaller and up to
-  2.75x as fast). Open: values in registers across statements, X/Y loop
-  counters, inlining at program level.
+  overlay with zero-page frames, block layout, branch relaxation, pruning
+  of unused runtime; since 2026-11-23 a data-flow pass over the assembly
+  of each function, `opt.rs`: values and ranges, liveness, merged copies,
+  index registers, loop counters in X/Y, loop tests at the end, invariant code out of loops, and frames that only keep the
+  bytes still in use; arguments and results in A, X and Y; since
+  2026-11-24 `inline.rs`: the assembly of a function replaces its calls
+  if it has one caller or is not longer than what the calls save).
 * rustc's MIR inliner: raising `-Zinline-mir-threshold` alone (functions
   without `#[inline]`) gives mixed sizes. `cargo c64` sets it to 100 and
   `-Zinline-mir-hint-threshold` (functions with `#[inline]`: the helpers of
