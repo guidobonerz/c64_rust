@@ -52,7 +52,9 @@
 //! step of an iterator moves to the end of its loop and is done in place
 //! (`Opt::sink_add`, `Opt::in_place`), a computation that is the same in
 //! every round moves in front of the loop (`Opt::hoist`, and for a bounds
-//! check `Opt::hoist_check`), and the test of
+//! check `Opt::hoist_check`), the 16-bit test of a loop over a slice of
+//! known length becomes an 8-bit one (`Opt::narrow_test`) or the loop gets
+//! an index in Y in place of the pointer (`Opt::index_loop`), and the test of
 //! a loop moves to its end (`Opt::rotate`).
 //!
 //! Between the functions of the program the first three bytes of the
@@ -183,6 +185,8 @@ enum Plan {
     /// Through the pointer at frame bytes `cell` and `cell + 1` (copied to
     /// the scratch pointer `zp`) with the index in Y.
     Ptr { cell: usize, zp: usize, idx: Src },
+    /// `operand`: the pointer and Y are known, so the address is.
+    Direct { operand: String },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -240,6 +244,11 @@ struct Ins {
     /// A in front of it, and whether the carry is known to be clear there.
     add_same: Vec<usize>,
     add_clear: bool,
+    /// For an access `(zp_pN),y`: the frame bytes that hold the same
+    /// pointer as the scratch pointer (their low bytes), and Y if it is
+    /// known (see `forward`; for `index_loop`).
+    via: Vec<usize>,
+    via_y: Option<u8>,
 }
 
 enum Line {
@@ -286,6 +295,9 @@ struct Opt<'a> {
     adds: HashMap<u64, AddDef>,
     /// `adds` is complete (after the rewrite sweep of `forward`).
     adds_valid: bool,
+    /// What is known where a block is entered from the one in front of it,
+    /// by the line the block starts at (see `forward`; for `narrow_test`).
+    heads: HashMap<usize, St>,
     /// Liveness as if no redundant load were removed (see `backward`).
     keep_redundant: bool,
     /// The first rounds (see `forward`).
@@ -332,7 +344,76 @@ fn parse_mode(arg: &str) -> Mode {
 /// of it is never removed); `is_const` whether a symbol is data that the
 /// program never changes; `call_args` gives the number of argument bytes
 /// that a routine the code generator calls takes in A, X and Y (`None`: not
-/// known, all of them).
+/// known, all of them), and `call_reads` which of them it reads at all (a
+/// mask as `entry` gets it; `None`: not known).
+///
+/// `entry` gets the registers that the function reads before it writes
+/// them (bit 0: A, 1: X, 2: Y), if the function could be followed: what a
+/// caller has to load.
+/// A known address plus a constant, which the assembler can add:
+///
+/// ```text
+///     clc                      lda #<(X+4)
+///     lda #<(X)                sta p
+///     adc #$04                 lda #>(X+4)
+///     sta p                    sta p+1
+///     lda #>(X)                clc
+///     adc #$00
+///     sta p+1
+/// ```
+///
+/// (the end of an array for an iterator over it). The carry is clear after
+/// both: an address does not go past the end of the memory.
+fn fold_addr(text: &str) -> String {
+    if std::env::var_os("RUST64_NO_FOLD").is_some() {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let ins = |i: usize| -> Option<(&str, &str)> {
+        let l = lines.get(i)?;
+        if !l.starts_with([' ', '\t']) {
+            return None;
+        }
+        let t = l.split(';').next().unwrap_or("").trim();
+        Some(t.split_once(' ').map_or((t, ""), |(op, arg)| (op, arg.trim())))
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let (Some(("clc", "")), Some(("lda", lo)), Some(("adc", k)), Some(("sta", d0))) =
+            (ins(i), ins(i + 1), ins(i + 2), ins(i + 3))
+            && let (Some(("lda", hi)), Some(("adc", zero)), Some(("sta", d1))) = (ins(i + 4), ins(i + 5), ins(i + 6))
+            && let Some(e) = lo.strip_prefix("#<(").and_then(|e| e.strip_suffix(')'))
+            && hi.strip_prefix("#>(").and_then(|e| e.strip_suffix(')')) == Some(e)
+            && let Some(k) = k.strip_prefix("#$").and_then(|k| u8::from_str_radix(k, 16).ok())
+            && matches!(zero, "#$00" | "#0")
+            && !d0.starts_with(['#', '('])
+            && !d0.contains(',')
+            && (d1.strip_suffix("+1") == Some(d0) || d1.strip_suffix("+0+1") == d0.strip_suffix("+0"))
+        {
+            let pad = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
+            for l in [
+                format!("lda #<({e}+{k})"),
+                format!("sta {d0}"),
+                format!("lda #>({e}+{k})"),
+                format!("sta {d1}"),
+                "clc".to_owned(),
+            ] {
+                out.push_str(pad);
+                out.push_str(&l);
+                out.push('\n');
+            }
+            i += 7;
+            continue;
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn optimize(
     text: &str,
     id: usize,
@@ -340,15 +421,22 @@ pub fn optimize(
     is_io: &dyn Fn(&str) -> bool,
     is_const: &dyn Fn(&str) -> bool,
     call_args: &dyn Fn(&str) -> Option<u64>,
+    call_reads: &dyn Fn(&str) -> Option<u8>,
+    entry: &mut Option<u8>,
 ) -> String {
     let call_regs = |sym: &str| {
-        call_args(sym).map(|n| match n {
-            0 => 0,
-            1 => RA,
-            2 => RA | RX,
-            _ => RA | RX | RY,
+        call_args(sym).map(|n| {
+            let taken = match n {
+                0 => 0,
+                1 => RA,
+                2 => RA | RX,
+                _ => RA | RX | RY,
+            };
+            taken & call_reads(sym).unwrap_or(RA | RX | RY)
         })
     };
+    *entry = None;
+    let text = &fold_addr(text);
     let nframe = layout.values().map(|&(o, n)| o + n).max().unwrap_or(0) as usize;
     let ncells = nframe + 2 * crate::asm::ZP.len();
     let ret = layout.get(&format!("L{id}_0")).map_or(0, |&(o, n)| o + n) as usize;
@@ -364,6 +452,7 @@ pub fn optimize(
         escaped: vec![false; ncells],
         adds: HashMap::new(),
         adds_valid: false,
+        heads: HashMap::new(),
         keep_redundant: false,
         early: true,
         ret,
@@ -374,10 +463,17 @@ pub fn optimize(
         call_regs: &call_regs,
         is_const,
     };
+    let trace = std::env::var_os("RUST64_OPT_TRACE").is_some();
     if !o.parse(text) {
+        if trace {
+            eprintln!("opt F{id}: not parsed");
+        }
         return text.to_owned();
     }
-    for round in 0..24 {
+    if trace {
+        eprintln!("opt F{id}: {} lines, {} cells, escaped {}", o.lines.len(), o.ncells, o.escaped.iter().filter(|e| **e).count());
+    }
+    for round in 0..400 {
         o.early = round < 2;
         let Some(blocks) = o.blocks() else { return text.to_owned() };
         let mut changed = o.forward(&blocks);
@@ -388,6 +484,12 @@ pub fn optimize(
         if !changed && !o.early {
             break;
         }
+    }
+    if let Some(blocks) = o.blocks()
+        && !blocks.is_empty()
+    {
+        let live_in = o.liveness(&blocks);
+        *entry = Some(live_in[0].regs & (RA | RX | RY));
     }
     o.emit()
 }
@@ -432,6 +534,8 @@ impl Opt<'_> {
             first: None,
             add_same: Vec::new(),
             add_clear: false,
+            via: Vec::new(),
+            via_y: None,
         }
     }
 
@@ -603,6 +707,8 @@ impl Opt<'_> {
                     first: None,
                     add_same: Vec::new(),
                     add_clear: false,
+                    via: Vec::new(),
+                    via_y: None,
                 }));
             }
         }
@@ -1131,7 +1237,11 @@ impl Opt<'_> {
             ("beq", true) | ("bne", false) => {
                 st.z = Tri::T;
                 match st.zsrc.clone() {
-                    ZSrc::Val(v) => Self::narrow(st, v, 0, 0),
+                    // (a value that is zero is not negative)
+                    ZSrc::Val(v) => {
+                        st.n = Tri::F;
+                        Self::narrow(st, v, 0, 0)
+                    }
                     ZSrc::Cmp(Cmp { l, r }) => {
                         Self::narrow(st, l.vn, r.lo, r.hi);
                         Self::narrow(st, r.vn, l.lo, l.hi);
@@ -1386,6 +1496,7 @@ impl Opt<'_> {
                     _ => None,
                 };
                 let readable = ins.mode == Mode::Imm || ins.cell.is_some();
+                let ora = std::env::var_os("RUST64_NO_ORA").is_none();
                 if is_branch(ins.op) {
                     match Self::known(&st, ins.op) {
                         Some(false) => gone = true,
@@ -1410,8 +1521,15 @@ impl Opt<'_> {
                     if holds(r) {
                         // the flags are already those of the value, or
                         // the load goes when they are not needed
-                        if st.zsrc == ZSrc::Val(v.vn) {
+                        // (or of a constant, and known to be so: `lda #0`
+                        // where a `bne` was not taken)
+                        let flags = v.lo == v.hi && st.z == tri(v.lo == 0) && st.n == tri(v.lo >= 128);
+                        if st.zsrc == ZSrc::Val(v.vn) || flags {
                             gone = true;
+                        } else if r == 0 && ins.mode == Mode::Mem && !self.early && ora {
+                            // only the flags are needed: without the
+                            // memory, whose store may then go
+                            new = Some(("ora", "#$00".to_owned()));
                         } else {
                             redundant = Some(NZ);
                         }
@@ -1523,6 +1641,17 @@ impl Opt<'_> {
                     }
                     _ => None,
                 };
+                let (via, via_y) = match ins.ptr {
+                    Some(z) if ins.mode == Mode::IndY => {
+                        let (lo, hi) = (st.l[3 + z].vn, st.l[3 + z + 1].vn);
+                        let same: Vec<usize> = (0..self.nframe.saturating_sub(1))
+                            .filter(|&c| !self.escaped[c] && st.l[3 + c].vn == lo && st.l[3 + c + 1].vn == hi)
+                            .take(8)
+                            .collect();
+                        (same, (st.l[2].lo == st.l[2].hi).then_some(st.l[2].lo))
+                    }
+                    _ => (Vec::new(), None),
+                };
                 // an addition: what is added, and the carry that goes in
                 let add = (ins.op == "adc").then(|| {
                     let cin = match (st.c, st.cadd) {
@@ -1555,6 +1684,8 @@ impl Opt<'_> {
                 ins.step_reg = stepping.map(|(r, c)| (r, st.c == c));
                 ins.add_same = add_same;
                 ins.add_clear = add_clear;
+                ins.via = via;
+                ins.via_y = via_y;
             }
         }
         self.adds_valid = true;
@@ -1562,6 +1693,7 @@ impl Opt<'_> {
         // from the one in front of it (for `rotate`: the first test of a
         // loop).
         let mut firsts: Vec<(usize, Option<bool>)> = Vec::new();
+        let mut heads: HashMap<usize, St> = HashMap::new();
         for t in 1..n {
             let slot = match blocks[t - 1].term {
                 Term::Fall(Tgt::Block(s)) if s == t => 0,
@@ -1569,6 +1701,7 @@ impl Opt<'_> {
                 _ => continue,
             };
             let (Term::Cond(..), Some(mut st)) = (blocks[t].term, outs[t - 1][slot].clone()) else { continue };
+            heads.insert(blocks[t].start, st.clone());
             let mut last = None;
             for i in blocks[t].start..blocks[t].end {
                 if let Line::Ins(ins) = &self.lines[i]
@@ -1593,6 +1726,7 @@ impl Opt<'_> {
             let Line::Ins(ins) = &mut self.lines[i] else { unreachable!() };
             ins.first = first;
         }
+        self.heads = heads;
         self.adds_valid = false;
         changed
     }
@@ -1643,6 +1777,16 @@ impl Opt<'_> {
         }
         let y = y.lo;
         let (lo, hi) = (&st.l[3 + p], &st.l[3 + p + 1]);
+        // a known address (the pointer of a function that was put into its
+        // caller, to a variable of the caller)
+        if lo.vn < ENTRY
+            && hi.vn < ENTRY
+            && (lo.vn < 256) == (hi.vn < 256)
+            && let Some(o) = self.abs_operand(lo.vn, hi.vn, 0, y)
+            && let Some(operand) = o.strip_suffix(",x")
+        {
+            return Some(Plan::Direct { operand: operand.to_owned() });
+        }
         let lod = self.adds.get(&lo.vn)?;
         if lod.cin != Cin::Zero {
             return None;
@@ -2001,7 +2145,9 @@ impl Opt<'_> {
                 let flags_free = ins.op != "sta" || live.regs & NZ == 0;
                 let mut before: Vec<(&'static str, String)> = Vec::new();
                 let mut operand = None;
+                let mut direct = None;
                 match &plan {
+                    Plan::Direct { operand: o } => direct = Some(o.clone()),
                     Plan::Abs { operand: o, idx } => {
                         if live.regs & RX == 0 && flags_free {
                             match idx {
@@ -2024,9 +2170,15 @@ impl Opt<'_> {
                         }
                     }
                 }
-                let applied = operand.is_some() || !before.is_empty();
+                let applied = operand.is_some() || direct.is_some() || !before.is_empty();
                 let Line::Ins(ins) = &mut self.lines[i] else { unreachable!() };
                 ins.plan = None;
+                if let Some(o) = direct {
+                    ins.arg = o;
+                    ins.mode = Mode::Mem;
+                    ins.ptr = None;
+                    ins.cell = None;
+                }
                 if let Some(o) = operand {
                     ins.arg = o;
                     ins.mode = Mode::MemX;
@@ -2133,8 +2285,32 @@ impl Opt<'_> {
                     live.regs |= FC;
                     continue;
                 }
-                // `adc #1` / `tay` of the value Y holds: `iny`
                 let prev = (blocks[b].start..i).rev().find(|&l| matches!(&self.lines[l], Line::Ins(p) if !p.gone));
+                // A branch that is always taken, behind a load that is
+                // only there to set its flag (the upper byte of a tag,
+                // which is the constant 0): a jump, without the load.
+                if ins.always
+                    && is_branch(ins.op)
+                    && let Some(l) = prev
+                    && let Line::Ins(p) = &self.lines[l]
+                    && matches!(p.mode, Mode::Imm | Mode::Imp)
+                    && let Some(r) = match p.op {
+                        "lda" | "txa" | "tya" => Some(RA),
+                        "ldx" | "tax" => Some(RX),
+                        "ldy" | "tay" => Some(RY),
+                        _ => None,
+                    }
+                    && live.regs & (r | NZ) == 0
+                {
+                    let Line::Ins(p) = &mut self.lines[l] else { unreachable!() };
+                    p.gone = true;
+                    let Line::Ins(ins) = &mut self.lines[i] else { unreachable!() };
+                    ins.op = "jmp";
+                    ins.always = false;
+                    changed = true;
+                    continue;
+                }
+                // `adc #1` / `tay` of the value Y holds: `iny`
                 let prev_ins = prev.and_then(|l| match &self.lines[l] {
                     Line::Ins(p) => Some(p),
                     _ => None,
@@ -2314,12 +2490,15 @@ impl Opt<'_> {
         }
         // When nothing else is left to do: loop counters into X or Y.
         if !changed && !self.early {
-            return self.sink_add(blocks, &live_in)
+            return self.funnel(blocks)
+                || self.sink_add(blocks, &live_in)
                 || self.in_place(blocks, &live_in)
                 || self.hoist(blocks, &live_in)
                 || self.hoist_check(blocks, &live_in)
+                || self.narrow_test(blocks, &live_in, true)
                 || self.promote(blocks, &live_in)
                 || self.sink(blocks, &live_in)
+                || self.narrow_test(blocks, &live_in, false)
                 || self.rotate(blocks, &live_in);
         }
         changed
@@ -2348,6 +2527,682 @@ impl Opt<'_> {
             }
         }
         true
+    }
+
+    /// `end - start` for two 16-bit values (low and high byte each), if
+    /// that is known to be 1..=255: both are constants or addresses the
+    /// assembler knows, or the end was made by adding a constant to the
+    /// start.
+    fn span(&self, start: [&Loc; 2], end: [&Loc; 2]) -> Option<u8> {
+        let word = |v: [&Loc; 2]| (v[0].vn < 256 && v[1].vn < 256).then(|| v[0].vn as u16 | (v[1].vn as u16) << 8);
+        if let (Some(s), Some(e)) = (word(start), word(end)) {
+            let d = e.wrapping_sub(s);
+            return (1..=255).contains(&d).then_some(d as u8);
+        }
+        // two addresses that the assembler knows: `X` and `X+k`
+        let sym = |v: &Loc| (SYM..ENTRY).contains(&v.vn).then(|| self.syms[(v.vn - SYM) as usize].as_str());
+        if let (Some(s0), Some(s1), Some(e0), Some(e1)) = (sym(start[0]), sym(start[1]), sym(end[0]), sym(end[1])) {
+            let a = s0.strip_prefix("#<(")?.strip_suffix(')')?;
+            let k: u64 = e0.strip_prefix("#<(")?.strip_prefix(a)?.strip_prefix('+')?.strip_suffix(')')?.parse().ok()?;
+            let same = s1.strip_prefix("#>(").and_then(|r| r.strip_suffix(')')) == Some(a)
+                && e1.strip_prefix("#>(").and_then(|r| r.strip_suffix(')')) == Some(&format!("{a}+{k}")[..]);
+            return (same && (1..=255).contains(&k)).then_some(k as u8);
+        }
+        let (lo, hi) = (self.adds.get(&end[0].vn)?, self.adds.get(&end[1].vn)?);
+        let k = if lo.x == start[0].vn && lo.y < 256 {
+            lo.y
+        } else if lo.y == start[0].vn && lo.x < 256 {
+            lo.x
+        } else {
+            return None;
+        };
+        let carried = hi.cin == Cin::Of(end[0].vn)
+            && ((hi.x == start[1].vn && hi.y == 0) || (hi.y == start[1].vn && hi.x == 0));
+        (lo.cin == Cin::Zero && k != 0 && carried).then_some(k as u8)
+    }
+
+    /// Whether block `x` of the loop `t..=b` (entered at `t` only) runs
+    /// exactly once on every way from `t` back to `t`: no way from `x` to
+    /// `x` without `t`, and none from `t` to `t` without `x`.
+    fn once_per_round(blocks: &[Block], t: usize, b: usize, x: usize) -> bool {
+        let reaches = |from: usize, avoid: usize| {
+            let mut seen = vec![false; blocks.len()];
+            let mut todo = vec![from];
+            let mut first = true;
+            while let Some(q) = todo.pop() {
+                if !first && q == from {
+                    return true;
+                }
+                if (!first && (q == avoid || seen[q])) || !(t..=b).contains(&q) {
+                    continue;
+                }
+                if !first {
+                    seen[q] = true;
+                }
+                first = false;
+                let next = match blocks[q].term {
+                    Term::Fall(s) | Term::Jmp(s) => vec![s],
+                    Term::Cond(s, f) => vec![s, f],
+                    Term::Ret => Vec::new(),
+                };
+                todo.extend(next.into_iter().filter_map(|s| match s {
+                    Tgt::Block(s) => Some(s),
+                    Tgt::External => None,
+                }));
+            }
+            false
+        };
+        x != t && (t..=b).contains(&x) && !reaches(x, t) && !reaches(t, x)
+    }
+
+    /// The step of the 16-bit value at frame bytes `c`, `c + 1` in the loop
+    /// `t..=b`, if these are its only writes there: `inc c` / `bne next` /
+    /// `inc c+1` / `next:`. The block of the first and the three lines.
+    fn inc_group(&self, blocks: &[Block], t: usize, b: usize, c: usize) -> Option<(usize, [usize; 3])> {
+        if c + 1 >= self.nframe || self.escaped[c] || self.escaped[c + 1] {
+            return None;
+        }
+        let mut writes = Vec::new();
+        for i in blocks[t].start..blocks[b].end {
+            if let Line::Ins(ins) = &self.lines[i]
+                && !ins.gone
+                && self.effect(ins).3
+                && ins.mode == Mode::Mem
+                && self.own(&ins.arg).is_some_and(|w| w == c || w == c + 1)
+            {
+                writes.push(i);
+            }
+        }
+        let &[w0, w1] = &writes[..] else { return None };
+        let code = |q: usize| -> Vec<usize> {
+            (blocks[q].start..blocks[q].end)
+                .filter(|&i| matches!(&self.lines[i], Line::Ins(ins) if !ins.gone))
+                .collect()
+        };
+        let x = (t..=b).find(|&q| (blocks[q].start..blocks[q].end).contains(&w0))?;
+        let cx = code(x);
+        let (&[.., last, branch], true) = (&cx[..], x + 2 <= b) else { return None };
+        let fits = last == w0
+            && self.ins(w0).op == "inc"
+            && self.ins(w0).cell == Some(c)
+            && self.ins(branch).op == "bne"
+            && !self.ins(branch).always
+            && code(x + 1) == [w1]
+            && self.ins(w1).op == "inc"
+            && self.ins(w1).cell == Some(c + 1)
+            && matches!(blocks[x].term, Term::Cond(Tgt::Block(l), Tgt::Block(h)) if l == x + 2 && h == x + 1)
+            && matches!(blocks[x + 1].term, Term::Fall(Tgt::Block(l)) if l == x + 2);
+        fits.then_some((x, [w0, branch, w1]))
+    }
+
+    /// Walks an array of bytes with an index in Y in place of a pointer
+    /// (for `narrow_test`, which has found the loop `t..=b` with its test
+    /// at lines `test`, the step of the pointer at lines `step`, and that
+    /// it runs `k` rounds):
+    ///
+    /// ```text
+    ///                                         ldy #0
+    /// head:   lda p                   head:   cpy #k
+    ///         cmp end                         bne body
+    ///         bne body                        jmp exit
+    ///         lda p+1                 body:   lda p
+    ///         cmp end+1                       sta zp_p0
+    ///         beq exit                        lda p+1
+    /// body:   lda p                           sta zp_p0+1
+    ///         sta zp_p0                       lda (zp_p0),y
+    ///         lda p+1                         ...
+    ///         sta zp_p0+1                     iny
+    ///         ldy #0                          jmp head
+    ///         lda (zp_p0),y
+    ///         ...
+    ///         inc p
+    ///         bne next
+    ///         inc p+1
+    /// next:   jmp head
+    /// ```
+    ///
+    /// The pointer stays at the start of the array, so the copy to the
+    /// scratch pointer is the same in every round and goes in front of the
+    /// loop (`hoist`), or away where the pointer is in the zero page.
+    ///
+    /// The other form of the loop copies the pointer at the head, steps it
+    /// right away (`p = copy + 1`) and works with the copy. There the copy
+    /// is made once, in front of the loop, and Y is stepped at the head: it
+    /// starts at 255, and the head is `iny` / `cpy #k`.
+    ///
+    /// Other pointers that are stepped together with this one (the
+    /// destination of a copy loop) stay where they are as well; if one is
+    /// needed after the loop, the rounds are added to it at the exit.
+    ///
+    /// That needs, besides what `narrow_test` has checked: elements of one
+    /// byte; the loop uses Y only as the zero of accesses through these
+    /// pointers (`Ins::via`), and every other read of a pointer is a copy
+    /// to a scratch pointer; neither Y nor the pointer is needed after the
+    /// loop, and what the old test and the step left in A and the flags is
+    /// not needed (A may be at the start of the body: the low byte of the
+    /// pointer, for the copy; it is loaded again).
+    #[allow(clippy::too_many_arguments)]
+    fn index_loop(
+        &mut self,
+        blocks: &[Block],
+        live_in: &[Live],
+        (t, b, body, exit): (usize, usize, usize, usize),
+        k: u8,
+        test: [usize; 6],
+        (p0, q0, prefix): (usize, Option<usize>, &[usize]),
+        step: &[usize],
+    ) -> bool {
+        let [l0, m0, l1, m1, b1, exit_jump] = test;
+        let test = [l0, m0, l1, m1, b1];
+        // the bytes of the pointer and of its copy; what the accesses use
+        let mut ptr = vec![p0, p0 + 1];
+        ptr.extend(q0.into_iter().flat_map(|q| [q, q + 1]));
+        let base = q0.unwrap_or(p0);
+        let inside = |q: usize| (t..=b).contains(&q);
+        let succs = |q: usize| -> Vec<Tgt> {
+            match blocks[q].term {
+                Term::Fall(s) | Term::Jmp(s) => vec![s],
+                Term::Cond(s, f) => vec![s, f],
+                Term::Ret => Vec::new(),
+            }
+        };
+        // after the loop: no Y, no pointer
+        let mut after_loop = vec![false; self.ncells];
+        let mut one_exit = true;
+        for q in t..=b {
+            let out = self.live_out(blocks, live_in, q);
+            // (a return between the blocks of the loop leaves it too)
+            let ret = matches!(blocks[q].term, Term::Ret).then_some(Tgt::External);
+            for s in succs(q).into_iter().chain(ret) {
+                let l = match s {
+                    Tgt::Block(s) if inside(s) => continue,
+                    Tgt::Block(s) => {
+                        one_exit &= s == exit && (blocks[q].start..blocks[q].end).contains(&exit_jump);
+                        &live_in[s]
+                    }
+                    Tgt::External => {
+                        one_exit = false;
+                        &out
+                    }
+                };
+                if l.regs & RY != 0 || ptr.iter().any(|&c| l.cells[c]) {
+                    return false;
+                }
+                for (a, c) in after_loop.iter_mut().zip(&l.cells) {
+                    *a |= *c;
+                }
+            }
+        }
+        // Other pointers that the loop walks along with this one (`inc a` /
+        // `bne` / `inc a+1` directly in front of or behind the step) and
+        // uses in the same way stay where they are too, and get the rounds
+        // added where the loop ends, if they are needed then: that must be
+        // the only way out of the loop.
+        let mut others: Vec<(usize, [usize; 3])> = Vec::new();
+        if q0.is_none() {
+            let x = (t..=b).find(|&q| (blocks[q].start..blocks[q].end).contains(&step[0]));
+            let mut seen: Vec<usize> = Vec::new();
+            for i in blocks[t].start..blocks[b].end {
+                let Line::Ins(ins) = &self.lines[i] else { continue };
+                if ins.gone || ins.mode != Mode::IndY || ins.via.contains(&base) {
+                    continue;
+                }
+                let found = ins.via.iter().copied().find(|&a| {
+                    others.iter().any(|o| o.0 == a)
+                        || (!seen.contains(&a) && !ptr.contains(&a) && !ptr.contains(&(a + 1)) && {
+                            seen.push(a);
+                            match (self.inc_group(blocks, t, b, a), x) {
+                                (Some((xa, lines)), Some(x)) => {
+                                    let first = |q: usize| {
+                                        (blocks[q].start..blocks[q].end)
+                                            .find(|&i| matches!(&self.lines[i], Line::Ins(ins) if !ins.gone))
+                                    };
+                                    let adjacent = (xa + 2 == x && first(x) == Some(step[0]))
+                                        || (x + 2 == xa && first(xa) == Some(lines[0]));
+                                    let needed = after_loop[a] || after_loop[a + 1];
+                                    let can_add = one_exit
+                                        && live_in[exit].regs & FV == 0
+                                        && (self.ins(b1).op != "bne"
+                                            || !(0..blocks.len()).any(|q| {
+                                                q != t + 1
+                                                    && succs(q).iter().any(|s| {
+                                                        matches!(s, Tgt::Block(j) if (blocks[*j].start..blocks[*j].end).contains(&exit_jump))
+                                                    })
+                                            }));
+                                    if adjacent
+                                        && live_in[xa + 2].regs & NZ == 0
+                                        && Self::once_per_round(blocks, t, b, xa)
+                                        && (!needed || can_add)
+                                    {
+                                        others.push((a, lines));
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            }
+                        })
+                });
+                if found.is_none() {
+                    return false;
+                }
+            }
+        }
+        for &(a, _) in &others {
+            ptr.extend([a, a + 1]);
+        }
+        let bases: Vec<usize> = std::iter::once(base).chain(others.iter().map(|o| o.0)).collect();
+        const FLAGS_LEFT: u8 = FN | FZ | FC;
+        if live_in[exit].regs & (RA | FLAGS_LEFT) != 0 || live_in[body].regs & FLAGS_LEFT != 0 {
+            return false;
+        }
+        // A at the start of the body: loaded again there, if the body is
+        // only reached from the test
+        let reload = live_in[body].regs & RA != 0;
+        if reload && (0..blocks.len()).any(|q| q != t && q != t + 1 && succs(q).contains(&Tgt::Block(body))) {
+            return false;
+        }
+        let Some(&last) = step.iter().max() else { return false };
+        let skip: Vec<usize> =
+            test.iter().chain(step).chain(prefix).chain(others.iter().flat_map(|o| &o.1)).copied().collect();
+        let mut zeros: Vec<usize> = Vec::new();
+        for q in t..=b {
+            let code = self.block_code(blocks, live_in, q);
+            for (n, &(i, after)) in code.iter().enumerate() {
+                // what the step leaves: nothing with the copy (it goes),
+                // the flags of `iny` without
+                if i == last && after & (if q0.is_some() { RA | FLAGS } else { NZ }) != 0 {
+                    return false;
+                }
+                if skip.contains(&i) {
+                    continue;
+                }
+                let ins = self.ins(i);
+                let (uses, defs, ..) = self.effect(ins);
+                if ins.mode == Mode::IndY {
+                    if !ins.via.iter().any(|c| bases.contains(c)) || ins.via_y != Some(0) || defs & RY != 0 {
+                        return false;
+                    }
+                } else if (uses | defs) & RY != 0 {
+                    let zero = ins.op == "ldy" && ins.ival.as_ref().is_some_and(|v| v.vn == 0);
+                    if !zero || after & NZ != 0 {
+                        return false;
+                    }
+                    zeros.push(i);
+                }
+                // a read of the pointer: a copy to a scratch pointer
+                let cell = if ins.mode == Mode::Mem { self.own(&ins.arg) } else { None };
+                if cell.is_some_and(|c| ptr.contains(&c)) {
+                    let (reg, store) = match ins.op {
+                        "lda" => (RA, "sta"),
+                        "ldx" => (RX, "stx"),
+                        _ => return false,
+                    };
+                    let Some(&(next, after_next)) = code.get(n + 1) else { return false };
+                    let next = self.ins(next);
+                    if next.op != store
+                        || next.mode != Mode::Mem
+                        || !self.own(&next.arg).is_some_and(|c| c >= self.nframe)
+                        || after_next & (reg | NZ) != 0
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        // the copy of the pointer, for in front of the loop
+        let mut front: Vec<Line> = Vec::new();
+        for &i in prefix {
+            let (op, arg) = (self.ins(i).op, self.ins(i).arg.clone());
+            front.push(Line::Ins(self.make_ins(op, arg)));
+        }
+        let start = if q0.is_some() { "#$ff" } else { "#$00" };
+        let mut load = self.make_ins("ldy", start.into());
+        load.ival = Some(self.imm(start));
+        front.push(Line::Ins(load));
+
+        // (what is added to the other pointers at the end)
+        let mut at_end: Vec<Line> = Vec::new();
+        for &(a, _) in &others {
+            if !(after_loop[a] || after_loop[a + 1]) {
+                continue;
+            }
+            let skip = crate::asm::fresh_label();
+            let (lo, hi, rounds) = (self.cell_name(a), self.cell_name(a + 1), format!("#${k:02x}"));
+            let mut add = self.make_ins("adc", rounds.clone());
+            add.ival = Some(self.imm(&rounds));
+            at_end.extend([
+                Line::Ins(self.make_ins("clc", String::new())),
+                Line::Ins(self.make_ins("lda", lo.clone())),
+                Line::Ins(add),
+                Line::Ins(self.make_ins("sta", lo)),
+                Line::Ins(self.make_ins("bcc", skip.clone())),
+                Line::Ins(self.make_ins("inc", hi)),
+                Line::Label(skip),
+            ]);
+        }
+        let other_steps: Vec<usize> = others.iter().flat_map(|o| o.1).collect();
+        for i in zeros
+            .into_iter()
+            .chain([l0, l1, m1])
+            .chain(step.iter().copied())
+            .chain(prefix.iter().copied())
+            .chain(other_steps)
+        {
+            let Line::Ins(ins) = &mut self.lines[i] else { unreachable!() };
+            ins.gone = true;
+        }
+        let Line::Ins(ins) = &mut self.lines[b1] else { unreachable!() };
+        if ins.op == "bne" {
+            ins.gone = true;
+        } else {
+            ins.op = "jmp";
+        }
+        let arg = format!("#${k:02x}");
+        let mut cmp = self.make_ins("cpy", arg.clone());
+        cmp.ival = Some(self.imm(&arg));
+        self.lines[m0] = Line::Ins(cmp);
+        // the step of Y: where the pointer was stepped, or at the head
+        let at = if q0.is_some() { l0 } else { step[0] };
+        self.lines[at] = Line::Ins(self.make_ins("iny", String::new()));
+        // What is added at the end: behind the loop, where the test now
+        // leaves to (the loop stays one that `rotate` takes).
+        if !at_end.is_empty() {
+            let label = crate::asm::fresh_label();
+            let Line::Ins(jump) = &mut self.lines[exit_jump] else { unreachable!() };
+            let to = std::mem::replace(&mut jump.arg, label.clone());
+            at_end.insert(0, Line::Label(label));
+            at_end.push(Line::Ins(self.make_ins("jmp", to)));
+        }
+        // (the later line first: the lines keep their numbers)
+        for l in std::mem::take(&mut at_end).into_iter().rev() {
+            self.lines.insert(blocks[b].end, l);
+        }
+        if reload {
+            let at = (blocks[body].start..blocks[body].end)
+                .find(|&i| !matches!(&self.lines[i], Line::Label(_)))
+                .unwrap_or(blocks[body].end);
+            let load = self.make_ins("lda", self.cell_name(p0));
+            self.lines.insert(at, Line::Ins(load));
+        }
+        for l in front.into_iter().rev() {
+            self.lines.insert(blocks[t].start, l);
+        }
+        self.clear_marks();
+        true
+    }
+
+    /// Makes the test of a loop over a slice of known length an 8-bit one.
+    /// The loop walks a pointer up to an end that is the pointer's start
+    /// plus a constant below 256, and compares all 16 bits in every round:
+    ///
+    /// ```text
+    /// head:   lda p                   head:   lda p           head:   cpx #n
+    ///         cmp end                         cmp end                 bne body
+    ///         bne body                        bne body                jmp exit
+    ///         lda p+1                         jmp exit
+    ///         cmp end+1
+    ///         beq exit
+    /// body:   ...
+    /// ```
+    ///
+    /// (In front of the test the pointer may be copied, where the body works
+    /// with the copy and steps the pointer as copy plus `s`.) On the way the pointer is never more than 255 away from its start,
+    /// so it is at the end exactly when the low bytes are equal (middle).
+    /// If the loop also counts in X or Y (`enumerate`, after `promote`),
+    /// the counter tells the same, without a load (right).
+    ///
+    /// That needs: at the entry of the loop the end is the pointer plus
+    /// `k`, 1..=255 (`span`, with what `forward` knows there: `heads`);
+    /// the loop does not write the end and writes the pointer in one place
+    /// only, a step by a constant `s` that divides `k`, which runs exactly
+    /// once per round (`once_per_round`). Then the pointer is the start
+    /// plus `s` times the rounds so far at every test. The counter is a
+    /// register with a known value at the entry whose only change in the
+    /// loop is one `inx`/`dex`/`iny`/`dey`, also once per round. What the
+    /// old test left in A (and, with the counter, in the flags) must not
+    /// be needed. The loop is as in `rotate`, which then can take it.
+    ///
+    /// Better than both is an index in Y in place of the pointer
+    /// (`index_loop`); that is tried first, and before `promote` gives the
+    /// registers away (`index_only`: nothing else). One loop per call; true
+    /// if something changed.
+    fn narrow_test(&mut self, blocks: &[Block], live_in: &[Live], index_only: bool) -> bool {
+        for b in 0..blocks.len() {
+            let Term::Jmp(Tgt::Block(t)) = blocks[b].term else { continue };
+            if t == 0 || t + 1 >= b || !Self::enters_at_top(blocks, t, b) {
+                continue;
+            }
+            let Some(st) = self.heads.get(&blocks[t].start).cloned() else { continue };
+            let code = |q: usize| -> Vec<usize> {
+                (blocks[q].start..blocks[q].end)
+                    .filter(|&i| matches!(&self.lines[i], Line::Ins(ins) if !ins.gone))
+                    .collect()
+            };
+            if (blocks[t].start..blocks[b].end).any(|i| self.asm_entry(i)) {
+                continue;
+            }
+            // the test
+            // (in front of it the pointer may be copied: the body then
+            // works with the copy, and the step is `p = copy + s`)
+            let head = code(t);
+            let Some(cut) = head.len().checked_sub(3) else { continue };
+            let (&[l0, m0, b0], &[l1, m1, b1]) = (&head[cut..], &code(t + 1)[..]) else { continue };
+            let copy = match head[..cut] {
+                [] => None,
+                [a, b, c, d] => {
+                    let cell = |i: usize, op: &str| self.ins(i).cell.filter(|_| self.ins(i).op == op);
+                    let (Some(from0), Some(q0), Some(from1), Some(q1)) =
+                        (cell(a, "lda"), cell(b, "sta"), cell(c, "lda"), cell(d, "sta"))
+                    else {
+                        continue;
+                    };
+                    if Some(from0) != self.ins(l0).cell || from1 != from0 + 1 || q1 != q0 + 1 || q1 >= self.nframe {
+                        continue;
+                    }
+                    Some((q0, [b, d]))
+                }
+                _ => continue,
+            };
+            let (q0, q1) = match copy {
+                Some((q0, _)) => (Some(q0), Some(q0 + 1)),
+                None => (None, None),
+            };
+            let Term::Cond(Tgt::Block(body), Tgt::Block(low_equal)) = blocks[t].term else { continue };
+            let Term::Cond(taken, fall) = blocks[t + 1].term else { continue };
+            if low_equal != t + 1 || self.ins(b0).op != "bne" || self.ins(b0).always || self.ins(b1).always {
+                continue;
+            }
+            // (the branch of the second half goes to the exit, or over a
+            // jump to it)
+            let (exit, exit_jump) = match self.ins(b1).op {
+                "beq" if fall == Tgt::Block(body) => (taken, b1),
+                "bne" if taken == Tgt::Block(body) => {
+                    let Tgt::Block(j) = fall else { continue };
+                    let (&[jump], Term::Jmp(e)) = (&code(j)[..], blocks[j].term) else { continue };
+                    if self.ins(jump).op != "jmp" {
+                        continue;
+                    }
+                    (e, jump)
+                }
+                _ => continue,
+            };
+            let Tgt::Block(exit) = exit else { continue };
+            if (t..=b).contains(&exit) || !(t..=b).contains(&body) {
+                continue;
+            }
+            let (Some(p0), Some(p1)) = (self.ins(l0).cell, self.ins(l1).cell) else { continue };
+            if self.ins(l0).op != "lda" || self.ins(l1).op != "lda" || p1 != p0 + 1 || p1 >= self.nframe {
+                continue;
+            }
+            let end = |i: usize| -> Option<(Option<usize>, Loc)> {
+                let ins = self.ins(i);
+                match (ins.op, ins.mode, ins.cell) {
+                    ("cmp", Mode::Imm, _) => Some((None, ins.ival.clone()?)),
+                    ("cmp", Mode::Mem, Some(c))
+                        if c < self.nframe && c != p0 && c != p1 && Some(c) != q0 && Some(c) != q1 =>
+                    {
+                        Some((Some(c), st.l[3 + c].clone()))
+                    }
+                    _ => None,
+                }
+            };
+            let (Some((e0, end0)), Some((e1, end1))) = (end(m0), end(m1)) else { continue };
+            let Some(k) = self.span([&st.l[3 + p0], &st.l[3 + p1]], [&end0, &end1]) else { continue };
+            // what the loop writes: not the end, the pointer in one step
+            let mut steps: Vec<usize> = Vec::new();
+            let mut copy_writes: Vec<usize> = Vec::new();
+            let mut fixed = true;
+            for i in blocks[t].start..blocks[b].end {
+                let Line::Ins(ins) = &self.lines[i] else { continue };
+                if ins.gone || !self.effect(ins).3 {
+                    continue;
+                }
+                // (a write to memory that is not followed could be one)
+                let c = if ins.mode == Mode::Mem { self.own(&ins.arg) } else { None };
+                if c.is_some() && (c == e0 || c == e1) {
+                    fixed = false;
+                } else if c == Some(p0) || c == Some(p1) {
+                    steps.push(i);
+                } else if c.is_some() && (c == q0 || c == q1) && !copy.is_some_and(|(_, at)| at.contains(&i)) {
+                    copy_writes.push(i);
+                }
+            }
+            let &[w0, w1] = &steps[..] else { continue };
+            if !fixed || self.ins(w0).cell != Some(p0) || self.ins(w1).cell != Some(p1) {
+                continue;
+            }
+            let Some(x) = (t..=b).find(|&q| (blocks[q].start..blocks[q].end).contains(&w0)) else { continue };
+            let cx = code(x);
+            let Some(j) = cx.iter().position(|&i| i == w0) else { continue };
+            let at = |j: usize| cx.get(j).map(|&i| self.ins(i));
+            // the high byte: stepped behind a branch on the carry of the
+            // low byte, in a block of its own
+            let carried = |branch: &str| {
+                j + 2 == cx.len()
+                    && at(j + 1).is_some_and(|i| i.op == branch && !i.always)
+                    && x + 2 <= b
+                    && code(x + 1) == [w1]
+                    && self.ins(w1).op == "inc"
+                    && matches!(blocks[x].term, Term::Cond(Tgt::Block(l), Tgt::Block(h)) if l == x + 2 && h == x + 1)
+                    && matches!(blocks[x + 1].term, Term::Fall(Tgt::Block(l)) if l == x + 2)
+            };
+            let konst = |i: &Ins| i.ival.as_ref().filter(|v| v.vn < 256).map(|v| v.vn as u8);
+            let (s, group): (u8, Vec<usize>) = match self.ins(w0).op {
+                "inc" if carried("bne") => (1, vec![w0, cx[j + 1], w1]),
+                "sta" if j >= 2 => {
+                    let (Some(load), Some(add)) = (at(j - 2), at(j - 1)) else { continue };
+                    let clear = add.add_clear || (j >= 3 && at(j - 3).is_some_and(|i| i.op == "clc"));
+                    let high = carried("bcc")
+                        || (at(j + 1).is_some_and(|i| {
+                            i.op == "lda"
+                                && (i.cell == Some(p1) || (i.cell.is_some() && i.cell == q1 && at(j - 2).is_some_and(|l| l.cell == q0)))
+                        })
+                            && at(j + 2).is_some_and(|i| i.op == "adc" && konst(i) == Some(0))
+                            && cx.get(j + 3) == Some(&w1)
+                            && self.ins(w1).op == "sta");
+                    // from the pointer itself, or from the copy: that
+                    // still is the pointer if nothing wrote it since the
+                    // head (the step comes first in the round)
+                    let from_copy = load.cell.is_some() && load.cell == q0;
+                    let copy_holds =
+                        copy_writes.is_empty() || (x == body && copy_writes.iter().all(|&i| i > w1));
+                    if load.op != "lda"
+                        || !(load.cell == Some(p0) || (from_copy && copy_holds))
+                        || add.op != "adc"
+                        || !clear
+                        || !high
+                    {
+                        continue;
+                    }
+                    let Some(s) = konst(add) else { continue };
+                    let mut group = Vec::new();
+                    if j >= 3 && at(j - 3).is_some_and(|i| i.op == "clc") {
+                        group.push(cx[j - 3]);
+                    }
+                    group.extend([cx[j - 2], cx[j - 1], w0]);
+                    if carried("bcc") {
+                        group.extend([cx[j + 1], w1]);
+                    } else {
+                        group.extend([cx[j + 1], cx[j + 2], w1]);
+                    }
+                    (s, group)
+                }
+                _ => continue,
+            };
+            if s == 0 || k % s != 0 || !Self::once_per_round(blocks, t, b, x) {
+                continue;
+            }
+            let rounds = k / s;
+            // best: an index in Y in place of the pointer
+            let in_place = self.ins(w0).op == "inc";
+            if s == 1
+                && (if copy.is_some() { !in_place && copy_writes.is_empty() } else { in_place })
+                && self.index_loop(
+                    blocks,
+                    live_in,
+                    (t, b, body, exit),
+                    k,
+                    [l0, m0, l1, m1, b1, exit_jump],
+                    (p0, q0, &head[..cut]),
+                    &group,
+                )
+            {
+                return true;
+            }
+            if index_only {
+                continue;
+            }
+            // a counter in a register
+            const LEFT: u8 = RA | FN | FZ | FC;
+            let mut counter = None;
+            if (live_in[body].regs | live_in[exit].regs) & LEFT == 0 {
+                for (r, reg, up, down, cmp) in [(1, RX, "inx", "dex", "cpx"), (2, RY, "iny", "dey", "cpy")] {
+                    let mut defs: Vec<usize> = Vec::new();
+                    for i in blocks[t].start..blocks[b].end {
+                        if let Line::Ins(ins) = &self.lines[i]
+                            && !ins.gone
+                            && self.effect(ins).1 & reg != 0
+                        {
+                            defs.push(i);
+                        }
+                    }
+                    let &[d] = &defs[..] else { continue };
+                    let from = &st.l[r];
+                    let to = match self.ins(d).op {
+                        op if op == up => from.lo.wrapping_add(rounds),
+                        op if op == down => from.lo.wrapping_sub(rounds),
+                        _ => continue,
+                    };
+                    let Some(q) = (t..=b).find(|&q| (blocks[q].start..blocks[q].end).contains(&d)) else { continue };
+                    if from.lo == from.hi && Self::once_per_round(blocks, t, b, q) {
+                        counter = Some((cmp, to));
+                        break;
+                    }
+                }
+            }
+            if counter.is_none() && live_in[exit].regs & RA != 0 {
+                continue;
+            }
+            let over = self.ins(b1).op == "bne";
+            if let Some((cmp, to)) = counter {
+                let arg = format!("#${to:02x}");
+                let mut new = self.make_ins(cmp, arg.clone());
+                new.ival = Some(self.imm(&arg));
+                self.lines[m0] = Line::Ins(new);
+            }
+            for (i, gone) in [(l0, counter.is_some()), (l1, true), (m1, true), (b1, over)] {
+                let Line::Ins(ins) = &mut self.lines[i] else { unreachable!() };
+                ins.gone = gone;
+                if i == b1 && !over {
+                    ins.op = "jmp";
+                }
+            }
+            self.clear_marks();
+            return true;
+        }
+        false
     }
 
     /// Puts the test of a loop at its end:
@@ -2506,6 +3361,8 @@ impl Opt<'_> {
                 ins.first = None;
                 ins.add_same.clear();
                 ins.add_clear = false;
+                ins.via.clear();
+                ins.via_y = None;
             }
         }
     }
@@ -2614,6 +3471,69 @@ impl Opt<'_> {
             }
         }
         Some((first, k + 1, src, dst, vec![k0], keep))
+    }
+
+    /// A loop with several jumps back to its head (`continue`, an `if`
+    /// without `else` at the end of the body) gets one: the others go to
+    /// the last one, which is a block of its own then. That is where the
+    /// step of the loop can go (`sink_add`); if nothing is put there, the
+    /// jumps to the jump are straightened again at the end. One loop per
+    /// call; true if something changed.
+    fn funnel(&mut self, blocks: &[Block]) -> bool {
+        let n = blocks.len();
+        let last_ins = |b: usize| {
+            (blocks[b].start..blocks[b].end).rev().find(|&i| matches!(&self.lines[i], Line::Ins(ins) if !ins.gone))
+        };
+        for t in 1..n {
+            // the blocks from the head on that jump or branch to it
+            let back: Vec<usize> = (t..n)
+                .filter(|&q| match blocks[q].term {
+                    Term::Jmp(Tgt::Block(s)) | Term::Cond(Tgt::Block(s), _) => s == t,
+                    _ => false,
+                })
+                .collect();
+            let (Some(&latch), true) = (back.last(), back.len() >= 2) else { continue };
+            let Some(at) = last_ins(latch) else { continue };
+            let Line::Ins(jump) = &self.lines[at] else { continue };
+            if jump.op != "jmp" || jump.mode != Mode::Mem || jump.in_asm || jump.arg.starts_with('@') {
+                continue;
+            }
+            let head = jump.arg.clone();
+            // (all of them name the head the same way, outside `asm!`)
+            let sources: Vec<usize> = back[..back.len() - 1].iter().filter_map(|&q| last_ins(q)).collect();
+            if sources.len() + 1 != back.len()
+                || !sources.iter().all(|&i| matches!(&self.lines[i], Line::Ins(ins) if ins.arg == head && !ins.in_asm))
+            {
+                continue;
+            }
+            // the jump alone in its block: the label in front of it, or a
+            // new one
+            let alone = (blocks[latch].start..at).all(|i| match &self.lines[i] {
+                Line::Ins(ins) => ins.gone,
+                _ => true,
+            });
+            let label = (blocks[latch].start..at)
+                .rev()
+                .find_map(|i| match &self.lines[i] {
+                    Line::Label(l) if !l.starts_with('@') => Some(l.clone()),
+                    _ => None,
+                })
+                .filter(|_| alone);
+            let (label, new) = match label {
+                Some(l) => (l, false),
+                None => (crate::asm::fresh_label(), true),
+            };
+            for i in sources {
+                let Line::Ins(ins) = &mut self.lines[i] else { unreachable!() };
+                ins.arg = label.clone();
+            }
+            if new {
+                self.lines.insert(at, Line::Label(label));
+            }
+            self.clear_marks();
+            return true;
+        }
+        false
     }
 
     /// Moves an addition of a constant (`add_group`: the step of an
@@ -3083,7 +4003,9 @@ impl Opt<'_> {
             // what is needed where the loop is left
             let mut exit = vec![false; self.ncells];
             for q in t..=b {
-                for s in succs(q) {
+                // (a return between the blocks of the loop leaves it too)
+                let ret = matches!(blocks[q].term, Term::Ret).then_some(Tgt::External);
+                for s in succs(q).into_iter().chain(ret) {
                     let out;
                     let l = match s {
                         Tgt::Block(s) if (t..=b).contains(&s) => continue,
@@ -3326,7 +4248,9 @@ impl Opt<'_> {
             let mut exit = Live { regs: 0, cells: vec![false; self.ncells] };
             for q in t..=b {
                 let out = self.live_out(blocks, live_in, q);
-                for s in succs(q) {
+                // (a return between the blocks of the loop leaves it too)
+                let ret = matches!(blocks[q].term, Term::Ret).then_some(Tgt::External);
+                for s in succs(q).into_iter().chain(ret) {
                     let l = match s {
                         Tgt::Block(s) if inside(s) => continue,
                         Tgt::Block(s) => &live_in[s],

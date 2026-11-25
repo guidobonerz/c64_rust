@@ -286,7 +286,7 @@ cargo cannot see that change itself.
 | `u16`, `i16`, `usize`, `isize` | 2 | `usize` is 16 bits |
 | pointers, references, `fn` | 2 | |
 | `&[T]`, `&str` | 4 | pointer and length |
-| `u32`, `i32` | 4 | multiplication/division in the runtime |
+| `u32`, `i32` | 4 | multiplication/division in the runtime (`examples/pi`, `examples/mandelbrot`) |
 | `u64`, `i64` | 8 | |
 | `u128`, `i128` | 16 | add, subtract, logic, compare; no `*` `/` |
 | `char` | 4 | avoid: use `u8` and ASCII |
@@ -349,7 +349,7 @@ its own screen codes:
 
 | Address | Contents |
 |---|---|
-| `$0002-$008F` | zero page: `#[c64::zp]` statics, then the frames of the most-called functions (saved at start, restored at exit) |
+| `$0002-$008F` | zero page: `#[c64::zp]` statics, the registers of the runtime routines and the argument areas of the library's assembly routines that the program uses, then the frames of the most-called functions (saved at start, restored at exit) |
 | `$00F9-$00FE` | the runtime's pointer registers (`zp_p0`-`zp_p2`) |
 | `$0400-$07FF` | text screen (default) |
 | `$0801` | BASIC line `SYS 2061`, then the runtime and the program |
@@ -372,20 +372,33 @@ The program starts like a BASIC program (`RUN`). The start code
 
 1. saves the part of the zero page `$02-$8F` that the program uses and
    clears it,
-2. saves the stack pointer, the IRQ vector (`$0314`), the CPU port
-   (`$01`), the VIC registers `$D011`, `$D015`, `$D016`, `$D018` and
-   CIA 2's port A (the VIC bank),
+2. saves the stack pointer,
 3. clears the statics that start as zero (they are in the BSS, not in the
    file, so they are zero at every `RUN`) and initializes the zero-page
    statics,
 4. calls `main`.
 
-When `main` returns, or on `sys::exit()` or a panic, it restores the
-interrupt setup (CIA timer IRQ on, raster IRQ off), the memory
-configuration, the VIC mode and bank, silences the SID and restores the
-zero page, so BASIC continues normally. The border and background colours
-are not restored, so the program's last screen stays readable (and the
-tests can read the border colour).
+When `main` returns, or on `sys::exit()` or a panic, the exit code puts
+the machine back into the state BASIC starts with, so BASIC continues
+normally:
+
+* the memory configuration (`$01` = `$37`),
+* the CIAs and the SID's volume, with the KERNAL's `IOINIT` (`$FF84`):
+  the timer interrupt is on, the VIC bank is 0, the SID is silent,
+* the VIC's mode and interrupts: `$D011`-`$D01A` get the KERNAL's start
+  values (text mode, 25 rows, 40 columns, the upper-case character set at
+  `$1000`, the screen at `$0400`, sprites off, raster interrupt off),
+* the IRQ vector `$0314`, if the program names it: the KERNAL's handler
+  `$EA31`,
+* the zero page.
+
+Nothing of the hardware is saved at the start for this: the values are
+the KERNAL's, and the exit is about 20 bytes. The border and background
+colours, the sprites' positions and colours and the text colour stay as
+the program left them, so the program's last screen stays readable (and
+the tests can read the border colour). What was different before `RUN`
+is not brought back: lower case switched on by hand, a screen moved
+somewhere else, an interrupt handler of a cartridge in `$0314`.
 
 The backend generates this code for each program and leaves out what the
 program cannot need:
@@ -395,14 +408,15 @@ program cannot need:
 | zero page | no zero-page statics, and no function frame in the zero page is used (otherwise only the used bytes are saved) |
 | stack pointer | nothing can reach `sys::exit()` or a panic |
 | clearing statics | no static starts as zero (a few bytes of them stay in the file instead) |
-| interrupts, memory configuration, VIC, SID | every write of the program goes to a known, harmless place: its own variables, or a fixed address outside `$00/$01`, `$0314-$0319` and the I/O area (the colours `$D020-$D02E` are harmless) |
+| memory configuration, CIAs, VIC, SID | every write of the program goes to a known, harmless place: its own variables, or a fixed address outside `$00/$01`, `$0314-$0319` and the I/O area (the colours `$D020-$D02E` are harmless) |
+| IRQ vector | the program and the library routines it uses name none of the vectors `$0314-$0319` |
 
-Anything the backend cannot follow keeps the last step: a store through a
-pointer, an indexed store to a numeric address, `sei`, a call to a numeric
-address outside the ROMs or through a vector. Calls into the KERNAL and
-BASIC ROMs do not count. A program that needs none of the steps starts
-directly with `main`: `examples/border` (`lda #5`, `sta $d020`, `rts`) is
-a 20-byte file, 12 of them the BASIC line.
+Anything the backend cannot follow keeps the step for the hardware: a
+store through a pointer, an indexed store to a numeric address, `sei`, a
+call to a numeric address outside the ROMs or through a vector. Calls
+into the KERNAL and BASIC ROMs do not count. A program that needs none of
+the steps starts directly with `main`: `examples/border` (`lda #5`,
+`sta $d020`, `rts`) is a 20-byte file, 12 of them the BASIC line.
 
 ### Static frames
 
@@ -431,10 +445,11 @@ assembly of each function then removes most of what that costs (chapter
 
 ### Runtime registers
 
-The arithmetic helpers (`rt_mul8`, `rt_mul16`, `rt_mul`, `rt_udiv`, `rt_sdiv`, `rt_memcpy`, ...)
-use registers in the BSS: `rt_a`, `rt_b`, `rt_r`, `rt_t` (8 bytes each),
-`rt_n`, `rt_cnt`; calls through pointers use `rt_args` (32 bytes),
-`rt_ret` (16 bytes) and `rt_jvec`. The interrupt dispatcher saves them
+The arithmetic helpers (`rt_mul8`, `rt_mul16`, `rt_mul16s`/`rt_mul16u`, `rt_mul32`, `rt_mul`, `rt_udiv8`/`16`/`32`, `rt_udiv`, `rt_sdiv`, `rt_memcpy`, ...)
+use registers of their own: `rt_a`, `rt_b`, `rt_r`, `rt_t` (8 bytes each),
+`rt_n`, `rt_cnt`, in the zero page where the program leaves room (see
+"Zero page" below), else in the BSS; calls through pointers use `rt_args`
+(32 bytes), `rt_ret` (16 bytes) and `rt_jvec`. The interrupt dispatcher saves them
 (`rt_ctx_save`), but only the groups that the code reached by handlers
 uses: the arithmetic registers (39 bytes), `rt_args`/`rt_ret` (48 bytes),
 the argument areas of assembly functions. Otherwise it saves only the six
@@ -444,8 +459,16 @@ part of it.
 ### Zero page
 
 The zero page `$02-$8F` (BASIC's, free while the program runs) holds the
-`#[c64::zp]` statics and, in what is left, the frames at the bottom of the
-frame overlay: the leaf functions first. Machine code that you call (`sys::jsr`, a SID
+`#[c64::zp]` statics, then what the library's assembly works with (the
+registers of the runtime's multiplication, division and block routines,
+`rt_a`, `rt_b`, `rt_r`, ..., and the argument areas of the assembly
+routines the program calls: only the ones it uses, 10 to 80 bytes), and in
+what is left the frames at the bottom of the frame overlay: the leaf
+functions first, and of each frame the small values (up to four bytes)
+before the structs and arrays. The assembly names its registers and
+arguments in nearly every instruction, so this makes the library routines
+shorter and faster (`pi`: 12% smaller, 15% fewer cycles). Where
+there is no room (many `#[c64::zp]` statics) they stay in the BSS. Machine code that you call (`sys::jsr`, a SID
 tune's player) must not use these addresses for its own data; `$FB-$FE`,
 the usual choice of such code, are the runtime's scratch pointers and may
 be overwritten by it between calls.
@@ -606,6 +629,25 @@ with `rts` (or `jmp` to another routine). Useful runtime labels:
 | `rt_panic` | red border, return to BASIC |
 | `rt_jsrind` | `jmp (rt_jvec)` |
 
+Only the routines the program refers to are in the `.prg`: the text is
+cut at its global labels, and a routine, table or equate is kept if the
+code or something that is kept names it. A routine can have a second,
+short form for programs that have a larger routine anyway:
+
+```
+small:
+.ifdef large {
+        ...                     ; pass the work on
+        jmp large
+} .else {
+        ...                     ; do it here
+}
+```
+
+What is in the first branch counts only if `large` is kept for another
+reason, so `small` alone does not bring `large` into the program
+(`c64_fmt_dec16` and `c64_fmt_dec` in `c64`'s `text.rat` work like this).
+
 ### Inline assembly
 
 `c64::asm!` puts assembly lines into a function, without a call:
@@ -761,7 +803,7 @@ text::put_str(0, 0, core::str::from_utf8(b.as_bytes()).unwrap_or(""), Color::Whi
 | `trait Display` | `fmt<W: Write>(&self, w)`, for `str`, `[u8]`, `bool`, `char`, all integers, `&T` |
 | `Hex(v)`, `Bin(v)` | all digits, for `u8`/`u16`/`u32` (`Bin`: `u8`/`u16`) |
 | `Buf<N>` | a fixed text buffer: `as_bytes`, `len`, `clear` |
-| `write_u16`, `write_u32` | decimal without division |
+| `write_u16`, `write_u32` | decimal without division; a program that prints no number wider than 16 bits only has the small routine for the digits |
 | `print!`, `println!`, `write!` | comma-separated values |
 
 Implement `Display` for your own types:
@@ -1578,18 +1620,46 @@ of that:
   built from other values gets no storage: its users read (or dereference)
   the source bytes directly, also across branches, as long as the source
   cannot change before a use. Zero-extended high bytes become `#0`, which
-  also shortens the 16-bit arithmetic that follows.
+  also shortens the 16-bit arithmetic that follows. A struct or array of
+  more than 16 bytes that is only passed on (`let d = e; x.f = d`) is a
+  view of the one place it was copied from.
+* **Built where it goes.** A temporary of four bytes or more that is
+  assigned once and then only moved into (a field of) another variable in
+  the same block gets the bytes of that variable: `Name { buf: [0; 40],
+  len: 0 }` fills `buf` where it stays, `Ok(d)` has nothing to copy for
+  `d`.
+* **Results where the call left them.** A result of more than three bytes
+  is in the frame of the called function. A variable that only holds such
+  a result and is read before the next call is that memory: no copy into
+  the caller's frame (`match dir.next() { Some(e) => ..., None => ... }`
+  reads the entry there).
 * **Compare and branch.** A comparison that feeds a branch or a bounds
   check is not turned into a `bool`: `lda i / cmp #25 / bcc ok`. Constant
-  high bytes are skipped, `x < 0` tests the sign bit.
+  high bytes are skipped, `x < 0` tests the sign bit. The same holds for
+  `!(a < b)` (`is_err()`, `!done`): the branch goes the other way.
+* **Checks that were made.** A comparison that the code can only reach
+  through the true branch of the same comparison of the same values is not
+  made again: in `if n < buf.len() { buf[n] = c }` the index has no check
+  of its own.
+* **Matches on enums.** Where a `match` covers all variants, the last one
+  is not tested: it is what is left. An enum with two variants that has no
+  tag of its own (`Option<&T>`, `Result<Dir, Error>` with the error in a
+  value that the data cannot have) is decided by one comparison of that
+  byte.
 * **Tables.** Arrays of up to 256 bytes at a known address are indexed
   with X: `lda table,x`.
 * **Small arithmetic.** Shifts of a byte by a constant are done in A,
   wider ones in place; unsigned `* / %` by powers of two become shifts and
   masks; `x += 1` is `inc` (with `bne`/`inc` for 16 bits); zero bytes of a
   constant are not added; `and #$ff` and similar disappear. `min` and
-  `max` are a comparison and a copy; unsigned division of one and two
-  bytes has routines of its own.
+  `max` are a comparison and a copy; unsigned division of one, two and
+  four bytes has routines of its own, and so has multiplication. A shift
+  of a wider value by 8 bits or more moves bytes first.
+* **Fixed point.** `(a as i32 * b as i32) >> k` with 16-bit `a` and `b` is
+  one call of a 16 x 16 to 32 bit multiplication (`rt_mul16s`, or
+  `rt_mul16u` for unsigned values): the operands are not widened first.
+* **Quotient and remainder.** `d % g` and `d / g` with the same operands
+  next to each other (the digits of a number) are one division.
 * **Blocks of memory.** A copy or fill of a known size up to 255 bytes is
   a loop in place (5 to 11 bytes) instead of a call to `rt_memcpy` or
   `rt_memset`.
@@ -1628,7 +1698,9 @@ Then the assembly of each function goes through a **data-flow pass**
   pointer + byte and is then only dereferenced becomes an indexed access,
   and its computation goes: `0x0400 + i as u16` written through is
   `ldx i` / `sta $0400,x`, an element of a slice is `ldy i` /
-  `lda (slice),y`.
+  `lda (slice),y`. Where the pointer and Y are both known (the `&mut self`
+  of a function that was put into its caller, to a variable of the
+  caller), the access is direct: `lda (ptr),y` becomes `lda d+2`.
 * **Loop counters.** A frame byte that a loop only loads, stores and
   steps lives in X or Y for the time of the loop, when the loop does not
   need that register for something else and the byte is not used after it:
@@ -1646,6 +1718,20 @@ Then the assembly of each function goes through a **data-flow pass**
   works on. A bounds check of that kind moves too, when the loop is known
   to run at least once (a loop over an array or over a slice of known
   length).
+* **A short test.** A loop over an array, or over a slice whose length is
+  a constant, walks a pointer up to an end and compares the two, 16 bits
+  wide, in every round. If the end is less than 256 bytes after the start,
+  the low bytes alone tell when the pointer is there, and the test is
+  `lda p` / `cmp end` / `bne`. If the loop also counts in X or Y
+  (`enumerate`), the counter tells it without a load: `cpx #n` / `bne`.
+* **An index for the pointer.** If the elements of such a loop are bytes
+  and the loop needs Y for nothing else, the pointer stays at the start of
+  the array and Y is the index: `lda (p),y` / ... / `iny` / `cpy #n` /
+  `bne`, in place of a 16-bit step and a 16-bit test in every round. A
+  second pointer that the loop steps along with the first (the
+  destination of a copy loop written with `for`) stays where it is too;
+  if it is needed after the loop, the number of rounds is added to it
+  there.
 * **Test at the end.** The test of a small loop moves behind its body, so
   each round ends with one conditional branch instead of a branch and a
   jump; the loop is entered with a jump to the test (or directly, when the
@@ -1657,6 +1743,42 @@ Finally, for the program as a whole:
   Y, and so is a result of up to three bytes; the callee stores them only
   if it needs them in memory. An argument byte in memory that the callee
   never reads is not passed.
+* **Arguments that are not read.** For each function the pass notes which
+  of A, X and Y it reads at its entry; the callers do not load the others.
+  A reference to a value without bytes (`&mut Console`, the `self` of a
+  type that only has methods) that a function only hands on is not an
+  argument at all: the other arguments take its registers. A function
+  that looks at the address itself still gets it.
+* **One way back.** A loop with several jumps back to its head
+  (`continue`, an `if` without `else` at the end of the body) gets one
+  block for them, and the step of the loop goes there: `for &c in text`
+  with a condition in the body steps its pointer in place like a loop
+  without one.
+* **Variables that share their bytes.** Where a value of four bytes or
+  more is moved from one variable to another (`let d = match open() {
+  Ok(d) => d, .. }`, `Ok(entry)` at the end of a function, `drop(d)`),
+  the two get the same memory if they are never in use at the same time
+  with different contents, and the move copies nothing. A value that is
+  built in a variable and then returned is built in the result. A copy
+  that is changed while the original is still read, two values that
+  change places, a value that is needed while its successor is made:
+  those keep their own bytes. `RUST64_NO_JOIN=1` turns this off.
+* **Results of functions that are pasted in.** A function with one caller
+  that returns its value in memory writes it straight to the caller's
+  variable when its code stands in the caller, if no reference to that
+  variable exists at the call.
+* **Counters that fit a byte.** A `usize` or `u16` variable that starts at
+  a small constant or a byte and is only stepped where it is known to be
+  below a constant (`if n < 40 { buf[n] = c; n += 1 }`, a `while n < 100`)
+  never reaches 256: where it is read its upper byte is the constant 0,
+  and the code that kept that byte goes away. The comparison is one `cmp`,
+  the step one `inc`, the index goes straight into X or Y. A counter with
+  a limit of 300, or one that is stepped past 255, keeps both bytes.
+  `RUST64_NO_NARROW=1` turns this off.
+* **Addresses the assembler adds.** The end of an array in the frame or
+  in the data (`for p in &parts`) is its address plus a constant: the
+  code loads `#<(X+12)` instead of adding at run time, and a loop over at
+  most 255 bytes compares only the low byte of its pointer with it.
 * **Inlining.** rustc inlines small functions before the code generator
   starts; some only show to be small, or to have one caller, in the
   finished program. So at the end the assembly of a function replaces the
@@ -1676,11 +1798,21 @@ Finally, for the program as a whole:
   directly with `(ptr),y`. After the data-flow pass the frames of small
   programs fit completely. Function pointer targets (interrupt handlers)
   get their own region.
+
+  A frame has two parts, which are placed apart: the values of up to four
+  bytes (`F<n>f` in the listing: counters, pointers, lengths) and the
+  larger ones (`F<n>g`: structs, arrays, buffers). The small parts of all
+  functions come first. So a buffer of 40 bytes in a function at the
+  bottom does not push the counters and pointers of its callers out of
+  the zero page; the large parts follow and get what is left of it.
 * **Statics in the BSS.** Statics that are all zero are not in the file:
   they are cleared at the start.
 * **Jumps.** Jumps to jumps and to the next line are removed; `bcc skip /
   jmp target` becomes `bcs target` when the target is certainly in range;
-  `jsr f` / `rts` becomes `jmp f`.
+  `jsr f` / `rts` becomes `jmp f`. A test of a result for zero (`match
+  open() { 0 => .., e => .. }`, `if let Err(e) = ..`) is `bne` to one side
+  and falls into the other; a value that is stored only to be tested is
+  tested in A (`ora #$00`) and not stored.
 * **Pruning.** Only the runtime and library assembly routines that the
   program refers to are included: the smallest program is 20 bytes.
 
@@ -1858,14 +1990,14 @@ rust64 follows the phases in `PLAN.md`:
 
 Code quality: the data-flow pass of chapter 10 made the release builds of
 the examples 30% smaller in total than the code generator alone gives
-(`diagonal`: 3155 to 1510 bytes, `rasterbars`: 1733 to 1327, `wic64`: 3392
+(`diagonal`: 3155 to 1444 bytes, `rasterbars`: 1733 to 1327, `wic64`: 3392
 to 2340) and compiled loops more than twice as fast. Compared with
 oscar64, an optimizing C compiler for the 6502, rust64 is level or ahead
 where the library's assembly does the work; where compiled code does, its
-programs are 15 to 34% larger and within 5% in time per frame (ahead in
+programs are 15 to 28% larger and within 6% in time per frame (ahead in
 two of three) (the
 README has the numbers).
-Still open: the 16-bit comparison of an iterator's pointer with its end in every round, a counter in a
+Still open: an index for an iterator's pointer where the loop uses Y for something else or the elements are larger than a byte, a counter in a
 register also where the loop needs both index registers (a block copy in
 its body).
 Release builds (`opt-level = "s"`) give the best code. Debug builds

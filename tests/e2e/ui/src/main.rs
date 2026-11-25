@@ -85,6 +85,20 @@ fn main() {
     ui::frame(37, 22, 3, 3, Border::Square, Color::White);
     check(scr(37, 22) == 0x70 && scr(39, 24) == 0x7d && scr(38, 23) == 0x2e);
 
+    // 16-18: numbers of up to 16 bits. This program prints no wider ones,
+    // so it has the small routine for the digits (c64_fmt_dec16).
+    let mut b = c64::fmt::Buf::<40>::new();
+    for n in [0u16, 7, 10, 99, 100, 999, 1000, 9999] {
+        c64::write!(b, n, ' ');
+    }
+    check(b.as_bytes() == b"0 7 10 99 100 999 1000 9999 ");
+    b.clear();
+    c64::write!(b, 10000u16, ' ', 10010u16, ' ', 12345u16, ' ', 40000u16, ' ', 60009u16, ' ', 65535u16);
+    check(b.as_bytes() == b"10000 10010 12345 40000 60009 65535");
+    b.clear();
+    c64::write!(b, 255u8, ' ', -128i8, ' ', -32768i16, ' ', 32767i16, ' ', -1i16);
+    check(b.as_bytes() == b"255 -128 -32768 32767 -1");
+
     unsafe {
         hw::vic().border.write(if FAILS == 0 { Color::Green } else { Color::Red });
     }

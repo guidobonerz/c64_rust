@@ -73,19 +73,23 @@ const POW10_32: [u32; 9] = [
     10,
 ];
 
-// On the C64 the digits come from one assembly routine (rat/text.rat) for
-// all sizes and all sinks.
+// On the C64 the digits come from assembly routines (rat/text.rat) for all
+// sinks: one for numbers of up to 16 bits and one for 32 bits, so that a
+// program that prints no wide numbers does not carry the large one.
 #[cfg(target_os = "c64")]
 unsafe extern "C" {
     fn c64_fmt_dec(n: u32) -> u8;
+    fn c64_fmt_dec16(n: u16) -> u8;
 }
 
+/// Writes the `len` digits a routine left in the runtime registers (one
+/// copy of this for both widths).
 #[cfg(target_os = "c64")]
-fn write_dec<W: Write>(w: &mut W, n: u32) {
+#[inline(never)]
+fn write_digits<W: Write>(w: &mut W, len: u8) {
     unsafe {
         // The digits are in the runtime registers rt_b..: copy them, the
         // sink may use those registers.
-        let len = c64_fmt_dec(n);
         let at: u16;
         crate::asm!("lda #<rt_b", "sta {p}", "lda #>rt_b", "sta {p}+1", p = out(reg) at);
         let digits: [u8; 10] = *(at as *const [u8; 10]);
@@ -95,14 +99,18 @@ fn write_dec<W: Write>(w: &mut W, n: u32) {
 
 /// Writes `n` in decimal.
 #[cfg(target_os = "c64")]
+#[inline(never)]
 pub fn write_u16<W: Write>(w: &mut W, n: u16) {
-    write_dec(w, n as u32)
+    let len = unsafe { c64_fmt_dec16(n) };
+    write_digits(w, len)
 }
 
 /// Writes `n` in decimal.
 #[cfg(target_os = "c64")]
+#[inline(never)]
 pub fn write_u32<W: Write>(w: &mut W, n: u32) {
-    write_dec(w, n)
+    let len = unsafe { c64_fmt_dec(n) };
+    write_digits(w, len)
 }
 
 /// Writes `n` in decimal.

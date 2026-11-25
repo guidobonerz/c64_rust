@@ -88,6 +88,18 @@ const RT_RET: u64 = 16;
 /// The first zero-page address for `zp` statics and the last one.
 const ZP_FIRST: u64 = 0x02;
 const ZP_LAST: u64 = 0x8f;
+/// The registers of the runtime routines: name, offset in their block and
+/// size (see `runtime.rat`).
+const RT_REGS: [(&str, u64, u64); 8] = [
+    ("rt_cnt", 0, 1),
+    ("rt_sgn", 1, 1),
+    ("rt_sgnq", 2, 1),
+    ("rt_n", 3, 4),
+    ("rt_a", 7, 8),
+    ("rt_b", 15, 8),
+    ("rt_r", 23, 8),
+    ("rt_t", 31, 8),
+];
 
 /// Bytes of BSS the runtime uses (`rt_zpsave`, the saved hardware state
 /// and the runtime registers, see runtime.rat).
@@ -115,6 +127,23 @@ struct Program<'tcx> {
     statics: FxIndexSet<DefId>,
     /// Call graph: callees of each function (by index in `funcs`).
     calls: Vec<Vec<usize>>,
+    /// A function and the inlined functions whose frames its text treats
+    /// as its own (`inline_fns`): their bytes may be in use across the
+    /// calls of the function.
+    merged: Vec<(usize, Vec<usize>)>,
+    /// The registers each function reads at its entry (bit 0: A, 1: X,
+    /// 2: Y), as far as known: an argument byte that is not read is not
+    /// loaded by the callers.
+    entry_regs: FxIndexMap<usize, u8>,
+    /// For each function: the arguments that are not passed
+    /// (`unpassed_args`; `None` while the function is being looked at).
+    unpassed: FxIndexMap<Instance<'tcx>, Option<Vec<bool>>>,
+    /// The same by the number of the function, once it is compiled.
+    unpassed_of: FxIndexMap<usize, Vec<bool>>,
+    /// Variables (`F<id>v<n>`) that calls write their result to: whether
+    /// no pointer to the variable exists at any of those calls
+    /// (`free_dests`).
+    free_dests: FxIndexMap<String, bool>,
     /// Functions whose address is taken: id -> the arguments are a tuple
     /// (closure shims, "rust-call").
     addr_taken: FxIndexMap<usize, bool>,
@@ -243,6 +272,11 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         allocs: FxIndexSet::default(),
         statics: FxIndexSet::default(),
         calls: Vec::new(),
+        merged: Vec::new(),
+        entry_regs: FxIndexMap::default(),
+        unpassed: FxIndexMap::default(),
+        unpassed_of: FxIndexMap::default(),
+        free_dests: FxIndexMap::default(),
         addr_taken: FxIndexMap::default(),
         sigs: FxIndexMap::default(),
         layouts: FxIndexMap::default(),
@@ -428,7 +462,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
             for line in text.lines() {
                 let line = line.split(';').next().unwrap_or("");
                 for w in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-                    if w.ends_with("__args") || w.ends_with("__res") {
+                    if w.ends_with("__args") || w.ends_with("__res") || RT_REGS.iter().any(|r| r.0 == w) {
                         used.insert(w.to_owned());
                     }
                 }
@@ -436,16 +470,57 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         }
         used
     };
-    let _ = writeln!(p.defs, "rt_fsave = __bss + {}", p.bss);
-    for (sym, &(args, res)) in &p.foreign {
-        for (suffix, n) in [("args", args), ("res", res)] {
-            if n > 0 && used_areas.contains(&format!("{sym}__{suffix}")) {
-                let _ = writeln!(p.defs, "{sym}__{suffix} = __bss + {}", p.bss);
-                p.bss += n;
-            }
+    // What goes into the zero page besides the statics and the frames,
+    // defined in front of the code (the assembler then takes the short
+    // instructions): the registers of the runtime routines and the
+    // argument areas of the assembly functions. The library's assembly
+    // names them in nearly every line.
+    let mut zp_defs = String::new();
+    {
+        // the registers the program uses, as one block in their order
+        // (the routines index from one to the other)
+        let regs: Vec<&(&str, u64, u64)> = RT_REGS.iter().filter(|r| used_areas.contains(r.0)).collect();
+        let lo = regs.iter().map(|r| r.1).min().unwrap_or(0);
+        let hi = regs.iter().map(|r| r.1 + r.2).max().unwrap_or(0);
+        let len = hi - lo;
+        let zp = len > 0 && std::env::var_os("RUST64_NO_ZP_RT").is_none() && p.zp_next + len <= ZP_LAST + 1;
+        let (base, defs) = if zp {
+            p.zp_next += len;
+            (format!("${:02x}", p.zp_next - len), &mut zp_defs)
+        } else {
+            (format!("__bss+{}", 160 + lo), &mut p.defs)
+        };
+        let _ = writeln!(defs, "rt_save = {base}");
+        let _ = writeln!(defs, "rt_save_n = {}", len.max(1));
+        for r in regs {
+            let _ = writeln!(defs, "{} = {base}+{}", r.0, r.1 - lo);
         }
     }
-    let _ = writeln!(p.defs, "rt_fsave_end = __bss + {}", p.bss);
+    {
+        let areas: Vec<(String, u64)> = p
+            .foreign
+            .iter()
+            .flat_map(|(sym, &(args, res))| [(format!("{sym}__args"), args), (format!("{sym}__res"), res)])
+            .filter(|(name, n)| *n > 0 && used_areas.contains(name))
+            .collect();
+        let len: u64 = areas.iter().map(|a| a.1).sum();
+        let zp = len > 0 && std::env::var_os("RUST64_NO_ZP_ARGS").is_none() && p.zp_next + len <= ZP_LAST + 1;
+        if zp {
+            let _ = writeln!(zp_defs, "rt_fsave = ${:02x}", p.zp_next);
+            for (name, n) in areas {
+                let _ = writeln!(zp_defs, "{name} = ${:02x}", p.zp_next);
+                p.zp_next += n;
+            }
+            let _ = writeln!(zp_defs, "rt_fsave_end = ${:02x}", p.zp_next);
+        } else {
+            let _ = writeln!(p.defs, "rt_fsave = __bss + {}", p.bss);
+            for (name, n) in areas {
+                let _ = writeln!(p.defs, "{name} = __bss + {}", p.bss);
+                p.bss += n;
+            }
+            let _ = writeln!(p.defs, "rt_fsave_end = __bss + {}", p.bss);
+        }
+    }
     let _ = writeln!(p.defs, "rt_ctxbuf = __bss + {}", p.bss);
     p.bss += 256 + 8;
 
@@ -457,54 +532,116 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     // region of its own above the main program's: a handler may interrupt
     // anything. What fits into the rest of the zero page goes there: the
     // leaves first, which are called most.
+    //
+    // A frame has two parts that are placed apart: the small values, and
+    // the large ones (structs, arrays). The small parts of all frames come
+    // first, so a function's counters and pointers are in the zero page
+    // even where a buffer of something it calls would have filled it.
     let frames = compact_frames(&mut p, &[&wrappers, &data.text, &lib]);
     let n = p.funcs.len();
     let mut size = vec![0u64; n];
-    for (id, sz, _) in &frames {
-        size[*id] = *sz;
+    let mut part = [vec![0u64; n], vec![0u64; n]];
+    for f in &frames {
+        size[f.id] = f.size[0] + f.size[1];
+        part[0][f.id] = f.size[0];
+        part[1][f.id] = f.size[1];
     }
-    let mut off: Vec<Option<u64>> = vec![None; n];
-    fn place(p: &Program<'_>, f: usize, base: u64, size: &[u64], off: &mut Vec<Option<u64>>) -> u64 {
+    // What a frame lies above: the frames of the functions it calls. The
+    // frame of an inlined function that its holder treats as its own
+    // (`merged`) is in use across the holder's calls, unlike that of a
+    // function that is called: it also lies above the frames of everything
+    // else that is called in the holder's text, and the merged frames of
+    // one holder lie above each other.
+    let above: Vec<Vec<usize>> = {
+        let mut above = p.calls.clone();
+        fn reaches(g: &[Vec<usize>], from: usize, to: usize, seen: &mut Vec<bool>) -> bool {
+            if from == to {
+                return true;
+            }
+            if std::mem::replace(&mut seen[from], true) {
+                return false;
+            }
+            g[from].iter().any(|&c| reaches(g, c, to, seen))
+        }
+        for (holder, all) in &p.merged {
+            // The calls in the holder's text: its own and those of the
+            // functions inlined into it.
+            let mut called: Vec<usize> = Vec::new();
+            for &f in std::iter::once(holder).chain(all) {
+                for &c in &p.calls[f] {
+                    if !all.contains(&c) && !called.contains(&c) {
+                        called.push(c);
+                    }
+                }
+            }
+            // (the small ones at the bottom: they may still fit into the zero page)
+            let mut inlined: Vec<usize> = all.iter().copied().filter(|&d| size[d] > 0).collect();
+            inlined.sort_by_key(|&d| (size[d], d));
+            if std::env::var_os("RUST64_FRAMES").is_some() {
+                eprintln!(
+                    "merged into F{holder} ({} bytes, calls {called:?}): {:?}",
+                    size[*holder],
+                    inlined.iter().map(|&d| (d, size[d])).collect::<Vec<_>>()
+                );
+            }
+            for (i, &d) in inlined.iter().enumerate() {
+                for &x in called.iter().chain(&inlined[..i]) {
+                    // (never the other way round: what calls `d` has its text too)
+                    if !above[d].contains(&x) && !reaches(&above, x, d, &mut vec![false; n]) {
+                        above[d].push(x);
+                    }
+                }
+            }
+        }
+        above
+    };
+    fn place(above: &[Vec<usize>], f: usize, base: u64, size: &[u64], off: &mut Vec<Option<u64>>) -> u64 {
         if let Some(o) = off[f] {
             return o;
         }
         let mut o = base;
-        for &c in &p.calls[f] {
-            o = o.max(place(p, c, base, size, off) + size[c]);
+        for &c in &above[f] {
+            o = o.max(place(above, c, base, size, off) + size[c]);
         }
         off[f] = Some(o);
         o
-    }
-    let mut top = 0;
-    for root in std::iter::once(main_id).chain(p.addr_taken.keys().copied()) {
-        let base = top;
-        place(&p, root, base, &size, &mut off);
-        top = (0..n).filter_map(|f| off[f].map(|o| o + size[f])).max().unwrap_or(0);
     }
     // The labels of zero-page frames are defined before the code, so that
     // the assembler picks zero-page addressing.
     let zp_avail = ZP_LAST + 1 - p.zp_next;
     let mut zp_frames = String::new();
-    let mut zp_ids = FxIndexSet::default();
+    // The names that are in the zero page.
+    let mut zp_names: FxIndexSet<String> = FxIndexSet::default();
     // Where the frames in the zero page end.
     let mut zp_frame_ends: Vec<(usize, u64)> = Vec::new();
-    for (id, sz, defs) in frames {
-        let o = off[id].unwrap_or_else(|| {
-            // not reachable from a root: its own space
-            top += sz;
-            top - sz
-        });
-        if sz > 0 && o + sz <= zp_avail {
-            zp_ids.insert(id);
-            zp_frame_ends.push((id, p.zp_next + o + sz));
-            let _ = writeln!(zp_frames, "F{id}f = ${:02x}", p.zp_next + o);
-            zp_frames.push_str(&defs);
-        } else {
-            let _ = writeln!(p.defs, "F{id}f = __bss + {}", p.bss + o);
-            p.defs.push_str(&defs);
+    let mut top = 0;
+    for (k, base) in ["f", "g"].into_iter().enumerate() {
+        let start = top;
+        let mut off: Vec<Option<u64>> = vec![None; n];
+        for root in std::iter::once(main_id).chain(p.addr_taken.keys().copied()) {
+            place(&above, root, top, &part[k], &mut off);
+            top = (0..n).filter_map(|f| off[f].map(|o| o + part[k][f])).max().unwrap_or(start).max(top);
+        }
+        for f in &frames {
+            let (id, sz) = (f.id, f.size[k]);
+            let o = off[id].unwrap_or_else(|| {
+                // not reachable from a root: its own space
+                top += sz;
+                top - sz
+            });
+            if sz > 0 && o + sz <= zp_avail {
+                zp_names.extend(f.names[k].iter().cloned());
+                zp_frame_ends.push((id, p.zp_next + o + sz));
+                let _ = writeln!(zp_frames, "F{id}{base} = ${:02x}", p.zp_next + o);
+                zp_frames.push_str(&f.defs[k]);
+            } else {
+                let _ = writeln!(p.defs, "F{id}{base} = __bss + {}", p.bss + o);
+                p.defs.push_str(&f.defs[k]);
+            }
         }
     }
     p.bss += top;
+    let in_zp = |name: &str| zp_names.contains(name.split('+').next().unwrap_or(name).trim());
 
     let mut out = String::new();
     let _ = writeln!(out, "\nrt_main = F{main_id}");
@@ -515,13 +652,8 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         out.push_str("        rts\n");
     }
     // Pointers in zero-page frames are dereferenced directly.
-    let code = crate::asm::zp_direct(&p.asm.text, |name| {
-        // F<id>v<n>[+off] or F<id>t+off
-        name.strip_prefix('F')
-            .and_then(|r| r.split_once(['v', 't']))
-            .and_then(|(id, _)| id.parse::<usize>().ok())
-            .is_some_and(|id| zp_ids.contains(&id))
-    });
+    // (F<id>v<n>[+off] or F<id>t+off)
+    let code = crate::asm::zp_direct(&p.asm.text, in_zp);
     // (a value that was stored for the pointer setup and loaded again)
     let code = crate::asm::peephole(&code);
     // Branch distances with the real sizes: frames in the zero page are
@@ -529,15 +661,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     let code = crate::asm::relax_with(
         &code,
         &|op, arg| {
-            crate::asm::line_size(op, arg, &|name| {
-                name.starts_with("zp_")
-                    || name
-                        .strip_prefix('F')
-                        .and_then(|r| r.split_once(['v', 't']))
-                        .or_else(|| name.strip_prefix('L').and_then(|r| r.split_once('_')))
-                        .and_then(|(id, _)| id.parse::<usize>().ok())
-                        .is_some_and(|id| zp_ids.contains(&id))
-            })
+            crate::asm::line_size(op, arg, &|name| name.starts_with("zp_") || in_zp(name))
         },
         120,
     );
@@ -549,7 +673,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     out.push_str(&p.defs);
     let _ = writeln!(out, "__bss_end = __bss + {}", p.bss);
     out.push_str(".assert __bss_end <= $a000, \"rust64: program and its data do not fit below $a000\"\n");
-    out.push_str(".assert rt_fsave_end - rt_fsave + rt_save_end - rt_save <= 256, \"rust64: too many assembly function arguments\"\n");
+    out.push_str(".assert rt_fsave_end - rt_fsave + 87 <= 256, \"rust64: too many assembly function arguments\"\n");
     for (addr, what) in &p.fixed_vars {
         if *addr >= 0x0801 {
             let _ = writeln!(
@@ -604,11 +728,13 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         .filter(|(id, _)| refers(*id))
         .map(|&(_, end)| end)
         .fold(p.zp_next, u64::max);
-    let start = start_exit(zp_end - ZP_FIRST, hw, exit_used, zp_init, zero);
+    let irq = hw
+        && (crate::asm::touches_irq(&all) || p.fixed_vars.iter().any(|(a, _)| (0x0314..0x031a).contains(a)));
+    let start = start_exit(zp_end - ZP_FIRST, hw, irq, exit_used, zp_init, zero);
     let lib = crate::asm::prune(&lib, &format!("{start}{out}"));
     format!(
-        "; generated by rust64\n.basicupstart rt_start\n\n; ---- frames in the zero page ----\n\
-         {zp_frames}\n{start}{lib}{out}"
+        "; generated by rust64\n.basicupstart rt_start\n\n; ---- in the zero page ----\n\
+         {zp_defs}{zp_frames}\n{start}{lib}{out}"
     )
 }
 
@@ -622,7 +748,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
 /// the one it names (the callers of a function with spread arguments store
 /// through the name of the first one); a name used in any other way keeps
 /// all its bytes.
-fn compact_frames(p: &mut Program<'_>, others: &[&String]) -> Vec<(usize, u64, String)> {
+fn compact_frames(p: &mut Program<'_>, others: &[&String]) -> Vec<Frame> {
     let frames = std::mem::take(&mut p.frames);
     let mut names: FxIndexMap<String, (usize, u64, u64)> = FxIndexMap::default();
     for (&id, (layout, _)) in &p.layouts {
@@ -668,6 +794,7 @@ fn compact_frames(p: &mut Program<'_>, others: &[&String]) -> Vec<(usize, u64, S
             words(line.split(';').next().unwrap_or(""), &mut mark);
         }
     }
+    let small = std::env::var("RUST64_FRAME_SMALL").ok().and_then(|v| v.parse().ok()).unwrap_or(FRAME_SMALL);
     let mut out = Vec::with_capacity(frames.len());
     for (id, _, _) in frames {
         let kept = &keep[&id];
@@ -679,20 +806,53 @@ fn compact_frames(p: &mut Program<'_>, others: &[&String]) -> Vec<(usize, u64, S
             n += k as u64;
         }
         pos.push(n);
-        let mut defs = String::new();
-        let mut entries: Vec<(&String, u64)> = p.layouts[&id]
+        let mut entries: Vec<(&String, u64, u64)> = p.layouts[&id]
             .0
             .iter()
             .filter(|(name, _)| used.contains(*name))
-            .map(|(name, &(o, _))| (name, o))
+            .map(|(name, &(o, n))| (name, o, n))
             .collect();
-        entries.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
-        for (name, o) in entries {
-            let _ = writeln!(defs, "{name} = F{id}f+{}", pos[o as usize]);
+        // (a name that lies in another one's bytes after it)
+        entries.sort_by(|a, b| (a.1, std::cmp::Reverse(a.2), a.0).cmp(&(b.1, std::cmp::Reverse(b.2), b.0)));
+        let mut frame = Frame { id, size: [0; 2], defs: Default::default(), names: Default::default() };
+        // the value before: where it starts and ends, its part and its
+        // place there. Names in its bytes go with it.
+        let mut last: Option<(u64, u64, usize, u64)> = None;
+        for (name, o, len) in entries {
+            let (k, at) = match last {
+                Some((start, end, k, at)) if o < end => (k, at + pos[o as usize] - pos[start as usize]),
+                _ => {
+                    let end = ((o + len) as usize).min(kept.len()).max(o as usize);
+                    let bytes = pos[end] - pos[o as usize];
+                    let k = (bytes > small) as usize;
+                    let at = frame.size[k];
+                    frame.size[k] += bytes;
+                    if len > 0 {
+                        last = Some((o, o + len, k, at));
+                    }
+                    (k, at)
+                }
+            };
+            let _ = writeln!(frame.defs[k], "{name} = F{id}{}+{at}", ["f", "g"][k]);
+            frame.names[k].push(name.clone());
         }
-        out.push((id, n, defs));
+        debug_assert_eq!(frame.size[0] + frame.size[1], n);
+        out.push(frame);
     }
     out
+}
+
+/// The largest value that is in the first part of a frame, in bytes.
+const FRAME_SMALL: u64 = 4;
+
+/// A function's frame after `compact_frames`, in its two parts (`F<id>f`:
+/// the small values, `F<id>g`: the large ones): the sizes, the definitions
+/// of the names, and the names.
+struct Frame {
+    id: usize,
+    size: [u64; 2],
+    defs: [String; 2],
+    names: [Vec<String>; 2],
 }
 
 /// The start and exit code of the program.
@@ -702,8 +862,11 @@ fn compact_frames(p: &mut Program<'_>, others: &[&String]) -> Vec<(usize, u64, S
 ///   start, restored at the exit.
 /// * `hw`: the program can change the interrupt setup, the memory
 ///   configuration, the VIC mode or bank or the SID
-///   ([`crate::asm::touches_hw`]): saved at the start (what cannot be set
-///   to a known value), restored at the exit.
+///   ([`crate::asm::touches_hw`]): the exit sets them to what BASIC starts
+///   with. Nothing is saved for that: the KERNAL has the values.
+/// * `irq`: the program names the interrupt vectors
+///   ([`crate::asm::touches_irq`]): the exit sets the IRQ vector to the
+///   KERNAL's handler.
 /// * `exit_used`: something jumps to `rt_exit` (`sys::exit`, a panic), from
 ///   any depth of calls: the stack pointer is saved.
 /// * `zp_init`: there are zero-page statics to initialize.
@@ -712,7 +875,7 @@ fn compact_frames(p: &mut Program<'_>, others: &[&String]) -> Vec<(usize, u64, S
 ///
 /// A program that needs none of this starts directly with `main`, whose
 /// `rts` returns to BASIC.
-fn start_exit(zp: u64, hw: bool, exit_used: bool, zp_init: bool, zero: u64) -> String {
+fn start_exit(zp: u64, hw: bool, irq: bool, exit_used: bool, zp_init: bool, zero: u64) -> String {
     let mut a = Asm::default();
     a.raw("\n; ---- start and exit ----");
     if zp == 0 && !hw && !exit_used && !zp_init && zero == 0 {
@@ -765,22 +928,7 @@ fn start_exit(zp: u64, hw: bool, exit_used: bool, zp_init: bool, zero: u64) -> S
         a.ins("tsx");
         a.ins("stx rt_sp");
     }
-    const SAVED: [(&str, &str); 7] = [
-        ("$0314", "rt_irqsave"),
-        ("$0315", "rt_irqsave+1"),
-        ("$01", "rt_port"),
-        ("$dd00", "rt_dd00"),
-        ("$d018", "rt_d018"),
-        ("$d011", "rt_d011"),
-        ("$d016", "rt_d016"),
-    ];
     if hw {
-        for (reg, at) in SAVED {
-            a.ins(format!("lda {reg}"));
-            a.ins(format!("sta {at}"));
-        }
-        a.ins("lda $d015");
-        a.ins("sta rt_d015");
         a.ins("cld");
     }
     if zp_init {
@@ -791,10 +939,12 @@ fn start_exit(zp: u64, hw: bool, exit_used: bool, zp_init: bool, zero: u64) -> S
         return a.text;
     }
     a.ins("jsr rt_main");
-    // Back to BASIC from anywhere: restore the IRQ vector, the CIA
-    // interrupt, the memory configuration, the VIC (except the colours, so
-    // the program's output stays readable), silence the SID, restore the
-    // zero page.
+    // Back to BASIC from anywhere, with the machine as BASIC starts with
+    // it: the memory configuration, the CIAs (timer interrupt on, VIC bank
+    // 0) and the SID's volume (the KERNAL's IOINIT), the VIC's mode and
+    // interrupts ($D011-$D01A from the KERNAL's table of start values; the
+    // colours and the sprites' positions stay, so the program's output
+    // stays readable), the IRQ vector, the zero page.
     a.label("rt_exit");
     if hw {
         a.ins("sei");
@@ -804,23 +954,20 @@ fn start_exit(zp: u64, hw: bool, exit_used: bool, zp_init: bool, zero: u64) -> S
         a.ins("txs");
     }
     if hw {
-        for (i, (reg, at)) in SAVED.iter().enumerate() {
-            a.ins(format!("lda {at}"));
-            a.ins(format!("sta {reg}"));
-            if i == 1 {
-                a.ins("lda #0");
-                a.ins("sta $d01a");
-                a.ins("lda #$ff");
-                a.ins("sta $d019");
-                a.ins("lda #$81");
-                a.ins("sta $dc0d");
-            }
-        }
-        a.ins("lda rt_d015");
-        a.ins("sta $d015");
-        a.ins("lda #0");
-        for reg in ["$d404", "$d40b", "$d412", "$d418"] {
-            a.ins(format!("sta {reg}"));
+        a.ins("lda #$37");
+        a.ins("sta $01");
+        a.ins("jsr $ff84");
+        a.ins("ldx #10");
+        a.raw("@vic:");
+        a.ins("lda $ecc9,x");
+        a.ins("sta $d010,x");
+        a.ins("dex");
+        a.ins("bne @vic");
+        if irq {
+            a.ins("lda #$31");
+            a.ins("sta $0314");
+            a.ins("lda #$ea");
+            a.ins("sta $0315");
         }
         a.ins("cli");
     }
@@ -966,7 +1113,11 @@ fn fn_ptr_entries(p: &mut Program<'_>) -> String {
         }
         // the first three argument bytes also in A, X and Y
         let mut regs: Vec<String> = Vec::new();
+        let unpassed = p.unpassed_of.get(&id).cloned().unwrap_or_default();
         'bytes: for (i, ty) in args.iter().enumerate() {
+            if unpassed.get(i) == Some(&true) {
+                continue;
+            }
             for o in 0..p.cx.layout_of(*ty).size.bytes() {
                 if regs.len() == 3 {
                     break 'bytes;
@@ -1396,6 +1547,43 @@ impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
     }
 }
 
+/// A local at one statement: it is read there, written there, read later,
+/// and read later while it holds a value.
+#[derive(Clone, Copy, Default)]
+struct Point {
+    used: bool,
+    def: bool,
+    live: bool,
+    held: bool,
+    /// A reference to it may exist before the statement.
+    ptr: bool,
+}
+
+/// A local at every statement of the function (per block; the terminator
+/// last).
+struct Flow {
+    points: Vec<Vec<Point>>,
+}
+
+impl Flow {
+    /// Whether this local and `other` cannot share their bytes: one is
+    /// written where the other is read or holds a value that is read
+    /// later. The statement `exempt` is the move between the two.
+    fn clashes(&self, other: &Flow, exempt: Option<Location>) -> bool {
+        for (b, (ra, rb)) in self.points.iter().zip(&other.points).enumerate() {
+            for (i, (a, o)) in ra.iter().zip(rb).enumerate() {
+                if exempt.is_some_and(|e| e.block.as_usize() == b && e.statement_index == i) {
+                    continue;
+                }
+                if a.def && (o.used || o.held) || o.def && (a.used || a.held) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Where a fused comparison goes.
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
@@ -1428,6 +1616,36 @@ struct FnCx<'a, 'tcx> {
     lazy_cand: Vec<bool>,
     /// The defining rvalue of each lazy local.
     lazy_def: Vec<Option<&'tcx Rvalue<'tcx>>>,
+    /// The real locals each lazy local reads.
+    lazy_roots: Vec<Vec<Local>>,
+    /// Temporaries that are built where they go (`forwarded`): the local
+    /// and the offset in it.
+    fwd: Vec<Option<(Local, u64)>>,
+    /// Locals that others share their bytes with (`join_locals`).
+    joined: Vec<bool>,
+    /// Locals that can stay where a call left its result (`result_views`),
+    /// and where that is once the call is compiled.
+    res_cand: Vec<bool>,
+    res_at: Vec<Option<String>>,
+    /// Locals of two bytes whose value always fits one (`narrow_locals`):
+    /// where they are read, the second byte is the constant 0.
+    narrow: Vec<bool>,
+    /// The statement that is being compiled.
+    cur: Option<(BasicBlock, usize)>,
+    /// Statements whose result an earlier one has stored: the other half
+    /// of a division and remainder (see `div_partner`).
+    done: FxIndexSet<(BasicBlock, usize)>,
+    /// Locals that a reference or raw pointer is made to (when asked for).
+    borrowed: Option<Vec<bool>>,
+}
+
+/// The locals that a statement or terminator names.
+struct Mentions(Vec<Local>);
+
+impl<'tcx> Visitor<'tcx> for Mentions {
+    fn visit_local(&mut self, local: Local, _: PlaceContext, _: Location) {
+        self.0.push(local);
+    }
 }
 
 fn compile_fn(p: &mut Program<'_>, id: usize) {
@@ -1471,12 +1689,26 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
         uses: Uses::new(tcx, mir),
         lazy_cand: Vec::new(),
         lazy_def: vec![None; mir.local_decls.len()],
+        lazy_roots: Vec::new(),
+        fwd: vec![None; mir.local_decls.len()],
+        res_cand: Vec::new(),
+        res_at: vec![None; mir.local_decls.len()],
+        narrow: Vec::new(),
+        joined: vec![false; mir.local_decls.len()],
+        cur: None,
+        done: FxIndexSet::default(),
+        borrowed: None,
     };
     let start = f.p.asm.text.len();
     f.addrs = f.addr_locals();
     f.lazy_cand = f.lazy_locals();
+    f.fwd = f.forwarded();
+    f.join_locals();
+    f.res_cand = f.result_views();
+    f.narrow = f.narrow_locals();
     f.body();
     f.finish();
+    f.free_dests();
     let opt = optimize_fn(f.p, &f.p.asm.text[start..].to_owned(), id, &[]);
     f.p.asm.text.truncate(start);
     f.p.asm.text.push_str(&opt);
@@ -1578,15 +1810,33 @@ fn inline_fns(p: &mut Program<'_>, funcs: &mut [Func], mut pinned: std::collecti
     }
     // an inlined function -> the functions that have its text now
     let mut holders: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+    let join = std::env::var_os("RUST64_NO_JOIN").is_none();
     let mut dirty: HashSet<usize> = HashSet::new();
     for c in order {
         let Some(&ci) = index.get(&c) else { continue };
+        // A callee that does not read all the registers its arguments
+        // come in: the loads in this function can go.
+        let spare = callees.get(&c).into_iter().flatten().any(|g| {
+            let taken = match p.arg_bytes.get(g) {
+                Some(0) => 0,
+                Some(1) => 1,
+                Some(2) => 3,
+                _ => 7,
+            };
+            p.entry_regs.get(g).is_some_and(|r| r & taken != taken)
+        });
+        if spare && funcs[ci].live {
+            dirty.insert(c);
+        }
         if dirty.contains(&c) {
             let mut extra: Vec<usize> =
                 holders.iter().filter(|(_, h)| h.len() == 1 && h.contains(&c)).map(|(&d, _)| d).collect();
             extra.sort_unstable();
             let text = funcs[ci].lines.join("\n") + "\n";
             funcs[ci].lines = optimize_fn(p, &text, c, &extra).lines().map(str::to_owned).collect();
+            if !extra.is_empty() {
+                p.merged.push((c, extra));
+            }
         }
         if pinned.contains(&c) {
             continue;
@@ -1610,8 +1860,21 @@ fn inline_fns(p: &mut Program<'_>, funcs: &mut [Func], mut pinned: std::collecti
         for (i, found) in calls {
             let caller = funcs[i].id;
             for site in found.iter().rev() {
-                let text = crate::inline::paste(&body, caller, site.tail);
-                funcs[i].lines.splice(site.line..=site.line, text);
+                let mut text = crate::inline::paste(&body, caller, site.tail);
+                let mut last = site.line;
+                // (a result in memory: the text writes it where it goes)
+                if !site.tail
+                    && join
+                    && let Some(&(_, size)) = p.sigs.get(&c)
+                    && let Some((place, n)) =
+                        crate::inline::result_copy(&funcs[i].lines, site.line, c, caller, size, &|name| {
+                            p.free_dests.get(name) == Some(&true)
+                        })
+                {
+                    text = crate::inline::with_result_at(text, c, &place);
+                    last += n;
+                }
+                funcs[i].lines.splice(site.line..=last, text);
             }
             crate::asm::widen(&mut funcs[i].lines);
             dirty.insert(caller);
@@ -1625,6 +1888,173 @@ fn inline_fns(p: &mut Program<'_>, funcs: &mut [Func], mut pinned: std::collecti
         }
         holders.insert(c, into);
     }
+}
+
+/// The arguments of `inst` that are not passed: references to values
+/// without bytes (`&mut Console`, the `self` of a type that only has
+/// methods) which the function does nothing with but hand them on. Such a
+/// reference would take the registers that the other arguments can use.
+///
+/// "Nothing but hand them on": the argument (and copies and reborrows of
+/// it) is only dereferenced, which reads and writes nothing, or passed to
+/// functions that do not take it either. A function that looks at the
+/// address itself (a cast, a comparison, storing or returning it) gets it.
+fn unpassed_args<'tcx>(p: &mut Program<'tcx>, inst: Instance<'tcx>) -> Vec<bool> {
+    let tcx = p.tcx;
+    match p.unpassed.get(&inst) {
+        Some(Some(v)) => return v.clone(),
+        // (a function that calls itself)
+        Some(None) => return Vec::new(),
+        None => {}
+    }
+    let def_id = inst.def_id();
+    let plain = matches!(inst.def, InstanceKind::Item(_))
+        && !tcx.is_foreign_item(def_id)
+        && !tcx.is_closure_like(def_id)
+        && tcx.is_mir_available(def_id);
+    if !plain {
+        p.unpassed.insert(inst, Some(Vec::new()));
+        return Vec::new();
+    }
+    p.unpassed.insert(inst, None);
+    let mir = tcx.instance_mir(inst.def);
+    let mono = |ty: Ty<'tcx>| {
+        inst.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            TypingEnv::fully_monomorphized(),
+            ty::EarlyBinder::bind(tcx, ty),
+        )
+    };
+    struct Whole<'a> {
+        set: &'a [bool],
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Whole<'_> {
+        fn visit_place(&mut self, place: &Place<'tcx>, ctx: PlaceContext, loc: Location) {
+            if matches!(ctx, PlaceContext::NonUse(_)) {
+                return;
+            }
+            // behind the reference there is nothing
+            if self.set[place.local.as_usize()] && place.projection.first() != Some(&ProjectionElem::Deref) {
+                self.found = true;
+            }
+            self.super_projection(place.as_ref(), ctx, loc);
+        }
+        fn visit_local(&mut self, local: Local, ctx: PlaceContext, _: Location) {
+            if !matches!(ctx, PlaceContext::NonUse(_)) && self.set[local.as_usize()] {
+                self.found = true;
+            }
+        }
+    }
+    let n = mir.local_decls.len();
+    let mut out = vec![false; mir.arg_count];
+    if mir.spread_arg.is_none() {
+        for arg in 1..=mir.arg_count {
+            let ty = mono(mir.local_decls[Local::from_usize(arg)].ty);
+            let ty::Ref(_, to, _) = *ty.kind() else { continue };
+            if !to.is_sized(tcx, TypingEnv::fully_monomorphized()) || p.cx.layout_of(to).size.bytes() != 0 {
+                continue;
+            }
+            // the argument and the locals that are copies or reborrows of it
+            let mut set = vec![false; n];
+            set[arg] = true;
+            let own = |l: Local| l.as_usize() > mir.arg_count;
+            let mut ok = true;
+            let mut grown = true;
+            while grown && ok {
+                grown = false;
+                for (bb, data) in mir.basic_blocks.iter_enumerated() {
+                    if data.is_cleanup {
+                        continue;
+                    }
+                    for (i, stmt) in data.statements.iter().enumerate() {
+                        let loc = Location { block: bb, statement_index: i };
+                        if let StatementKind::Assign(b) = &stmt.kind {
+                            let (dest, rv) = &**b;
+                            let from = match rv {
+                                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _)
+                                    if src.projection.is_empty() && set[src.local.as_usize()] =>
+                                {
+                                    true
+                                }
+                                Rvalue::Ref(_, _, src)
+                                    if set[src.local.as_usize()]
+                                        && src.projection.first() == Some(&ProjectionElem::Deref) =>
+                                {
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if from {
+                                if !dest.projection.is_empty() || !own(dest.local) {
+                                    ok = false;
+                                } else if !set[dest.local.as_usize()] {
+                                    set[dest.local.as_usize()] = true;
+                                    grown = true;
+                                }
+                                continue;
+                            }
+                            // (a raw pointer is the address)
+                            if matches!(rv, Rvalue::RawPtr(_, src) if set[src.local.as_usize()]) {
+                                ok = false;
+                            }
+                        }
+                        let mut w = Whole { set: &set, found: false };
+                        w.visit_statement(stmt, loc);
+                        ok &= !w.found;
+                    }
+                    let term = data.terminator();
+                    let loc = Location { block: bb, statement_index: data.statements.len() };
+                    match &term.kind {
+                        TerminatorKind::Call { func, args, destination, .. } => {
+                            let mut w = Whole { set: &set, found: false };
+                            w.visit_operand(func, loc);
+                            w.visit_place(destination, PlaceContext::MutatingUse(MutatingUseContext::Call), loc);
+                            ok &= !w.found;
+                            // the function that is called, if it is one of
+                            // the program's
+                            let callee = match *mono(func.ty(mir, tcx)).kind() {
+                                ty::FnDef(d, fargs) => Some(Instance::expect_resolve(
+                                    tcx,
+                                    TypingEnv::fully_monomorphized(),
+                                    d,
+                                    fargs.skip_binder(),
+                                    term.source_info.span,
+                                )),
+                                _ => None,
+                            };
+                            for (j, a) in args.iter().enumerate() {
+                                match &a.node {
+                                    Operand::Copy(src) | Operand::Move(src)
+                                        if src.projection.is_empty() && set[src.local.as_usize()] =>
+                                    {
+                                        let taken = match callee {
+                                            Some(c) => unpassed_args(p, c).get(j) != Some(&true),
+                                            None => true,
+                                        };
+                                        ok &= !taken;
+                                    }
+                                    o => {
+                                        let mut w = Whole { set: &set, found: false };
+                                        w.visit_operand(o, loc);
+                                        ok &= !w.found;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            let mut w = Whole { set: &set, found: false };
+                            w.visit_terminator(term, loc);
+                            ok &= !w.found;
+                        }
+                    }
+                }
+            }
+            out[arg - 1] = ok;
+        }
+    }
+    p.unpassed.insert(inst, Some(out.clone()));
+    out
 }
 
 /// The assembly-level passes over the text of one function. `extra` are
@@ -1642,7 +2072,48 @@ fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> S
         base += other.values().map(|&(o, n)| o + n).max().unwrap_or(0);
     }
     let mut opt = crate::asm::forward(&opt, id, &layout, args_end, &mut |l, o| const_byte(p, l, o));
+    let mut found = None;
     if std::env::var_os("RUST64_NO_OPT").is_none() {
+        // The data-flow pass follows every byte of the frame at every point
+        // of the function. Large locals (arrays) would make that slow and
+        // gain little: they are left out, which makes them memory like any
+        // other for the pass. The bytes that are left move together.
+        let layout = {
+            const LARGE: u64 = 64;
+            let kept = |name: &str, n: u64| n <= LARGE || name.ends_with('t');
+            let mut spans: Vec<(u64, u64)> =
+                layout.iter().filter(|(name, v)| kept(name, v.1)).map(|(_, &v)| v).collect();
+            spans.sort_unstable();
+            spans.dedup();
+            // old start -> new start of each run of bytes that are kept
+            let mut runs: Vec<(u64, u64, u64)> = Vec::new();
+            let mut next = 0;
+            for (o, n) in spans {
+                match runs.last_mut() {
+                    Some((start, end, _)) if o < *end => {
+                        let _ = start;
+                        if o + n > *end {
+                            next += o + n - *end;
+                            *end = o + n;
+                        }
+                    }
+                    _ => {
+                        runs.push((o, o + n, next));
+                        next += n;
+                    }
+                }
+            }
+            let moved = |o: u64| {
+                let &(start, _, new) = runs.iter().rev().find(|r| r.0 <= o).unwrap();
+                new + o - start
+            };
+            let tracked: crate::asm::FrameLayout = layout
+                .iter()
+                .filter(|(name, v)| kept(name, v.1))
+                .map(|(name, &(o, n))| (name.clone(), (moved(o), n)))
+                .collect();
+            tracked
+        };
         // Statics at a fixed address may be hardware registers.
         let tcx = p.tcx;
         let statics = &p.statics;
@@ -1690,6 +2161,11 @@ fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> S
             None if sym.starts_with("rt_") => Some(0),
             None => None,
         };
+        let entry_regs = &p.entry_regs;
+        let call_reads = |sym: &str| {
+            sym.strip_prefix('F').and_then(|n| n.parse::<usize>().ok()).and_then(|n| entry_regs.get(&n).copied())
+        };
+        let mut entry = None;
         for _ in 0..4 {
             let next = crate::asm::relax(&crate::opt::optimize(
                 &crate::asm::relax(&opt),
@@ -1698,13 +2174,22 @@ fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> S
                 &is_io,
                 &is_const,
                 &call_args,
+                &call_reads,
+                &mut entry,
             ));
             if next == opt {
                 break;
             }
+            // (what the last run found belongs to the text before it)
+            entry = None;
             opt = next;
         }
+        found = entry;
     }
+    match found {
+        Some(regs) => p.entry_regs.insert(id, regs),
+        None => p.entry_regs.swap_remove(&id),
+    };
     crate::asm::peephole(&crate::asm::relax(&opt))
 }
 
@@ -1748,13 +2233,13 @@ fn ctx_save(c: PtrCtx) -> String {
         copy(&mut a, "rt_jvec", "rt_ctxbuf+262", "2", false);
         // Assembly functions may use the arithmetic registers too.
         if c.arith || c.foreign {
-            copy(&mut a, "rt_save", "rt_ctxbuf", "rt_args-rt_save", false);
+            copy(&mut a, "rt_save", "rt_ctxbuf", "rt_save_n", false);
         }
         if c.calls {
-            copy(&mut a, "rt_args", "rt_ctxbuf+rt_args-rt_save", "rt_save_end-rt_args", false);
+            copy(&mut a, "rt_args", "rt_ctxbuf+39", "48", false);
         }
         if c.foreign {
-            copy(&mut a, "rt_fsave", "rt_ctxbuf+rt_save_end-rt_save", "rt_fsave_end-rt_fsave", true);
+            copy(&mut a, "rt_fsave", "rt_ctxbuf+87", "rt_fsave_end-rt_fsave", true);
         }
         a.ins("rts");
     }
@@ -1804,12 +2289,25 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
     /// The label of a local's storage (`F<id>v<n>`, defined in `finish`).
     fn local_name(&self, l: Local) -> String {
-        format!("F{}v{}", self.id, l.as_usize())
+        // (a result that is read where the call left it)
+        if let Some(Some(at)) = self.res_at.get(l.as_usize()) {
+            return at.clone();
+        }
+        match self.fwd.get(l.as_usize()) {
+            // (a temporary that is built where it goes)
+            Some(&Some((d, 0))) => format!("F{}v{}", self.id, d.as_usize()),
+            Some(&Some((d, off))) => format!("F{}v{}+{off}", self.id, d.as_usize()),
+            _ => format!("F{}v{}", self.id, l.as_usize()),
+        }
     }
 
     /// The address of a local; marks its storage as used.
     fn local_addr(&self, l: Local) -> String {
-        self.touched.borrow_mut()[l.as_usize()] = true;
+        let at = match self.fwd.get(l.as_usize()) {
+            Some(&Some((d, _))) => d,
+            _ => l,
+        };
+        self.touched.borrow_mut()[at.as_usize()] = true;
         self.local_name(l)
     }
 
@@ -1837,7 +2335,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let touched = self.touched.borrow().clone();
         for (l, _) in self.mir.local_decls.iter_enumerated() {
             let i = l.as_usize();
-            if i > self.mir.arg_count && !touched[i] {
+            if i > self.mir.arg_count && !touched[i] || self.fwd[i].is_some() {
                 continue;
             }
             let size = self.layout(self.local_ty(l)).size.bytes();
@@ -1870,8 +2368,13 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         // go in `opt.rs`.)
         let mut k = 0;
         let mut total = 0;
+        let unpassed = unpassed_args(self.p, self.inst);
+        self.p.unpassed_of.insert(self.id, unpassed.clone());
         for l in 1..=self.mir.arg_count {
             let local = Local::from_usize(l);
+            if unpassed.get(l - 1) == Some(&true) {
+                continue;
+            }
             let size = self.layout(self.local_ty(local)).size.bytes();
             total += size;
             for o in 0..size {
@@ -1896,18 +2399,44 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             let term = data.terminator();
             let next = order.get(k + 1).copied();
             let fused = self.fusable(bb);
+            let niche = self.niche_switch(bb);
             for (i, stmt) in data.statements.iter().enumerate() {
-                if fused.is_some_and(|(k, ..)| k == i) {
+                if fused.is_some_and(|(k, also, ..)| k == i || also == Some(i)) {
+                    continue;
+                }
+                if niche.is_some_and(|(k, ..)| k == i) {
+                    continue;
+                }
+                if self.done.contains(&(bb, i)) {
                     continue;
                 }
                 self.span = stmt.source_info.span;
                 self.temp_cur = 0;
+                self.cur = Some((bb, i));
                 self.statement(&stmt.kind);
             }
+            self.cur = None;
             self.span = term.source_info.span;
             self.temp_cur = 0;
-            if let Some((_, op, x, y, t_true, t_false)) = fused {
+            if let Some((i, _, op, x, y, Target::Block(t), Target::Panic)) = fused
+                && self.implied(bb, i, op, x, y)
+            {
+                // (a check that the branch into this block has made)
+                self.goto(t, next);
+            } else if let Some((_, _, op, x, y, t_true, t_false)) = fused {
                 self.branch_on(op, x, y, t_true, t_false, next);
+            } else if let Some((_, place, start, t_niche, t_other)) = niche {
+                // the tag is the niche value, or the variant with the data
+                let (a, l, _) = self.place(place);
+                let Variants::Multiple { tag_field, .. } = &l.variants else { unreachable!() };
+                let v = Val::Mem(a.offset(l.fields.offset(tag_field.as_usize()).bytes()));
+                let a = &mut self.p.asm;
+                a.setup_val(&v, 0);
+                a.lda(&v, 0, 0);
+                if start != 0 {
+                    a.ins(format!("cmp #${start:02x}"));
+                }
+                self.two_way("beq", "bne", Target::Block(t_niche), Target::Block(t_other), next);
             } else {
                 self.terminator(&term.kind, next);
             }
@@ -2262,7 +2791,12 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 }
                 let def = Location { block: bb, statement_index: i };
                 let size = self.layout(self.local_ty(place.local)).size.bytes();
-                if size == 0 || size > 16 {
+                if size == 0 {
+                    continue;
+                }
+                // A large value is only a view of one place: it is where
+                // that is (a view of parts would be copied byte by byte).
+                if size > 16 && !matches!(rv, Rvalue::Use(Operand::Copy(_) | Operand::Move(_), _)) {
                     continue;
                 }
                 let Some(ops) = self.view_operands(place.local, rv) else { continue };
@@ -2291,9 +2825,22 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let u = &self.uses;
                 let uses: rustc_data_structures::fx::FxHashSet<Location> =
                     u.use_locs[t].iter().copied().collect();
+                // A local that is borrowed can change through a pointer:
+                // a view of it holds only up to uses in the same block,
+                // with nothing in between that stores through a pointer
+                // (a call ends the block).
+                let near = uses.iter().all(|l| l.block == bb && l.statement_index > i)
+                    && uses.iter().map(|l| l.statement_index).max().is_some_and(|last| {
+                        data.statements.iter().take(last + 1).skip(i + 1).all(|s| match &s.kind {
+                            StatementKind::Assign(b) => !b.0.is_indirect(),
+                            StatementKind::SetDiscriminant { place, .. } => !place.is_indirect(),
+                            StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => true,
+                            _ => false,
+                        })
+                    });
                 for r in &my_roots {
                     let r = r.as_usize();
-                    if u.borrowed[r]
+                    if u.borrowed[r] && !near
                         || u.def_locs[r].iter().any(|&d| d != def && self.reaches_use(d, def, &uses))
                     {
                         ok = false;
@@ -2308,7 +2855,718 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.lazy_def[t] = Some(rv);
             }
         }
+        self.lazy_roots = roots;
         cand
+    }
+
+    /// Results that are read where the called function left them: a local
+    /// of more than three bytes (a result in memory) whose only assignment
+    /// is a call, and that is only read before the next call. The result
+    /// area of a function keeps its contents until something is called
+    /// (frames of functions that are not active at the same time share
+    /// memory), so the copy into the local is not needed.
+    ///
+    /// "Read" includes the views of the local (`lazy_locals`). The
+    /// arguments of the next call do not count as "before" it: they are
+    /// written into another frame.
+    fn result_views(&self) -> Vec<bool> {
+        struct Reads(Vec<(Local, Location)>);
+        impl<'tcx> Visitor<'tcx> for Reads {
+            fn visit_local(&mut self, local: Local, ctx: PlaceContext, loc: Location) {
+                if !matches!(ctx, PlaceContext::NonUse(_)) {
+                    self.0.push((local, loc));
+                }
+            }
+        }
+        let mir = self.mir;
+        let n = mir.local_decls.len();
+        let u = &self.uses;
+        let mut cand = vec![false; n];
+        let mut reads = Reads(Vec::new());
+        reads.visit_body(mir);
+        let clobbers = |bb: BasicBlock| {
+            matches!(
+                mir.basic_blocks[bb].terminator().kind,
+                TerminatorKind::Call { .. } | TerminatorKind::Drop { .. } | TerminatorKind::TailCall { .. }
+            )
+        };
+        let preds = mir.basic_blocks.predecessors();
+        for (bb, data) in mir.basic_blocks.iter_enumerated() {
+            let TerminatorKind::Call { destination, target: Some(target), .. } = &data.terminator().kind else {
+                continue;
+            };
+            let t = destination.local.as_usize();
+            if !destination.projection.is_empty()
+                || t == 0
+                || t <= mir.arg_count
+                || u.defs[t] != 1
+                || u.borrowed[t]
+                || self.lazy_cand[t]
+                || self.addrs[t].is_some()
+                || self.fwd[t].is_some()
+                || self.joined[t]
+                || self.layout(self.local_ty(destination.local)).size.bytes() <= 3
+            {
+                continue;
+            }
+            // Where the result is still there at the start of each block:
+            // true until shown otherwise, false at the entry.
+            let mut valid = vec![true; mir.basic_blocks.len()];
+            valid[0] = false;
+            let out = |valid: &[bool], p: BasicBlock, to: BasicBlock| {
+                if p == bb {
+                    to == *target
+                } else {
+                    valid[p.as_usize()] && !clobbers(p)
+                }
+            };
+            loop {
+                let mut changed = false;
+                for b in mir.basic_blocks.indices() {
+                    let i = b.as_usize();
+                    if valid[i] && (i == 0 || !preds[b].iter().all(|&p| out(&valid, p, b))) {
+                        valid[i] = false;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            let ok = reads.0.iter().all(|&(l, loc)| {
+                let mine = l == destination.local
+                    || self.lazy_roots.get(l.as_usize()).is_some_and(|r| r.contains(&destination.local));
+                if !mine {
+                    return true;
+                }
+                let stmts = mir.basic_blocks[loc.block].statements.len();
+                // (the call's own destination is its write)
+                if loc.block == bb && loc.statement_index == stmts {
+                    return l == destination.local && !self.call_reads(data.terminator(), destination.local);
+                }
+                valid[loc.block.as_usize()] && (loc.statement_index < stmts || !clobbers(loc.block))
+            });
+            cand[t] = ok;
+        }
+        cand
+    }
+
+    /// Whether the call reads `l` (as an argument or as the function).
+    fn call_reads(&self, term: &Terminator<'tcx>, l: Local) -> bool {
+        let TerminatorKind::Call { func, args, .. } = &term.kind else { return true };
+        let reads = |o: &Operand<'tcx>| matches!(o, Operand::Copy(p) | Operand::Move(p) if p.local == l);
+        reads(func) || args.iter().any(|a| reads(&a.node))
+    }
+
+    /// Temporaries that are built where they go: a local of four bytes or
+    /// more that is assigned once and used once, further on in the same
+    /// block, as the whole value or as a field of an assignment to (a
+    /// field of) another local. It gets no storage of its own: its bytes
+    /// are that part of the other local, and the assignment has nothing to
+    /// copy for it.
+    ///
+    /// From the definition to the use nothing may name the other local
+    /// (its bytes are in use for the temporary), neither directly nor as a
+    /// view; if a reference to it exists, nothing may go through a pointer
+    /// there either.
+    fn forwarded(&self) -> Vec<Option<(Local, u64)>> {
+        struct Scan {
+            named: Vec<Local>,
+            indirect: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Scan {
+            fn visit_place(&mut self, place: &Place<'tcx>, ctx: PlaceContext, loc: Location) {
+                self.indirect |= place.is_indirect();
+                self.super_place(place, ctx, loc);
+            }
+            fn visit_local(&mut self, local: Local, _: PlaceContext, _: Location) {
+                self.named.push(local);
+            }
+        }
+        let n = self.mir.local_decls.len();
+        let mut fwd: Vec<Option<(Local, u64)>> = vec![None; n];
+        let mut targets = vec![false; n];
+        let u = &self.uses;
+        for (bb, data) in self.mir.basic_blocks.iter_enumerated() {
+            if data.is_cleanup {
+                continue;
+            }
+            for (i, stmt) in data.statements.iter().enumerate() {
+                let StatementKind::Assign(b) = &stmt.kind else { continue };
+                let (place, _) = &**b;
+                let t = place.local.as_usize();
+                if !place.projection.is_empty()
+                    || t == 0
+                    || t <= self.mir.arg_count
+                    || u.defs[t] != 1
+                    || u.uses[t] != 1
+                    || u.plain[t] != 1
+                    || u.borrowed[t]
+                    || self.lazy_cand[t]
+                    || self.addrs[t].is_some()
+                    || self.consts[t].is_some()
+                    || targets[t]
+                    || self.layout(self.local_ty(place.local)).size.bytes() < 4
+                {
+                    continue;
+                }
+                let Some(at) = u.plain_loc[t] else { continue };
+                if at.block != bb || at.statement_index <= i || at.statement_index >= data.statements.len() {
+                    continue;
+                }
+                let j = at.statement_index;
+                let StatementKind::Assign(ub) = &data.statements[j].kind else { continue };
+                let (dest, rv) = &**ub;
+                let d = dest.local.as_usize();
+                let Some((base, dl)) = self.field_offset(*dest) else { continue };
+                if d == t || self.lazy_cand[d] || self.addrs[d].is_some() || fwd[d].is_some() {
+                    continue;
+                }
+                let is_t = |o: &Operand<'tcx>| {
+                    matches!(o, Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() && p.local == place.local)
+                };
+                let off = match rv {
+                    Rvalue::Use(op, _) if is_t(op) => 0,
+                    Rvalue::Aggregate(kind, ops) => {
+                        let Some((fi, _)) = ops.iter_enumerated().find(|(_, o)| is_t(o)) else { continue };
+                        match &**kind {
+                            AggregateKind::Adt(_, variant, _, _, None) => {
+                                dl.for_variant(&self.p.cx, *variant).fields.offset(fi.as_usize()).bytes()
+                            }
+                            AggregateKind::Tuple | AggregateKind::Closure(..) => dl.fields.offset(fi.as_usize()).bytes(),
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                };
+                let mut scan = Scan { named: Vec::new(), indirect: false };
+                for (k, s) in data.statements.iter().enumerate().take(j).skip(i) {
+                    scan.visit_statement(s, Location { block: bb, statement_index: k });
+                }
+                scan.visit_rvalue(rv, at);
+                // (the destination itself may be behind nothing but fields)
+                let clash = scan.named.iter().any(|m| {
+                    *m == dest.local || self.lazy_roots.get(m.as_usize()).is_some_and(|r| r.contains(&dest.local))
+                });
+                if clash || u.borrowed[d] && scan.indirect {
+                    continue;
+                }
+                fwd[t] = Some((dest.local, base + off));
+                targets[d] = true;
+            }
+        }
+        fwd
+    }
+
+    /// Locals that share their bytes: where a value of four bytes or more
+    /// is moved from one local to another (`d = move r.0`, `_0 = Some(move
+    /// e)`, `x = move y`), the smaller one lives in the larger one if the
+    /// two are never in use at the same time with different contents. The
+    /// move then has nothing to copy. The result is in `fwd`, like the
+    /// temporaries of `forwarded`.
+    ///
+    /// "In use at the same time": one of them is written (also through a
+    /// pointer, if a reference to it exists) where the other one is read
+    /// by the same statement, or holds a value that is read later. A local
+    /// that a reference exists to counts as read until its storage ends or
+    /// it is moved away as a whole. Locals that already share bytes are
+    /// checked each against each.
+    fn join_locals(&mut self) {
+        if std::env::var_os("RUST64_NO_JOIN").is_some() {
+            return;
+        }
+        let mir = self.mir;
+        let blocks = &mir.basic_blocks;
+        let n = mir.local_decls.len();
+        let sizes: Vec<u64> = (0..n).map(|l| self.layout(self.local_ty(Local::from_usize(l))).size.bytes()).collect();
+        let eligible = |l: Local| {
+            let i = l.as_usize();
+            sizes[i] >= 4 && !self.lazy_cand[i] && self.addrs[i].is_none() && self.consts[i].is_none()
+        };
+        let pinned = |l: Local| l.as_usize() <= mir.arg_count;
+        // A local that is a view of a part of another one (`lazy_locals`):
+        // that one, and the offset there.
+        let view = |mut l: Local, mut off: u64| -> (Local, u64) {
+            for _ in 0..4 {
+                if !self.lazy_cand[l.as_usize()] {
+                    break;
+                }
+                let Some(Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)) = self.lazy_def[l.as_usize()] else {
+                    break;
+                };
+                let Some((o, _)) = self.field_offset(*src) else { break };
+                l = src.local;
+                off += o;
+            }
+            (l, off)
+        };
+        // the moves: the local that would live in the other one, the other
+        // one, the offset there, and the statement
+        let mut moves: Vec<(Local, Local, u64, Location)> = Vec::new();
+        for (bb, data) in blocks.iter_enumerated() {
+            if data.is_cleanup {
+                continue;
+            }
+            for (i, stmt) in data.statements.iter().enumerate() {
+                let StatementKind::Assign(b) = &stmt.kind else { continue };
+                let (dest, rv) = &**b;
+                let loc = Location { block: bb, statement_index: i };
+                let bare = |o: &Operand<'tcx>| match o {
+                    Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => Some(p.local),
+                    _ => None,
+                };
+                // `len` bytes at `so` of `sl` go to `d0` of `dl`: one of
+                // the two is all of its local
+                let mut relate = |sl: Local, so: u64, dl: Local, d0: u64, len: u64| {
+                    if so == 0 && len == sizes[sl.as_usize()] {
+                        moves.push((sl, dl, d0, loc));
+                    } else if d0 == 0 && len == sizes[dl.as_usize()] {
+                        moves.push((dl, sl, so, loc));
+                    }
+                };
+                match rv {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..) => {
+                        if let (Some((d0, l)), Some((so, _))) = (self.field_offset(*dest), self.field_offset(*src)) {
+                            let (sl, so) = view(src.local, so);
+                            relate(sl, so, dest.local, d0, l.size.bytes());
+                        }
+                    }
+                    Rvalue::Aggregate(kind, ops) => {
+                        let Some((base, dl)) = self.field_offset(*dest) else { continue };
+                        for (fi, o) in ops.iter_enumerated() {
+                            let Some(src) = bare(o) else { continue };
+                            let off = match &**kind {
+                                AggregateKind::Adt(_, variant, _, _, None) => {
+                                    dl.for_variant(&self.p.cx, *variant).fields.offset(fi.as_usize()).bytes()
+                                }
+                                AggregateKind::Tuple | AggregateKind::Closure(..) => {
+                                    dl.fields.offset(fi.as_usize()).bytes()
+                                }
+                                _ => continue,
+                            };
+                            let (sl, so) = view(src, 0);
+                            relate(sl, so, dest.local, base + off, sizes[src.as_usize()]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if moves.is_empty() {
+            return;
+        }
+        let mut flows: Vec<Option<Flow>> = (0..n).map(|_| None).collect();
+        let trace = std::env::var_os("RUST64_JOIN_TRACE").is_some();
+        let mut fwd = self.fwd.clone();
+        let mut any = false;
+        for (sub, sup, off, at) in moves {
+            if trace {
+                eprintln!(
+                    "join F{}: {sub:?} in {sup:?}+{off} at {at:?} (eligible {} {})",
+                    self.id,
+                    eligible(sub),
+                    eligible(sup)
+                );
+            }
+            if sub == sup || !eligible(sub) || !eligible(sup) || off + sizes[sub.as_usize()] > sizes[sup.as_usize()] {
+                continue;
+            }
+            let place = |fwd: &[Option<(Local, u64)>], l: Local| fwd[l.as_usize()].unwrap_or((l, 0));
+            let (rs, os) = place(&fwd, sub);
+            let (rp, op) = place(&fwd, sup);
+            if rs == rp {
+                continue;
+            }
+            // where the group of `sub` starts in the group of `sup`
+            let delta = (op + off) as i64 - os as i64;
+            let (root, moving, shift) = if delta >= 0
+                && delta as u64 + sizes[rs.as_usize()] <= sizes[rp.as_usize()]
+                && !pinned(rs)
+            {
+                (rp, rs, delta as u64)
+            } else if delta <= 0 && (-delta) as u64 + sizes[rp.as_usize()] <= sizes[rs.as_usize()] && !pinned(rp) {
+                (rs, rp, (-delta) as u64)
+            } else {
+                continue;
+            };
+            let members = |fwd: &[Option<(Local, u64)>], r: Local| -> Vec<(Local, u64)> {
+                let mut m = vec![(r, 0)];
+                m.extend(fwd.iter().enumerate().filter_map(|(i, f)| match f {
+                    Some((d, o)) if *d == r => Some((Local::from_usize(i), *o)),
+                    _ => None,
+                }));
+                m
+            };
+            let stay = members(&fwd, root);
+            let go = members(&fwd, moving);
+            let mut ok = true;
+            'pairs: for &(a, ao) in &go {
+                for &(b, bo) in &stay {
+                    let (a0, a1) = (ao + shift, ao + shift + sizes[a.as_usize()]);
+                    let (b0, b1) = (bo, bo + sizes[b.as_usize()]);
+                    if a0 >= b1 || b0 >= a1 {
+                        continue;
+                    }
+                    for l in [a, b] {
+                        if flows[l.as_usize()].is_none() {
+                            flows[l.as_usize()] = Some(self.flow(l));
+                        }
+                    }
+                    let (fa, fb) = (flows[a.as_usize()].as_ref().unwrap(), flows[b.as_usize()].as_ref().unwrap());
+                    let exempt = ((a == sub && b == sup) || (a == sup && b == sub)).then_some(at);
+                    if fa.clashes(fb, exempt) {
+                        if trace {
+                            for (bi, (ra, rb)) in fa.points.iter().zip(&fb.points).enumerate() {
+                                for (i, (x, y)) in ra.iter().zip(rb).enumerate() {
+                                    if x.def && (y.used || y.held) || y.def && (x.used || x.held) {
+                                        eprintln!(
+                                            "  {a:?}/{b:?} clash at bb{bi}[{i}]: def {} {} used {} {} held {} {}",
+                                            x.def, y.def, x.used, y.used, x.held, y.held
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        ok = false;
+                        break 'pairs;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            for (l, o) in go {
+                fwd[l.as_usize()] = Some((root, o + shift));
+            }
+            self.joined[root.as_usize()] = true;
+            self.joined[moving.as_usize()] = false;
+            any = true;
+        }
+        if any {
+            for l in 0..n {
+                if self.joined[l] {
+                    self.touched.borrow_mut()[l] = true;
+                }
+            }
+            // (addresses that were noted before: by the new names)
+            let id = self.id;
+            for a in self.addrs.iter_mut().flatten() {
+                let (base, rest) = match a.split_once('+') {
+                    Some((b, r)) => (b, Some(r)),
+                    None => (a.as_str(), None),
+                };
+                let Some(l) = base.strip_prefix(&format!("F{id}v")).and_then(|r| r.parse::<usize>().ok()) else {
+                    continue;
+                };
+                let Some((root, off)) = fwd.get(l).copied().flatten() else { continue };
+                let extra = match rest {
+                    None => Some(0),
+                    Some(r) => r.split('+').map(|t| t.parse::<u64>().ok()).sum::<Option<u64>>(),
+                };
+                *a = match extra {
+                    Some(e) if off + e == 0 => format!("F{id}v{}", root.as_usize()),
+                    Some(e) => format!("F{id}v{}+{}", root.as_usize(), off + e),
+                    None => format!("F{id}v{}+{off}+{}", root.as_usize(), rest.unwrap_or("0")),
+                };
+            }
+            self.fwd = fwd;
+        }
+    }
+
+    /// Notes for each local of four bytes or more that a call writes its
+    /// result to whether no reference to it (or to a local that shares
+    /// its bytes) can exist at the call. If the function that is called is
+    /// later pasted into this one, it can then write its result there
+    /// itself (`inline::result_copy`).
+    fn free_dests(&mut self) {
+        let mir = self.mir;
+        let n = mir.local_decls.len();
+        let mut flows: Vec<Option<Flow>> = (0..n).map(|_| None).collect();
+        for (bb, data) in mir.basic_blocks.iter_enumerated() {
+            let TerminatorKind::Call { destination, .. } = &data.terminator().kind else { continue };
+            let d = destination.local;
+            if !destination.projection.is_empty() || self.layout(self.local_ty(d)).size.bytes() < 4 {
+                continue;
+            }
+            let root = self.fwd[d.as_usize()].map_or(d, |f| f.0);
+            let mut free = true;
+            for l in 0..n {
+                if l != root.as_usize() && self.fwd[l].map(|f| f.0) != Some(root) {
+                    continue;
+                }
+                if flows[l].is_none() {
+                    flows[l] = Some(self.flow(Local::from_usize(l)));
+                }
+                free &= !flows[l].as_ref().unwrap().points[bb.as_usize()][data.statements.len()].ptr;
+            }
+            let name = format!("F{}v{}", self.id, root.as_usize());
+            let all = self.p.free_dests.entry(name).or_insert(true);
+            *all &= free;
+        }
+    }
+
+    /// Where a local is written and read, and where it holds a value that
+    /// is read later (see `join_locals`).
+    fn flow(&self, l: Local) -> Flow {
+        struct Touch<'a> {
+            l: Local,
+            lazy: &'a [bool],
+            roots: &'a [Vec<Local>],
+            used: bool,
+            def: bool,
+            full: bool,
+            borrow: bool,
+            raw: bool,
+            moved: bool,
+            dead: bool,
+            /// Something is read or written through a pointer.
+            deref: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Touch<'_> {
+            fn visit_place(&mut self, place: &Place<'tcx>, ctx: PlaceContext, loc: Location) {
+                self.super_projection(place.as_ref(), ctx, loc);
+                if matches!(ctx, PlaceContext::NonUse(_)) {
+                    return;
+                }
+                self.deref |= place.is_indirect();
+                let base = place.local;
+                if base != self.l {
+                    // (a view of the local is read where it is used)
+                    if self.lazy.get(base.as_usize()) == Some(&true)
+                        && self.roots.get(base.as_usize()).is_some_and(|r| r.contains(&self.l))
+                    {
+                        self.used = true;
+                    }
+                    return;
+                }
+                if place.projection.first() == Some(&ProjectionElem::Deref) {
+                    self.used = true;
+                    return;
+                }
+                match ctx {
+                    PlaceContext::MutatingUse(MutatingUseContext::Borrow)
+                    | PlaceContext::NonMutatingUse(
+                        NonMutatingUseContext::SharedBorrow | NonMutatingUseContext::FakeBorrow,
+                    ) => {
+                        self.borrow = true;
+                        self.used = true;
+                    }
+                    PlaceContext::MutatingUse(MutatingUseContext::RawBorrow)
+                    | PlaceContext::NonMutatingUse(NonMutatingUseContext::RawBorrow) => {
+                        self.borrow = true;
+                        self.raw = true;
+                        self.used = true;
+                    }
+                    PlaceContext::MutatingUse(
+                        MutatingUseContext::Store
+                        | MutatingUseContext::Call
+                        | MutatingUseContext::AsmOutput
+                        | MutatingUseContext::Yield,
+                    ) => {
+                        self.def = true;
+                        self.full |= place.projection.is_empty();
+                    }
+                    PlaceContext::MutatingUse(_) => {
+                        self.used = true;
+                        self.def = true;
+                    }
+                    PlaceContext::NonMutatingUse(NonMutatingUseContext::Move) if place.projection.is_empty() => {
+                        self.used = true;
+                        self.moved = true;
+                    }
+                    _ => self.used = true,
+                }
+            }
+            fn visit_local(&mut self, local: Local, ctx: PlaceContext, loc: Location) {
+                match ctx {
+                    PlaceContext::NonUse(rustc_middle::mir::visit::NonUseContext::StorageDead) => self.dead |= local == self.l,
+                    PlaceContext::NonUse(_) => {}
+                    _ => self.visit_place(&Place::from(local), ctx, loc),
+                }
+            }
+        }
+        let mir = self.mir;
+        let blocks = &mir.basic_blocks;
+        let preds = blocks.predecessors();
+        let nb = blocks.len();
+        // per block and statement (the terminator last): the facts
+        #[derive(Clone, Copy, Default)]
+        struct At {
+            used: bool,
+            def: bool,
+            full: bool,
+            borrow: bool,
+            ends: bool,
+            /// Something may be written, or read, through a pointer.
+            indirect: bool,
+            deref: bool,
+        }
+        let mut at: Vec<Vec<At>> = Vec::with_capacity(nb);
+        let mut raw = false;
+        let mut moved: Vec<Vec<bool>> = Vec::with_capacity(nb);
+        for (bb, data) in blocks.iter_enumerated() {
+            let mut row = Vec::with_capacity(data.statements.len() + 1);
+            let mut mrow = Vec::with_capacity(data.statements.len() + 1);
+            for i in 0..=data.statements.len() {
+                let mut t = Touch {
+                    l,
+                    lazy: &self.lazy_cand,
+                    roots: &self.lazy_roots,
+                    used: false,
+                    def: false,
+                    full: false,
+                    borrow: false,
+                    raw: false,
+                    moved: false,
+                    dead: false,
+                    deref: false,
+                };
+                let loc = Location { block: bb, statement_index: i };
+                let indirect = match data.statements.get(i) {
+                    Some(stmt) => {
+                        t.visit_statement(stmt, loc);
+                        match &stmt.kind {
+                            StatementKind::Assign(b) => b.0.is_indirect(),
+                            StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => false,
+                            _ => true,
+                        }
+                    }
+                    None => {
+                        let term = data.terminator();
+                        t.visit_terminator(term, loc);
+                        !matches!(
+                            term.kind,
+                            TerminatorKind::Goto { .. }
+                                | TerminatorKind::SwitchInt { .. }
+                                | TerminatorKind::Return
+                                | TerminatorKind::Unreachable
+                                | TerminatorKind::Assert { .. }
+                        )
+                    }
+                };
+                raw |= t.raw;
+                mrow.push(t.moved);
+                row.push(At {
+                    used: t.used,
+                    def: t.def,
+                    full: t.full,
+                    borrow: t.borrow,
+                    ends: t.dead,
+                    indirect,
+                    deref: t.deref || indirect,
+                });
+            }
+            at.push(row);
+            moved.push(mrow);
+        }
+        // (a pointer made with `&raw` may be used after the value is moved)
+        if !raw {
+            for (row, mrow) in at.iter_mut().zip(&moved) {
+                for (a, m) in row.iter_mut().zip(mrow) {
+                    a.ends |= *m;
+                }
+            }
+        }
+        // where a reference may exist: forward from the borrows
+        let mut bor_in = vec![false; nb];
+        let bor_through = |b: usize, mut v: bool, each: &mut dyn FnMut(usize, bool)| -> bool {
+            for (i, a) in at[b].iter().enumerate() {
+                each(i, v);
+                v = (v || a.borrow) && !a.ends;
+            }
+            v
+        };
+        loop {
+            let mut changed = false;
+            for b in blocks.indices() {
+                let i = b.as_usize();
+                let v = bor_in[i] || preds[b].iter().any(|p| bor_through(p.as_usize(), bor_in[p.as_usize()], &mut |_, _| {}));
+                if v != bor_in[i] {
+                    bor_in[i] = v;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut bor: Vec<Vec<(bool, bool)>> = Vec::with_capacity(nb);
+        for b in 0..nb {
+            let mut ins = vec![false; at[b].len()];
+            bor_through(b, bor_in[b], &mut |i, v| ins[i] = v);
+            let row = ins.iter().zip(&at[b]).map(|(&v, a)| (v, (v || a.borrow) && !a.ends)).collect();
+            bor.push(row);
+        }
+        // through pointers
+        for b in 0..nb {
+            for (a, &(before, _)) in at[b].iter_mut().zip(&bor[b]) {
+                if before {
+                    a.used |= a.deref;
+                    a.def |= a.indirect;
+                }
+            }
+        }
+        // a value was written: forward
+        let mut init_in = vec![false; nb];
+        init_in[0] = (1..=mir.arg_count).contains(&l.as_usize());
+        let init_end = |b: usize, v: bool| v || at[b].iter().any(|a| a.def || a.borrow);
+        loop {
+            let mut changed = false;
+            for b in blocks.indices() {
+                let i = b.as_usize();
+                let v = init_in[i] || preds[b].iter().any(|p| init_end(p.as_usize(), init_in[p.as_usize()]));
+                if v != init_in[i] {
+                    init_in[i] = v;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // read later: backward
+        let mut live_in = vec![false; nb];
+        let live_start = |b: usize, mut v: bool| {
+            for a in at[b].iter().rev() {
+                v = a.used || (v && !a.full);
+            }
+            v
+        };
+        loop {
+            let mut changed = false;
+            for b in blocks.indices().rev() {
+                let i = b.as_usize();
+                let out = blocks[b].terminator().successors().any(|s| live_in[s.as_usize()]);
+                let v = live_start(i, out);
+                if v != live_in[i] {
+                    live_in[i] = v;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut points = Vec::with_capacity(nb);
+        for (b, data) in blocks.iter_enumerated() {
+            let i = b.as_usize();
+            let mut live = data.terminator().successors().any(|s| live_in[s.as_usize()]);
+            let mut row = vec![Point::default(); at[i].len()];
+            for (k, a) in at[i].iter().enumerate().rev() {
+                row[k].live = live;
+                live = a.used || (live && !a.full);
+            }
+            let mut init = init_in[i];
+            for (k, a) in at[i].iter().enumerate() {
+                init |= a.def || a.borrow;
+                row[k].held = row[k].live && init;
+                row[k].used = a.used;
+                row[k].def = a.def;
+                row[k].ptr = bor[i][k].0;
+            }
+            points.push(row);
+        }
+        Flow { points }
     }
 
     /// The value of a lazy local: a view of its operands, no code.
@@ -2328,6 +3586,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         match rv {
             Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
                 let (v, sl) = self.operand(op);
+                // (a large view: the place itself)
+                if dsize > 16 {
+                    return Some(v);
+                }
                 put(&mut bytes, 0, &v, sl.size.bytes());
             }
             Rvalue::Aggregate(kind, ops) => {
@@ -2356,33 +3618,52 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     fn fusable(
         &self,
         bb: BasicBlock,
-    ) -> Option<(usize, BinOp, &'tcx Operand<'tcx>, &'tcx Operand<'tcx>, Target, Target)> {
+    ) -> Option<(usize, Option<usize>, BinOp, &'tcx Operand<'tcx>, &'tcx Operand<'tcx>, Target, Target)> {
         let data = &self.mir.basic_blocks[bb];
-        let (i, stmt) = data.statements.iter().enumerate().rev().find(|(_, s)| {
-            !matches!(s.kind, StatementKind::StorageDead(_) | StatementKind::StorageLive(_) | StatementKind::Nop)
-        })?;
+        let quiet = |s: &rustc_middle::mir::Statement<'tcx>| {
+            matches!(s.kind, StatementKind::StorageDead(_) | StatementKind::StorageLive(_) | StatementKind::Nop)
+        };
+        let (last, stmt) = data.statements.iter().enumerate().rev().find(|(_, s)| !quiet(s))?;
         let StatementKind::Assign(b) = &stmt.kind else { return None };
-        let (place, rv) = &**b;
+        let u = &self.uses;
+        let term_loc = Location { block: bb, statement_index: data.statements.len() };
+        // A temporary that is assigned once and read once, at `at`.
+        let once = |place: &Place<'tcx>, at: Location| {
+            let t = place.local.as_usize();
+            place.projection.is_empty()
+                && u.defs[t] == 1
+                && u.uses[t] == 1
+                && u.plain[t] == 1
+                && !u.borrowed[t]
+                && u.plain_loc[t] == Some(at)
+                && self.consts[t].is_none()
+        };
+        let reads = |o: &Operand<'tcx>, l: Local| {
+            matches!(o, Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() && p.local == l)
+        };
+        // `!(a < b)`: the comparison in front of the negation, with the
+        // targets the other way round.
+        let (i, also, stmt, cond, negated) = match &b.1 {
+            Rvalue::UnaryOp(UnOp::Not, inner)
+                if once(&b.0, term_loc) && self.local_ty(b.0.local).is_bool() =>
+            {
+                let (k, cmp) = data.statements.iter().enumerate().take(last).rev().find(|(_, s)| !quiet(s))?;
+                let StatementKind::Assign(cb) = &cmp.kind else { return None };
+                if !reads(inner, cb.0.local) || !once(&cb.0, Location { block: bb, statement_index: last }) {
+                    return None;
+                }
+                (k, Some(last), cmp, b.0.local, true)
+            }
+            _ if once(&b.0, term_loc) => (last, None, stmt, b.0.local, false),
+            _ => return None,
+        };
+        let StatementKind::Assign(b) = &stmt.kind else { return None };
+        let (_, rv) = &**b;
         let Rvalue::BinaryOp(op, ops) = rv else { return None };
         if !matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
             return None;
         }
-        let t = place.local.as_usize();
-        let u = &self.uses;
-        let term_loc = Location { block: bb, statement_index: data.statements.len() };
-        if !place.projection.is_empty()
-            || u.defs[t] != 1
-            || u.uses[t] != 1
-            || u.plain[t] != 1
-            || u.borrowed[t]
-            || u.plain_loc[t] != Some(term_loc)
-            || self.consts[t].is_some()
-        {
-            return None;
-        }
-        let is_t = |o: &Operand<'tcx>| {
-            matches!(o, Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() && p.local == place.local)
-        };
+        let is_t = |o: &Operand<'tcx>| reads(o, cond);
         let (t_true, t_false) = match &data.terminator().kind {
             TerminatorKind::SwitchInt { discr, targets } if is_t(discr) => (
                 Target::Block(targets.target_for_value(1)),
@@ -2400,7 +3681,410 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             }
             _ => return None,
         };
-        Some((i, *op, &ops.0, &ops.1, t_true, t_false))
+        let (t_true, t_false) = if negated { (t_false, t_true) } else { (t_true, t_false) };
+        Some((i, also, *op, &ops.0, &ops.1, t_true, t_false))
+    }
+
+    /// Whether the comparison `x op y` at statement `at` of block `bb` is
+    /// known to hold: a block that every way to this one passes is only
+    /// entered by the true branch of the same comparison of the same
+    /// values, and nothing in between can change them
+    /// (`if n < buf.len() { ...; buf[n] = c }`: the check of the index).
+    ///
+    /// "The same values": the same constants, or locals that are copies of
+    /// the same place, made in the block of their comparison. "Nothing in
+    /// between": only assignments to locals that no reference exists to
+    /// and that the places do not name, no calls.
+    fn implied(&self, bb: BasicBlock, at: usize, op: BinOp, x: &'tcx Operand<'tcx>, y: &'tcx Operand<'tcx>) -> bool {
+        let mir = self.mir;
+        let blocks = &mir.basic_blocks;
+        let preds = blocks.predecessors();
+        let doms = blocks.dominators();
+        let u = &self.uses;
+        // What an operand is: a constant, a place, or the length of a
+        // slice; and the statement in its block that reads it into the
+        // local of the operand.
+        #[derive(PartialEq)]
+        enum Key<'tcx> {
+            Const,
+            Place(Place<'tcx>),
+            Len(Place<'tcx>),
+        }
+        let source = |o: &'tcx Operand<'tcx>, block: BasicBlock, upto: usize| -> Option<(Key<'tcx>, Option<usize>)> {
+            match o {
+                Operand::Constant(_) => Some((Key::Const, None)),
+                Operand::Copy(pl) | Operand::Move(pl) if pl.projection.is_empty() => {
+                    let l = pl.local.as_usize();
+                    if u.borrowed[l] {
+                        return None;
+                    }
+                    // a local that is assigned in several places: itself
+                    // (nothing between the comparisons assigns it)
+                    let &[d] = &u.def_locs[l][..] else { return Some((Key::Place(*pl), None)) };
+                    if d.block != block {
+                        return Some((Key::Place(*pl), None));
+                    }
+                    let stmt = blocks[d.block].statements.get(d.statement_index)?;
+                    let StatementKind::Assign(b) = &stmt.kind else { return None };
+                    if d.statement_index >= upto || u.defs[l] != 1 {
+                        return None;
+                    }
+                    match &b.1 {
+                        Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                            Some((Key::Place(*src), Some(d.statement_index)))
+                        }
+                        Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(src) | Operand::Move(src)) => {
+                            Some((Key::Len(*src), Some(d.statement_index)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        let quiet = |s: &rustc_middle::mir::Statement<'tcx>| {
+            matches!(s.kind, StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop)
+        };
+        // The block that the true branch of the first comparison enters:
+        // up the dominators of this block.
+        let mut q = bb;
+        for _ in 0..8 {
+            if let &[p] = &preds[q][..]
+                && p != q
+                && let Some((k, None, op2, x2, y2, Target::Block(t), _)) = self.fusable(p)
+                && t == q
+                && op2 == op
+                && blocks[p].terminator().successors().filter(|s| *s == q).count() == 1
+            {
+                let mut copies: Vec<(BasicBlock, usize)> = Vec::new();
+                let mut places: Vec<Place<'tcx>> = Vec::new();
+                let mut direct: Vec<Local> = Vec::new();
+                let mut same = |a: &'tcx Operand<'tcx>, b: &'tcx Operand<'tcx>| -> bool {
+                    // the same local on both sides
+                    if let (Operand::Copy(pa) | Operand::Move(pa), Operand::Copy(pb) | Operand::Move(pb)) = (a, b)
+                        && pa.projection.is_empty()
+                        && pb.projection.is_empty()
+                        && pa.local == pb.local
+                    {
+                        direct.push(pa.local);
+                        return !u.borrowed[pa.local.as_usize()];
+                    }
+                    let (Some((sa, da)), Some((sb, db))) = (source(a, bb, at), source(b, p, k)) else { return false };
+                    copies.extend(da.map(|i| (bb, i)));
+                    copies.extend(db.map(|i| (p, i)));
+                    match (sa, sb) {
+                        (Key::Const, Key::Const) => match (a, b) {
+                            (Operand::Constant(c), Operand::Constant(d)) => c.const_ == d.const_,
+                            _ => false,
+                        },
+                        (Key::Const, _) | (_, Key::Const) => false,
+                        (ka, kb) => {
+                            let same = ka == kb;
+                            let (Key::Place(pl) | Key::Len(pl)) = ka else { unreachable!() };
+                            places.push(pl);
+                            same
+                        }
+                    }
+                };
+                if same(x, x2) && same(y, y2) {
+                    // the locals the places name
+                    let mut named = Mentions(Vec::new());
+                    for pl in &places {
+                        named.visit_place(
+                            pl,
+                            PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy),
+                            Location::START,
+                        );
+                    }
+                    // (in the block of the first comparison a local that
+                    // both sides read as it is may still get its value)
+                    let sources = named.0.clone();
+                    named.0.extend(direct.iter().copied());
+                    let harmless_for = |names: &[Local], block: BasicBlock, i: usize, s: &rustc_middle::mir::Statement<'tcx>| {
+                        quiet(s)
+                            || copies.contains(&(block, i))
+                            || matches!(&s.kind, StatementKind::Assign(b)
+                                if !b.0.is_indirect()
+                                    && !u.borrowed[b.0.local.as_usize()]
+                                    && !names.contains(&b.0.local))
+                    };
+                    let harmless = |block: BasicBlock, i: usize, s: &rustc_middle::mir::Statement<'tcx>| {
+                        harmless_for(&named.0, block, i, s)
+                    };
+                    // in the block of the first comparison: only the copies
+                    let first = copies.iter().filter(|c| c.0 == p).map(|c| c.1).min().unwrap_or(k);
+                    if !blocks[p].statements.iter().enumerate().take(k).skip(first).all(|(i, s)| {
+                        harmless_for(&sources, p, i, s)
+                    }) {
+                        return false;
+                    }
+                    // the blocks between `q` and this one
+                    let n = blocks.len();
+                    let mut down = vec![false; n];
+                    let mut work = vec![q];
+                    while let Some(b) = work.pop() {
+                        if std::mem::replace(&mut down[b.as_usize()], true) || b == bb {
+                            continue;
+                        }
+                        work.extend(blocks[b].terminator().successors());
+                    }
+                    let mut up = vec![false; n];
+                    let mut work = vec![bb];
+                    while let Some(b) = work.pop() {
+                        if std::mem::replace(&mut up[b.as_usize()], true) || b == q {
+                            continue;
+                        }
+                        work.extend(preds[b].iter().copied());
+                    }
+                    return blocks.indices().filter(|b| down[b.as_usize()] && up[b.as_usize()]).all(|b| {
+                        let data = &blocks[b];
+                        let upto = if b == bb { at } else { data.statements.len() };
+                        doms.dominates(q, b)
+                            // (no way in from a block that is not checked)
+                            && (b == q || preds[b].iter().all(|p| down[p.as_usize()] && up[p.as_usize()]))
+                            && data.statements.iter().enumerate().take(upto).all(|(i, s)| harmless(b, i, s))
+                            && (b == bb
+                                || !matches!(
+                                    data.terminator().kind,
+                                    TerminatorKind::Call { .. }
+                                        | TerminatorKind::Drop { .. }
+                                        | TerminatorKind::TailCall { .. }
+                                        | TerminatorKind::InlineAsm { .. }
+                                ))
+                    });
+                }
+            }
+            // further up
+            match doms.immediate_dominator(q) {
+                Some(d) if d != q => q = d,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The locals of two bytes (`usize`, `u16`) whose value is always below
+    /// 256: a count or an index that starts at a small constant or a byte
+    /// and is only stepped where it is known to be below a constant
+    /// (`while n < 40 { ...; n += 1 }`, the index of an array). They keep
+    /// their two bytes, but where they are read the second one is the
+    /// constant 0, and so the stores to it go away as stores nobody reads.
+    ///
+    /// Every assignment to such a local is one of: a constant below 256, a
+    /// value of one byte that is extended, or `n + k` in a place where
+    /// `n < c` holds with `c + k <= 256`.
+    fn narrow_locals(&self) -> Vec<bool> {
+        let mir = self.mir;
+        let blocks = &mir.basic_blocks;
+        let u = &self.uses;
+        let n = mir.local_decls.len();
+        let mut out = vec![false; n];
+        if std::env::var_os("RUST64_NO_NARROW").is_some() {
+            return out;
+        }
+        // (the result too: it keeps its bytes for the caller)
+        'locals: for l in std::iter::once(0).chain(mir.arg_count + 1..n) {
+            let local = Local::from_usize(l);
+            let ty = self.local_ty(local);
+            if !matches!(ty.kind(), ty::Uint(_))
+                || self.layout(ty).size.bytes() != 2
+                || u.borrowed[l]
+                || u.def_locs[l].is_empty()
+                || u.defs[l] as usize != u.def_locs[l].len()
+                || self.addrs[l].is_some()
+                || self.lazy_cand[l]
+                || self.fwd[l].is_some()
+                || self.res_cand[l]
+                || self.consts[l].is_some()
+            {
+                continue;
+            }
+            for &d in &u.def_locs[l] {
+                let Some(stmt) = blocks[d.block].statements.get(d.statement_index) else { continue 'locals };
+                let StatementKind::Assign(b) = &stmt.kind else { continue 'locals };
+                let ok = b.0.projection.is_empty()
+                    && match &b.1 {
+                        Rvalue::Use(k @ Operand::Constant(_), ..) => self.const_bits(k).is_some_and(|v| v < 256),
+                        Rvalue::Cast(CastKind::IntToInt, src, _) => {
+                            let from = self.monomorphize(src.ty(&mir.local_decls, self.tcx()));
+                            matches!(from.kind(), ty::Uint(_)) && self.layout(from).size.bytes() == 1
+                        }
+                        Rvalue::BinaryOp(BinOp::Add | BinOp::AddUnchecked, ops) => match (&ops.0, &ops.1) {
+                            (Operand::Copy(x) | Operand::Move(x), k @ Operand::Constant(_))
+                                if x.projection.is_empty() =>
+                            {
+                                self.const_bits(k).is_some_and(|k| k < 256 && self.below(local, x.local, d, 256 - k))
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                if !ok {
+                    continue 'locals;
+                }
+            }
+            out[l] = true;
+        }
+        out
+    }
+
+    /// Whether `x`, which is `local` or a copy of it, is below a constant
+    /// of at most `limit` at `at`, where `local` is assigned: a block that
+    /// every way to `at` passes is only entered by the true branch of
+    /// `local < c`, and `local` is not assigned from there to `at`.
+    fn below(&self, local: Local, x: Local, at: Location, limit: u128) -> bool {
+        let mir = self.mir;
+        let blocks = &mir.basic_blocks;
+        let preds = blocks.predecessors();
+        let doms = blocks.dominators();
+        let u = &self.uses;
+        let defs = &u.def_locs[local.as_usize()];
+        // The statement that makes `t` a copy of `local`.
+        let copy_at = |t: Local| -> Option<Location> {
+            let i = t.as_usize();
+            let &[loc] = &u.def_locs[i][..] else { return None };
+            if u.defs[i] != 1 || u.borrowed[i] {
+                return None;
+            }
+            let StatementKind::Assign(b) = &blocks[loc.block].statements.get(loc.statement_index)?.kind else {
+                return None;
+            };
+            match &b.1 {
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), ..)
+                    if b.0.projection.is_empty() && src.projection.is_empty() && src.local == local =>
+                {
+                    Some(loc)
+                }
+                _ => None,
+            }
+        };
+        let via = if x == local {
+            None
+        } else {
+            match copy_at(x) {
+                Some(loc) => Some(loc),
+                None => return false,
+            }
+        };
+        let mut q = at.block;
+        for _ in 0..8 {
+            'here: {
+                let &[p] = &preds[q][..] else { break 'here };
+                if p == q || blocks[p].terminator().successors().filter(|s| *s == q).count() != 1 {
+                    break 'here;
+                }
+                let Some((k, _, op, a, c, t_true, t_false)) = self.fusable(p) else { break 'here };
+                let holds = match op {
+                    BinOp::Lt => t_true == Target::Block(q),
+                    BinOp::Ge => t_false == Target::Block(q),
+                    _ => false,
+                };
+                if !holds || !self.const_bits(c).is_some_and(|c| c <= limit) {
+                    break 'here;
+                }
+                // what is compared is the local as it is at the end of `p`
+                let (Operand::Copy(a) | Operand::Move(a)) = a else { break 'here };
+                if !a.projection.is_empty() {
+                    break 'here;
+                }
+                let from = if a.local == local {
+                    k
+                } else {
+                    match copy_at(a.local) {
+                        Some(loc) if loc.block == p && loc.statement_index < k => loc.statement_index,
+                        _ => break 'here,
+                    }
+                };
+                if defs.iter().any(|e| e.block == p && e.statement_index >= from) {
+                    break 'here;
+                }
+                // the copy that is stepped is made on this way
+                if let Some(loc) = via {
+                    let before = if loc.block == at.block {
+                        loc.statement_index < at.statement_index
+                    } else {
+                        doms.dominates(loc.block, at.block)
+                    };
+                    if !before || !doms.dominates(q, loc.block) {
+                        break 'here;
+                    }
+                }
+                // the blocks on the ways from `q` to `at`
+                let mut seen = vec![false; blocks.len()];
+                let mut work: Vec<BasicBlock> = if at.block == q { Vec::new() } else { preds[at.block].to_vec() };
+                while let Some(b) = work.pop() {
+                    if std::mem::replace(&mut seen[b.as_usize()], true) || b == q {
+                        continue;
+                    }
+                    work.extend(preds[b].iter().copied());
+                }
+                // (a way from `at` back to it that does not pass the check)
+                if seen[at.block.as_usize()] {
+                    break 'here;
+                }
+                if defs.iter().any(|e| {
+                    *e != at
+                        && (seen[e.block.as_usize()] || e.block == at.block && e.statement_index < at.statement_index)
+                }) {
+                    break 'here;
+                }
+                return true;
+            }
+            match doms.immediate_dominator(q) {
+                Some(d) if d != q => q = d,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// A `match` on an enum with two variants that is stored without a tag
+    /// of its own (`Option<&T>`, `Result<Dir, Error>` with the error in a
+    /// value the data cannot have): the block ends with the discriminant
+    /// and a switch on it, and the discriminant is used nowhere else. Then
+    /// one comparison of the tag with the niche value decides: the index of
+    /// the statement, the enum, the niche value, and the targets for the
+    /// variant of the niche and for the other one.
+    fn niche_switch(&self, bb: BasicBlock) -> Option<(usize, Place<'tcx>, u8, BasicBlock, BasicBlock)> {
+        let data = &self.mir.basic_blocks[bb];
+        let TerminatorKind::SwitchInt { discr, targets } = &data.terminator().kind else { return None };
+        let (i, stmt) = data.statements.iter().enumerate().rev().find(|(_, s)| {
+            !matches!(s.kind, StatementKind::StorageDead(_) | StatementKind::StorageLive(_) | StatementKind::Nop)
+        })?;
+        let StatementKind::Assign(b) = &stmt.kind else { return None };
+        let (place, Rvalue::Discriminant(of)) = &**b else { return None };
+        let t = place.local.as_usize();
+        let u = &self.uses;
+        let term_loc = Location { block: bb, statement_index: data.statements.len() };
+        let reads = matches!(discr, Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() && p.local == place.local);
+        if !reads
+            || !place.projection.is_empty()
+            || u.defs[t] != 1
+            || u.uses[t] != 1
+            || u.plain[t] != 1
+            || u.borrowed[t]
+            || u.plain_loc[t] != Some(term_loc)
+            || self.consts[t].is_some()
+            || self.lazy_cand[of.local.as_usize()]
+        {
+            return None;
+        }
+        let layout = self.layout(self.monomorphize(of.ty(self.mir, self.tcx()).ty));
+        let Variants::Multiple { tag, tag_encoding, variants, .. } = &layout.variants else { return None };
+        let TagEncoding::Niche { untagged_variant, niche_variants, niche_start } = tag_encoding else { return None };
+        if tag.size(&self.p.cx).bytes() != 1 || niche_variants.start != niche_variants.last || variants.len() != 2 {
+            return None;
+        }
+        let value = |v: VariantIdx| {
+            layout.ty.discriminant_for_variant(self.tcx(), v).map_or(v.as_u32() as u128, |d| d.val)
+        };
+        Some((
+            i,
+            *of,
+            *niche_start as u8,
+            targets.target_for_value(value(niche_variants.start)),
+            targets.target_for_value(value(*untagged_variant)),
+        ))
     }
 
     /// An overflow check in code that is compiled without them: functions
@@ -2816,6 +4500,25 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 other => self.fatal(format!("place projection {other:?} is not supported yet")),
             }
         }
+        // The offset behind a pointer goes into Y. If it does not fit (a
+        // field or a constant index far into a large array), the pointer
+        // is moved first.
+        if let Addr::Ind { ptr, off } = &addr
+            && *off > 0
+            && *off + layout.size.bytes() > 256
+        {
+            let t = self.temp(2);
+            let (ptr, off) = (ptr.clone(), *off);
+            let a = self.a();
+            a.ins("clc");
+            a.ins(format!("lda {ptr}"));
+            a.ins(format!("adc #${:02x}", off & 0xff));
+            a.ins(format!("sta {t}"));
+            a.ins(format!("lda {ptr}+1"));
+            a.ins(format!("adc #${:02x}", (off >> 8) & 0xff));
+            a.ins(format!("sta {t}+1"));
+            addr = Addr::Ind { ptr: t, off: 0 };
+        }
         (addr, layout, meta)
     }
 
@@ -2972,15 +4675,25 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             Operand::Copy(p) | Operand::Move(p) => {
                 if self.lazy_cand[p.local.as_usize()]
                     && let Some((off, l)) = self.field_offset(*p)
-                    && let Some(Val::Imm(b)) = self.lazy_val(p.local)
                 {
-                    let size = l.size.bytes() as usize;
-                    let part = b.into_iter().skip(off as usize).take(size).collect();
-                    return (Val::Imm(part), l);
+                    match self.lazy_val(p.local) {
+                        Some(Val::Imm(b)) => {
+                            let size = l.size.bytes() as usize;
+                            let part = b.into_iter().skip(off as usize).take(size).collect();
+                            return (Val::Imm(part), l);
+                        }
+                        Some(v @ Val::Mem(_)) => return (v.offset(off), l),
+                        None => {}
+                    }
                 }
                 if p.projection.is_empty() {
                     if let Some(e) = self.addrs[p.local.as_usize()].clone() {
                         let v = Val::Imm(vec![format!("#<({e})"), format!("#>({e})")]);
+                        return (v, self.layout(self.local_ty(p.local)));
+                    }
+                    // (a counter that stays below 256: its first byte and 0)
+                    if self.narrow.get(p.local.as_usize()) == Some(&true) {
+                        let v = Val::Imm(vec![self.local_addr(p.local), "#$00".to_owned()]);
                         return (v, self.layout(self.local_ty(p.local)));
                     }
                 }
@@ -3081,24 +4794,63 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         true
     }
 
-    /// Shifts the `n` bytes at `t` by the constant `k`.
+    /// Shifts the `n` bytes at `t` by the constant `k`: first by whole
+    /// bytes (moves), then bit by bit over the bytes that still change.
     fn shift_const(a: &mut Asm, t: &str, n: u64, k: u64, left: bool, signed: bool) {
-        for _ in 0..k {
+        let at = |i: u64| if i == 0 { t.to_owned() } else { format!("{t}+{i}") };
+        let (q, bits) = ((k / 8).min(n), k % 8);
+        // the bytes that the bits are shifted through
+        let m = n - q;
+        if q > 0 && left {
+            for i in (q..n).rev() {
+                a.ins(format!("lda {}", at(i - q)));
+                a.ins(format!("sta {}", at(i)));
+            }
+            a.ins("lda #$00");
+            for i in 0..q {
+                a.ins(format!("sta {}", at(i)));
+            }
+        } else if q > 0 {
+            for i in 0..m {
+                a.ins(format!("lda {}", at(i + q)));
+                a.ins(format!("sta {}", at(i)));
+            }
+            if signed {
+                // the sign: $ff or $00 (A is the old top byte, or it is
+                // still in its place)
+                if m == 0 {
+                    a.ins(format!("lda {}", at(n - 1)));
+                }
+                a.ins("asl");
+                a.ins("lda #$00");
+                a.ins("adc #$ff");
+                a.ins("eor #$ff");
+            } else {
+                a.ins("lda #$00");
+            }
+            for i in m..n {
+                a.ins(format!("sta {}", at(i)));
+            }
+        }
+        if m == 0 {
+            return;
+        }
+        for _ in 0..bits {
             if left {
-                a.ins(format!("asl {t}"));
-                for i in 1..n {
-                    a.ins(format!("rol {t}+{i}"));
+                a.ins(format!("asl {}", at(q)));
+                for i in q + 1..n {
+                    a.ins(format!("rol {}", at(i)));
                 }
             } else {
                 if signed {
-                    a.ins(format!("lda {t}+{}", n - 1));
+                    a.ins(format!("lda {}", at(m - 1)));
                     a.ins("cmp #$80");
-                    a.ins(format!("ror {t}+{}", n - 1));
+                    a.ins(format!("ror {}", at(m - 1)));
                 } else {
-                    a.ins(format!("lsr {t}+{}", n - 1));
+                    a.ins(format!("lsr {}", at(m - 1)));
                 }
-                for i in (0..n - 1).rev() {
-                    a.ins(format!("ror {t}+{i}"));
+                for i in (0..m - 1).rev() {
+                    a.ins(format!("ror {}", at(i)));
                 }
             }
         }
@@ -3426,6 +5178,189 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
     // ---- arithmetic ----
 
+    /// For the division or remainder `x op y` of the statement that is
+    /// being compiled: where the other of the two goes, if the code asks
+    /// for it next (`d % g` and then `d / g`, the digits of a number). That
+    /// statement is marked as done; the caller stores its result.
+    ///
+    /// "Next" is: further on in the same block, or in the blocks that
+    /// follow through assertions and jumps and have no other way in (the
+    /// checks for a zero divisor and for array bounds are assertions), with
+    /// only assignments in between that neither write the operands nor
+    /// name the local the result goes to. The operands and that local are
+    /// plain locals that no reference is made to (or constants).
+    fn div_partner(&mut self, op: BinOp, x: &Operand<'tcx>, y: &Operand<'tcx>) -> Option<Place<'tcx>> {
+        let (mut bb, at) = self.cur?;
+        let mir = self.mir;
+        // (not a value that is computed where it is used)
+        match &mir.basic_blocks[bb].statements.get(at)?.kind {
+            StatementKind::Assign(b) => match &b.1 {
+                Rvalue::BinaryOp(o, ops) if *o == op && std::ptr::eq(&ops.0, x) && std::ptr::eq(&ops.1, y) => {
+                    if self.operand_local(x) == Some(b.0.local) || self.operand_local(y) == Some(b.0.local) {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+        let wanted = if op == BinOp::Div { BinOp::Rem } else { BinOp::Div };
+        self.is_borrowed(Local::from_usize(0));
+        let plain = |this: &Self, l: Local| {
+            let i = l.as_usize();
+            !this.borrowed.as_ref().unwrap()[i] && !this.lazy_cand[i] && this.addrs[i].is_none()
+        };
+        let operands = [self.operand_local(x), self.operand_local(y)];
+        for (o, l) in [x, y].into_iter().zip(operands) {
+            match (o, l) {
+                (Operand::Constant(_), _) => {}
+                (_, Some(l)) if plain(self, l) => {}
+                _ => return None,
+            }
+        }
+        let same = |this: &Self, a: &Operand<'tcx>, b: &Operand<'tcx>| match (a, b) {
+            (Operand::Constant(c), Operand::Constant(d)) => c.const_ == d.const_,
+            (Operand::Constant(_), _) | (_, Operand::Constant(_)) => false,
+            _ => this.operand_local(a).is_some() && this.operand_local(a) == this.operand_local(b),
+        };
+        let mut named = Mentions(Vec::new());
+        let mut from = at + 1;
+        for _ in 0..6 {
+            let data = &mir.basic_blocks[bb];
+            for (i, stmt) in data.statements.iter().enumerate().skip(from) {
+                let loc = Location { block: bb, statement_index: i };
+                match &stmt.kind {
+                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
+                    StatementKind::Assign(b) => {
+                        let (place, rv) = &**b;
+                        if let Rvalue::BinaryOp(o, ops) = rv
+                            && *o == wanted
+                            && same(self, &ops.0, x)
+                            && same(self, &ops.1, y)
+                        {
+                            if place.projection.is_empty()
+                                && plain(self, place.local)
+                                && !named.0.contains(&place.local)
+                            {
+                                self.done.insert((bb, i));
+                                return Some(*place);
+                            }
+                            return None;
+                        }
+                        if operands.contains(&Some(place.local)) {
+                            return None;
+                        }
+                        named.visit_statement(stmt, loc);
+                    }
+                    _ => return None,
+                }
+            }
+            let term = data.terminator();
+            let target = match &term.kind {
+                TerminatorKind::Goto { target, .. } | TerminatorKind::Assert { target, .. } => *target,
+                _ => return None,
+            };
+            if mir.basic_blocks.predecessors()[target].len() != 1 {
+                return None;
+            }
+            // (what an assertion names for its message is not a use)
+            if let TerminatorKind::Assert { cond, .. } = &term.kind {
+                named.visit_operand(cond, Location { block: bb, statement_index: data.statements.len() });
+            }
+            bb = target;
+            from = 0;
+        }
+        None
+    }
+
+    /// For an operand that is a 16-bit integer cast to 32 bits: the 16-bit
+    /// operand and whether it is signed. The cast is in the block of the
+    /// statement that is being compiled, in front of it, and its operand is
+    /// a constant or a local that is not written in between (and that no
+    /// reference is made to), so it has the same value here.
+    fn widened(&mut self, o: &Operand<'tcx>) -> Option<(&'tcx Operand<'tcx>, bool)> {
+        let l = match o {
+            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
+            _ => return None,
+        };
+        let (bb, at) = self.cur?;
+        let &[def] = &self.uses.def_locs[l.as_usize()][..] else { return None };
+        if def.block != bb || def.statement_index >= at {
+            return None;
+        }
+        let mir = self.mir;
+        let stmts = &mir.basic_blocks[bb].statements;
+        let StatementKind::Assign(b) = &stmts[def.statement_index].kind else { return None };
+        let Rvalue::Cast(CastKind::IntToInt, src, _) = &b.1 else { return None };
+        let from = self.monomorphize(src.ty(&mir.local_decls, self.tcx()));
+        if self.layout(self.local_ty(l)).size.bytes() != 4 || !from.is_integral() || self.layout(from).size.bytes() != 2 {
+            return None;
+        }
+        match src {
+            Operand::Constant(_) => {}
+            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => {
+                if self.is_borrowed(p.local) {
+                    return None;
+                }
+                for stmt in &stmts[def.statement_index + 1..at] {
+                    match &stmt.kind {
+                        StatementKind::Assign(b) if b.0.local == p.local => return None,
+                        StatementKind::Assign(_)
+                        | StatementKind::StorageLive(_)
+                        | StatementKind::StorageDead(_)
+                        | StatementKind::Nop => {}
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some((src, Self::is_signed(from)))
+    }
+
+    /// Whether a reference or a raw pointer is made to the local anywhere
+    /// in the function.
+    fn is_borrowed(&mut self, l: Local) -> bool {
+        if self.borrowed.is_none() {
+            let mir = self.mir;
+            let mut borrowed = vec![false; mir.local_decls.len()];
+            for data in mir.basic_blocks.iter() {
+                for stmt in &data.statements {
+                    if let StatementKind::Assign(b) = &stmt.kind
+                        && let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = &b.1
+                    {
+                        borrowed[place.local.as_usize()] = true;
+                    }
+                }
+            }
+            self.borrowed = Some(borrowed);
+        }
+        self.borrowed.as_ref().unwrap()[l.as_usize()]
+    }
+
+    /// The local an operand is, if it is a whole local; for a temporary
+    /// that is only a copy of a local (and not stored: `lazy_locals`), that
+    /// local.
+    fn operand_local(&self, o: &Operand<'tcx>) -> Option<Local> {
+        let mut l = match o {
+            Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => p.local,
+            _ => return None,
+        };
+        for _ in 0..4 {
+            let i = l.as_usize();
+            let &[def] = &self.uses.def_locs[i][..] else { break };
+            let Some(stmt) = self.mir.basic_blocks[def.block].statements.get(def.statement_index) else { break };
+            match &stmt.kind {
+                StatementKind::Assign(b) if self.lazy_cand[i] => match &b.1 {
+                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _) if p.projection.is_empty() => l = p.local,
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        Some(l)
+    }
+
     fn binop(
         &mut self,
         op: BinOp,
@@ -3434,6 +5369,21 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         dst: &Addr,
         dl: TyAndLayout<'tcx>,
     ) {
+        // Two 16-bit values widened for a 32-bit product (fixed point):
+        // the routine takes them as they are.
+        if matches!(op, BinOp::Mul | BinOp::MulUnchecked)
+            && let (Some((sx, signed)), Some((sy, signed_y))) = (self.widened(x), self.widened(y))
+            && signed == signed_y
+        {
+            let (va, _) = self.operand(sx);
+            let (vb, _) = self.operand(sy);
+            let a = &mut self.p.asm;
+            a.copy(&Addr::Abs("rt_a".into()), &va, 2);
+            a.copy(&Addr::Abs("rt_b".into()), &vb, 2);
+            a.ins(if signed { "jsr rt_mul16s" } else { "jsr rt_mul16u" });
+            a.copy(dst, &Val::Mem(Addr::Abs("rt_r".into())), 4);
+            return;
+        }
         let (mut va, la) = self.operand(x);
         let (mut vb, lb) = self.operand(y);
         let n = la.size.bytes();
@@ -3701,29 +5651,42 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                         Some(c) => self.mul_const(dst, &va, n, c),
                         None => false,
                     };
+                // A division gives the quotient and the remainder: if the
+                // other one is asked for next, it is stored now.
+                let other = match op {
+                    Div | Rem if !inline => self.div_partner(op, x, y).map(|place| self.place(place).0),
+                    _ => None,
+                };
                 let a = &mut self.p.asm;
                 if !inline {
                     a.copy(&Addr::Abs("rt_a".into()), &va, n);
                     a.copy(&Addr::Abs("rt_b".into()), &vb, n);
-                    // One and two bytes have their own multiplication and
-                    // unsigned division.
-                    if n > 2 || (!mul && signed) {
-                        a.ins(format!("lda #{n}"));
-                        a.ins("sta rt_n");
-                    }
+                    // One, two and four bytes have their own
+                    // multiplication and unsigned division.
                     let (routine, result) = match op {
                         Div if !signed && n == 1 => ("rt_udiv8", "rt_a"),
                         Rem if !signed && n == 1 => ("rt_udiv8", "rt_r"),
                         Div if !signed && n == 2 => ("rt_udiv16", "rt_a"),
                         Rem if !signed && n == 2 => ("rt_udiv16", "rt_r"),
+                        Div if !signed && n == 4 => ("rt_udiv32", "rt_a"),
+                        Rem if !signed && n == 4 => ("rt_udiv32", "rt_r"),
                         Div => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_a"),
                         Rem => (if signed { "rt_sdiv" } else { "rt_udiv" }, "rt_r"),
                         _ if n == 1 => ("rt_mul8", "rt_r"),
                         _ if n == 2 => ("rt_mul16", "rt_r"),
+                        _ if n == 4 => ("rt_mul32", "rt_r"),
                         _ => ("rt_mul", "rt_r"),
                     };
+                    if matches!(routine, "rt_mul" | "rt_udiv" | "rt_sdiv") {
+                        a.ins(format!("lda #{n}"));
+                        a.ins("sta rt_n");
+                    }
                     a.ins(format!("jsr {routine}"));
                     a.copy(dst, &Val::Mem(Addr::Abs(result.into())), n);
+                    if let Some(d) = &other {
+                        let rest = if result == "rt_a" { "rt_r" } else { "rt_a" };
+                        a.copy(d, &Val::Mem(Addr::Abs(rest.into())), n);
+                    }
                 }
                 if op == MulWithOverflow {
                     // TODO: detect overflow (needs the full-width product).
@@ -3744,6 +5707,12 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     {
                         let d = d.clone();
                         Self::inc_dec(&mut self.p.asm, &d, 2, true);
+                        return;
+                    }
+                    // (a known address: the assembler adds)
+                    if let Some(e) = Self::imm_addr(&va) {
+                        let v = Val::Imm(vec![format!("#<({e}+{k})"), format!("#>({e}+{k})")]);
+                        self.a().copy(dst, &v, 2);
                         return;
                     }
                     let kv = Val::imm_u64(k, 2);
@@ -4046,6 +6015,16 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// to three bytes, else in the callee's result local.
     fn call_fn(&mut self, id: usize, args: &[(Val, u64)], dest: Option<Place<'tcx>>) {
         self.p.calls[self.id].push(id);
+        // A result that is read where the function leaves it.
+        if let Some(d) = dest
+            && d.projection.is_empty()
+            && self.res_cand.get(d.local.as_usize()) == Some(&true)
+        {
+            self.call_fn(id, args, None);
+            self.p.calls[self.id].pop();
+            self.res_at[d.local.as_usize()] = Some(format!("L{id}_0"));
+            return;
+        }
         // where the result goes: found before the call, as the registers
         // hold the result after it
         let dest = dest.map(|d| {
@@ -4105,11 +6084,42 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let (v, l) = self.operand(discr);
                 let n = l.size.bytes();
                 self.a().setup_val(&v, 0);
-                for (value, target) in targets.iter() {
+                // "Anything else cannot be" (the match of an enum): the
+                // last value needs no test, it is what is left.
+                let other = &self.mir.basic_blocks[targets.otherwise()];
+                let impossible = matches!(other.terminator().kind, TerminatorKind::Unreachable)
+                    && other.statements.iter().all(|s| {
+                        matches!(s.kind, StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop)
+                    });
+                let count = targets.iter().count();
+                let (tested, rest) = match targets.iter().last() {
+                    Some((_, last)) if impossible => (count - 1, last),
+                    _ => (count, targets.otherwise()),
+                };
+                // The bytes of the value that are constants (the upper
+                // byte of a tag that was extended): nothing to compare.
+                let known: Vec<Option<u8>> = (0..n)
+                    .map(|i| {
+                        let b = v.byte(i)?;
+                        let b = b.strip_prefix('#')?;
+                        match b.strip_prefix('$') {
+                            Some(h) => u8::from_str_radix(h, 16).ok(),
+                            None => b.parse().ok(),
+                        }
+                    })
+                    .collect();
+                for (value, target) in targets.iter().take(tested) {
+                    // (a value the bytes cannot have)
+                    if (0..n).any(|i| known[i as usize].is_some_and(|k| k != (value >> (8 * i)) as u8)) {
+                        continue;
+                    }
                     let tl = self.block(target);
                     let a = &mut self.p.asm;
                     let lnext = a.new_label();
                     for i in 0..n {
+                        if known[i as usize].is_some() {
+                            continue;
+                        }
                         a.lda(&v, i, 0);
                         let byte = (value >> (8 * i)) as u8;
                         if byte != 0 {
@@ -4120,7 +6130,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     a.ins(format!("jmp {tl}"));
                     a.label(&lnext);
                 }
-                self.goto(targets.otherwise(), next);
+                self.goto(rest, next);
             }
             TerminatorKind::Assert { target, msg, .. } if self.overflow_check_off(msg) => {
                 self.goto(*target, next)
@@ -4326,8 +6336,14 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             _ => {}
         }
         let id = self.p.func_id(inst, self.ctx);
+        let unpassed = unpassed_args(self.p, inst);
         let mut vals = Vec::with_capacity(args.len());
-        for arg in args {
+        for (i, arg) in args.iter().enumerate() {
+            // (a reference to nothing that the function does not look at)
+            if unpassed.get(i) == Some(&true) {
+                vals.push((Val::Imm(Vec::new()), 0));
+                continue;
+            }
             let (v, l) = self.operand(arg);
             vals.push((v, l.size.bytes()));
         }

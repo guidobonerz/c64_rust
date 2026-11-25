@@ -210,3 +210,50 @@ c64_fmt_dec:
         tya
         rts
 @pow10: .long 1000000000, 100000000, 10000000, 1000000, 100000, 10000, 1000, 100, 10
+
+; c64_fmt_dec16(n: u16) -> u8: the same for 16 bits (1-5 digits): what a
+; program needs that prints no wider numbers. A power of ten is subtracted
+; as long as the number is not smaller. In a program that has the routine
+; for 32 bits anyway, this one only passes the number on.
+c64_fmt_dec16:
+.ifdef c64_fmt_dec {
+        sta c64_fmt_dec__args
+        stx c64_fmt_dec__args+1
+        lda #0
+        sta c64_fmt_dec__args+2
+        sta c64_fmt_dec__args+3
+        jmp c64_fmt_dec
+} .else {
+        ldy #0                  ; digits written
+        ldx #6                  ; the power of ten (2 bytes each)
+@power: lda #$30
+        sta rt_t
+@sub:   lda c64_fmt_dec16__args
+        cmp @pow10,x
+        lda c64_fmt_dec16__args+1
+        sbc @pow10+1,x
+        bcc @out
+        sta c64_fmt_dec16__args+1
+        lda c64_fmt_dec16__args
+        sbc @pow10,x            ; (the carry is set)
+        sta c64_fmt_dec16__args
+        inc rt_t
+        bne @sub
+@out:   lda rt_t
+        cmp #$30
+        bne @digit
+        cpy #0
+        beq @next               ; no leading zeros
+@digit: sta rt_b,y
+        iny
+@next:  dex
+        dex
+        bpl @power
+        lda c64_fmt_dec16__args
+        ora #$30
+        sta rt_b,y
+        iny
+        tya
+        rts
+@pow10: .word 10, 100, 1000, 10000
+}

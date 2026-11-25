@@ -194,6 +194,12 @@ impl Asm {
         if size == 0 {
             return;
         }
+        // (a value that was built where it goes)
+        if let (Addr::Abs(d), Val::Mem(Addr::Abs(s))) = (dst, src)
+            && d == s
+        {
+            return;
+        }
         if size > 16 {
             if let Val::Mem(s) = src {
                 if self.copy_block(dst, s, size) {
@@ -575,6 +581,7 @@ fn label_follows(lines: &[Line], i: usize, name: &str) -> bool {
 /// * a jump to the next line is removed,
 /// * `bcc skip / jmp target / skip:` becomes `bcs target` when the target
 ///   is certainly within branch range (sizes are upper bounds),
+/// * `bne a / beq b / a: jmp target / b:` becomes `bne target` likewise,
 /// * labels nothing refers to any more are removed (the peephole pass then
 ///   sees through them). Only local labels (`_L…`, `F…_b…`) are touched.
 pub fn relax(text: &str) -> String {
@@ -720,6 +727,50 @@ pub fn relax_with(text: &str, size: &dyn Fn(&str, &str) -> i64, range: i64) -> S
                 changed = true;
             }
         }
+        // 3b. bne a / beq b / a: jmp target / b:  ->  bne target
+        // (the second branch is the opposite of the first: always taken)
+        for i in 0..lines.len() {
+            let Line::Ins(op, la) = &lines[i] else { continue };
+            let Some(opp) = opposite(op) else { continue };
+            let Some(j) = next_ins(&lines, i + 1) else { continue };
+            let Line::Ins(op2, lb) = &lines[j] else { continue };
+            if op2 != opp || !local(la) || (i + 1..j).any(|m| matches!(lines[m], Line::Label(_))) {
+                continue;
+            }
+            let Some(k) = next_ins(&lines, j + 1) else { continue };
+            let Line::Ins(jop, target) = &lines[k] else { continue };
+            // between the branches and the jump: the label `a` alone
+            let mut between = (j + 1..k).filter_map(|m| match &lines[m] {
+                Line::Label(n) => Some(n),
+                _ => None,
+            });
+            if jop != "jmp"
+                || !local(target)
+                || between.next() != Some(la)
+                || between.next().is_some()
+                || !label_follows(&lines, k, lb)
+            {
+                continue;
+            }
+            // nothing else leads to `a`
+            let refs = lines
+                .iter()
+                .filter(|l| match l {
+                    Line::Ins(_, arg) | Line::Other(arg) => {
+                        arg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == la)
+                    }
+                    Line::Label(_) => false,
+                })
+                .count();
+            let Some(&(_, tpos)) = label_pos.get(target) else { continue };
+            let d = tpos - (pos[i] + 2);
+            if refs == 1 && (-range..=range).contains(&d) {
+                lines[i] = Line::Ins(op.clone(), target.clone());
+                lines[j] = Line::Other(String::new());
+                lines[k] = Line::Other(String::new());
+                changed = true;
+            }
+        }
         // 4. unreferenced local labels
         let mut used = std::collections::HashSet::new();
         for l in &lines {
@@ -835,6 +886,11 @@ fn idents(text: &str) -> impl Iterator<Item = &str> {
 /// code and data) or a kept chunk mentions its name, or if the kept chunk
 /// before it runs into it (its last instruction is not `rts`, `jmp` or
 /// `rti`). Text before the first label is always kept.
+///
+/// A chunk can have two forms: what is in the first branch of an
+/// `.ifdef NAME { ... } .else { ... }` counts only if the chunk NAME is
+/// kept anyway (the assembler then picks that branch). So a small routine
+/// can pass its work on to a larger one where the program has both.
 pub fn prune(lib: &str, program: &str) -> String {
     struct Chunk<'a> {
         name: &'a str,
@@ -897,18 +953,61 @@ pub fn prune(lib: &str, program: &str) -> String {
     }
     let index: std::collections::HashMap<&str, usize> =
         chunks.iter().enumerate().map(|(i, c)| (c.name, i)).collect();
+    // What a chunk refers to: always, and in the first branch of an
+    // `.ifdef NAME {` (up to its `}`), which is only assembled if the
+    // chunk NAME is kept for another reason.
+    let refs = |text: &str| -> (Vec<usize>, Vec<(usize, Vec<usize>)>) {
+        let mut always = Vec::new();
+        let mut cond: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut inside = false;
+        for line in text.lines() {
+            let t = line.split(';').next().unwrap_or("").trim();
+            if let Some(rest) = t.strip_prefix(".ifdef ") {
+                let name = rest.trim_end_matches('{').trim();
+                match index.get(name) {
+                    Some(&i) => {
+                        cond.push((i, Vec::new()));
+                        inside = true;
+                    }
+                    None => inside = false,
+                }
+                continue;
+            }
+            if t.starts_with('}') {
+                inside = false;
+            }
+            let found = idents(line).filter_map(|t| index.get(t).copied());
+            match cond.last_mut() {
+                Some((_, v)) if inside => v.extend(found),
+                _ => always.extend(found),
+            }
+        }
+        (always, cond)
+    };
     let mut keep = vec![false; chunks.len()];
     let mut work: Vec<usize> = idents(program)
         .chain(idents(&preamble))
         .filter_map(|t| index.get(t).copied())
         .collect();
-    while let Some(i) = work.pop() {
-        if std::mem::replace(&mut keep[i], true) {
-            continue;
+    let mut waiting: Vec<(usize, Vec<usize>)> = Vec::new();
+    loop {
+        while let Some(i) = work.pop() {
+            if std::mem::replace(&mut keep[i], true) {
+                continue;
+            }
+            let (always, cond) = refs(&chunks[i].text);
+            work.extend(always);
+            waiting.extend(cond);
+            if chunks[i].falls_through && i + 1 < chunks.len() {
+                work.push(i + 1);
+            }
         }
-        work.extend(idents(&chunks[i].text).filter_map(|t| index.get(t).copied()));
-        if chunks[i].falls_through && i + 1 < chunks.len() {
-            work.push(i + 1);
+        // branches whose condition holds by now
+        let (ready, rest): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(c, _)| keep[*c]);
+        waiting = rest;
+        work.extend(ready.into_iter().flat_map(|(_, v)| v).filter(|&i| !keep[i]));
+        if work.is_empty() {
+            break;
         }
     }
     let mut out = preamble;
@@ -929,7 +1028,9 @@ pub fn prune(lib: &str, program: &str) -> String {
 ///         sta zp_pN+1
 /// ```
 ///
-/// is removed and the following `(zp_pN),y` accesses become `(P),y`, when P
+/// (or without its first line, where A holds the low byte of P from a load
+/// further up) is removed and the following `(zp_pN),y` accesses become
+/// `(P),y`, when P
 /// is in the zero page (`in_zp`) and, as far as the scratch pointer holds P
 /// (the region),
 /// * P is not written,
@@ -937,9 +1038,12 @@ pub fn prune(lib: &str, program: &str) -> String {
 /// * the code is straight, apart from branches inside the region (to `_C`
 ///   labels of the code generator and to `@labels` of an `asm!` block).
 ///
-/// The region ends at the next setup, at a return or at any other label:
-/// neither the code generator nor an `asm!` block relies on a scratch
-/// pointer beyond its statement.
+/// The region ends at the next setup, at a return, at a jump, or at any
+/// other label that is reached from in front of the setup. Labels that are
+/// only reached from behind it belong to the region, with all the lines
+/// that branch to them: a setup that the data-flow pass moved in front of
+/// a loop serves the whole loop. Behind the region nothing may use the
+/// scratch pointer before it is set again.
 pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     // The label and the instruction of a line.
@@ -980,183 +1084,279 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
     let word = |line: &str, name: &str| {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '@')).any(|w| w == name)
     };
+    let mut refs: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    let mut refs_stale = true;
     let mut i = 0;
     while i + 3 < lines.len() {
         let quad: Vec<Option<(String, String)>> = (0..4).map(|k| ins(&lines[i + k])).collect();
-        let (Some((o0, p)), Some((o1, z)), Some((o2, p1)), Some((o3, z1))) =
-            (&quad[0], &quad[1], &quad[2], &quad[3])
-        else {
+        // through A, or through X (the data-flow pass, in front of an
+        // access with an index in Y)
+        let full = match (&quad[0], &quad[1], &quad[2], &quad[3]) {
+            (Some((o0, p)), Some((o1, z)), Some((o2, p1)), Some((o3, z1))) => {
+                let via_x = o0 == "ldx" && o1 == "stx" && o2 == "ldx" && o3 == "stx";
+                (((o0 == "lda" && o1 == "sta" && o2 == "lda" && o3 == "sta") || via_x)
+                    && ZP.contains(&z.as_str())
+                    && *p1 == format!("{p}+1")
+                    && *z1 == format!("{z}+1")
+                    && in_zp(p))
+                .then(|| (p.clone(), z.clone(), via_x, 4))
+            }
+            _ => None,
+        };
+        // Without the first load: A holds the low byte of P from a load
+        // further up (the test of a loop, `lda P` / `cmp end` / `beq`),
+        // with nothing in between that changes A or P.
+        let short = || -> Option<(String, String, bool, usize)> {
+            let (Some((o1, z)), Some((o2, p1)), Some((o3, z1))) = (&quad[0], &quad[1], &quad[2]) else { return None };
+            let p = p1.strip_suffix("+1")?;
+            if !(o1 == "sta" && o2 == "lda" && o3 == "sta")
+                || !ZP.contains(&z.as_str())
+                || *z1 != format!("{z}+1")
+                || !in_zp(p)
+            {
+                return None;
+            }
+            for k in (0..i).rev() {
+                let (label, instr) = parse(&lines[k]);
+                if label.is_some() {
+                    return None;
+                }
+                let Some((op, arg)) = instr else { continue };
+                if op == "lda" {
+                    return (arg == p).then(|| (p.to_owned(), z.clone(), false, 3));
+                }
+                let keeps = matches!(
+                    op.as_str(),
+                    "cmp" | "cpx" | "cpy" | "bne" | "beq" | "bcc" | "bcs" | "bpl" | "bmi" | "bvc" | "bvs" | "clc"
+                        | "sec" | "ldx" | "ldy" | "inx" | "iny" | "dex" | "dey"
+                ) || (matches!(op.as_str(), "sta" | "stx" | "sty")
+                    && arg != p
+                    && !arg.starts_with(&format!("{p}+"))
+                    && !arg.contains([',', '(']));
+                if !keeps {
+                    return None;
+                }
+            }
+            None
+        };
+        let Some((p, z, via_x, len)) = full.or_else(short) else {
             i += 1;
             continue;
         };
-        // through A, or through X (the data-flow pass, in front of an
-        // access with an index in Y)
-        let via_x = o0 == "ldx" && o1 == "stx" && o2 == "ldx" && o3 == "stx";
-        if !(((o0 == "lda" && o1 == "sta" && o2 == "lda" && o3 == "sta") || via_x)
-            && ZP.contains(&z.as_str())
-            && *p1 == format!("{p}+1")
-            && *z1 == format!("{z}+1")
-            && in_zp(p))
-        {
-            i += 1;
-            continue;
-        }
-        let (p, z) = (p.clone(), z.clone());
         let through = format!("({z}),y");
         let sets_up =
             |op: &str, arg: &str| matches!(op, "sta" | "stx") && (arg == z || arg == format!("{z}+1"));
         // The region in which the scratch pointer holds P.
-        let mut end = i + 4;
-        let mut ok = true;
-        let mut loops: Vec<(usize, String)> = Vec::new();
-        let mut seen_label = false;
-        while end < lines.len() {
-            let (label, instr) = parse(&lines[end]);
-            if let Some(name) = label {
-                if name.starts_with('@') {
-                    loops.push((end, name));
-                } else if !name.starts_with("_C") {
-                    break; // a label
+        // The lines that name each operand (for the labels: the branches and
+        // jumps to them), as the lines are now.
+        if refs_stale {
+            refs.clear();
+            for (k, l) in lines.iter().enumerate() {
+                if let Some((_, arg)) = parse(l).1 {
+                    refs.entry(arg).or_default().push(k);
                 }
-                seen_label = true;
             }
-            let Some((op, arg)) = instr else {
+            refs_stale = false;
+        }
+        // The region: first up to the next label (a statement), then, if
+        // the scratch pointer is used beyond that, with the loops behind
+        // the setup.
+        let mut found = None;
+        for extend in [false, true] {
+            let mut end = i + len;
+            let mut ok = true;
+            let mut loops: Vec<(usize, String)> = Vec::new();
+            let mut seen_label = false;
+            // The lines that branch or jump to a label.
+            let mentions = |name: &str| -> &[usize] { refs.get(name).map_or(&[], |v| &v[..]) };
+            // labels inside the region that are only reached from behind the
+            // setup: of a loop that the setup was moved in front of
+            let mut inner: Vec<String> = Vec::new();
+            // the region ends where the scratch pointer is set again or the
+            // function returns; with a jump
+            let (mut closed, mut at_jump) = (false, false);
+            while end < lines.len() {
+                let (label, instr) = parse(&lines[end]);
+                if let Some(name) = label {
+                    if name.starts_with('@') {
+                        loops.push((end, name));
+                    } else if !name.starts_with("_C") {
+                        if !extend || !local(&name) || mentions(&name).iter().any(|&k| k < i) {
+                            break; // a label
+                        }
+                        inner.push(name);
+                    }
+                    seen_label = true;
+                }
+                let Some((op, arg)) = instr else {
+                    end += 1;
+                    continue;
+                };
+                if sets_up(&op, &arg) || matches!(op.as_str(), "rts" | "rti") {
+                    closed = true;
+                    break;
+                }
+                if op == "jmp" && (generated(&arg) || local(&arg)) {
+                    at_jump = true;
+                    break;
+                }
+                // A call (or a jump to a routine: `jsr` / `rts`) may read the
+                // scratch pointer; so does any other use of it.
+                if (matches!(op.as_str(), "jsr" | "jmp") && !generated(&arg))
+                    || (arg.contains(z.as_str()) && arg != through)
+                {
+                    ok = false;
+                    break;
+                }
+                let writes = matches!(
+                    op.as_str(),
+                    "sta" | "stx" | "sty" | "inc" | "dec" | "asl" | "lsr" | "rol" | "ror"
+                );
+                if writes && (arg == p || arg.starts_with(&format!("{p}+"))) {
+                    // P changes: the region ends here, if the code was straight
+                    // so far and what follows does not use the scratch pointer
+                    // (`*p = x; p += 1`).
+                    ok = !seen_label;
+                    for l in &lines[end + 1..] {
+                        let (label, instr) = parse(l);
+                        if label.is_some() {
+                            break;
+                        }
+                        let Some((op, arg)) = instr else { continue };
+                        if sets_up(&op, &arg)
+                            || matches!(op.as_str(), "rts" | "rti")
+                            || (op == "jmp" && (generated(&arg) || local(&arg)))
+                        {
+                            break;
+                        }
+                        if (matches!(op.as_str(), "jsr" | "jmp") && !generated(&arg)) || arg.contains(z.as_str()) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    break;
+                }
                 end += 1;
-                continue;
-            };
-            if sets_up(&op, &arg)
-                || matches!(op.as_str(), "rts" | "rti")
-                || (op == "jmp" && (generated(&arg) || local(&arg)))
-            {
-                break;
             }
-            // A call (or a jump to a routine: `jsr` / `rts`) may read the
-            // scratch pointer; so does any other use of it.
-            if (matches!(op.as_str(), "jsr" | "jmp") && !generated(&arg))
-                || (arg.contains(z.as_str()) && arg != through)
-            {
+            // The labels in the region: only reached from inside it (the jump
+            // that ends it counts as inside).
+            let limit = if at_jump { end + 1 } else { end };
+            if ok && inner.iter().any(|name| mentions(name).iter().any(|&k| k < i + len || k >= limit)) {
                 ok = false;
-                break;
             }
-            let writes = matches!(
-                op.as_str(),
-                "sta" | "stx" | "sty" | "inc" | "dec" | "asl" | "lsr" | "rol" | "ror"
-            );
-            if writes && (arg == p || arg.starts_with(&format!("{p}+"))) {
-                // P changes: the region ends here, if the code was straight
-                // so far and what follows does not use the scratch pointer
-                // (`*p = x; p += 1`).
-                ok = !seen_label;
-                for l in &lines[end + 1..] {
+            // Beyond the region nothing uses the scratch pointer before it is
+            // set again (as the text goes: to the end of the function).
+            if ok && !closed {
+                for l in &lines[end..] {
                     let (label, instr) = parse(l);
-                    if label.is_some() {
+                    if label.is_some_and(|n| generated(&n)) {
                         break;
                     }
                     let Some((op, arg)) = instr else { continue };
-                    if sets_up(&op, &arg)
-                        || matches!(op.as_str(), "rts" | "rti")
-                        || (op == "jmp" && (generated(&arg) || local(&arg)))
-                    {
+                    if sets_up(&op, &arg) {
                         break;
                     }
-                    if (matches!(op.as_str(), "jsr" | "jmp") && !generated(&arg)) || arg.contains(z.as_str()) {
+                    if arg.contains(z.as_str()) {
                         ok = false;
                         break;
                     }
                 }
-                break;
             }
-            end += 1;
-        }
-        // The `@labels` in the region: only branched to from inside it.
-        for (at, name) in &loops {
-            if !ok {
-                break;
-            }
-            let is_scope_end = |l: &str| parse(l).0.is_some_and(|n| !n.starts_with('@'));
-            let lo = (0..*at).rev().find(|&k| is_scope_end(&lines[k])).map_or(0, |k| k + 1);
-            let hi = (*at + 1..lines.len()).find(|&k| is_scope_end(&lines[k])).unwrap_or(lines.len());
-            for k in (lo..hi).filter(|&k| k != *at && !(i + 4..end).contains(&k)) {
-                if word(&lines[k], name) {
-                    ok = false;
+            // The `@labels` in the region: only branched to from inside it.
+            for (at, name) in &loops {
+                if !ok {
                     break;
                 }
-            }
-        }
-        // A branch from the region to an `@label` outside it: the code
-        // there may use the pointer too.
-        if ok {
-            for l in &lines[i + 4..end] {
-                if let Some((_, arg)) = parse(l).1
-                    && arg.starts_with('@')
-                    && !loops.iter().any(|(_, n)| *n == arg)
-                {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        // The removed loads also set A (or X) and the flags: what follows
-        // must load the register again before using either (labels on the
-        // way do not matter: this is about the code that runs after the
-        // setup).
-        if ok && via_x {
-            // The next instruction sets the flags, and X is not used up to
-            // its next load, the end of the statement (a label) or the end
-            // of the function.
-            let mut first = true;
-            for l in &lines[i + 4..] {
-                let (label, instr) = parse(l);
-                if label.is_some_and(|n| !n.starts_with('@') && !n.starts_with("_C")) {
-                    break;
-                }
-                let Some((op, arg)) = instr else { continue };
-                let arg = arg.to_ascii_lowercase();
-                if std::mem::take(&mut first) && !matches!(op.as_str(), "lda" | "ldy" | "ldx" | "tay" | "tya" | "pla") {
-                    ok = false;
-                    break;
-                }
-                // (a function of the program may take X as an argument)
-                let routine = matches!(op.as_str(), "jsr" | "jmp") && !local(&arg);
-                if matches!(op.as_str(), "ldx" | "tax" | "tsx" | "rts" | "rti")
-                    || (matches!(op.as_str(), "jsr" | "jmp") && !routine && !arg.starts_with('@'))
-                {
-                    break;
-                }
-                if routine
-                    || matches!(op.as_str(), "txa" | "txs" | "stx" | "inx" | "dex" | "cpx")
-                    || arg.ends_with(",x")
-                    || arg.ends_with(",x)")
-                {
-                    ok = false;
-                    break;
-                }
-            }
-        } else if ok {
-            ok = false;
-            for l in &lines[i + 4..] {
-                let Some((op, _)) = parse(l).1 else { continue };
-                match op.as_str() {
-                    "lda" | "pla" | "txa" | "tya" => {
-                        ok = true;
+                let is_scope_end = |l: &str| parse(l).0.is_some_and(|n| !n.starts_with('@'));
+                let lo = (0..*at).rev().find(|&k| is_scope_end(&lines[k])).map_or(0, |k| k + 1);
+                let hi = (*at + 1..lines.len()).find(|&k| is_scope_end(&lines[k])).unwrap_or(lines.len());
+                for k in (lo..hi).filter(|&k| k != *at && !(i + len..end).contains(&k)) {
+                    if word(&lines[k], name) {
+                        ok = false;
                         break;
                     }
-                    "ldx" | "ldy" | "clc" | "sec" | "inx" | "iny" | "dex" | "dey" => {}
-                    _ => break,
                 }
             }
+            // A branch from the region to an `@label` outside it: the code
+            // there may use the pointer too.
+            if ok {
+                for l in &lines[i + len..end] {
+                    if let Some((_, arg)) = parse(l).1
+                        && arg.starts_with('@')
+                        && !loops.iter().any(|(_, n)| *n == arg)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            // The removed loads also set A (or X) and the flags: what follows
+            // must load the register again before using either (labels on the
+            // way do not matter: this is about the code that runs after the
+            // setup).
+            if ok && via_x {
+                // The next instruction sets the flags, and X is not used up to
+                // its next load, the end of the statement (a label) or the end
+                // of the function.
+                let mut first = true;
+                for l in &lines[i + len..] {
+                    let (label, instr) = parse(l);
+                    if label.is_some_and(|n| !n.starts_with('@') && !n.starts_with("_C")) {
+                        break;
+                    }
+                    let Some((op, arg)) = instr else { continue };
+                    let arg = arg.to_ascii_lowercase();
+                    if std::mem::take(&mut first) && !matches!(op.as_str(), "lda" | "ldy" | "ldx" | "tay" | "tya" | "pla") {
+                        ok = false;
+                        break;
+                    }
+                    // (a function of the program may take X as an argument)
+                    let routine = matches!(op.as_str(), "jsr" | "jmp") && !local(&arg);
+                    if matches!(op.as_str(), "ldx" | "tax" | "tsx" | "rts" | "rti")
+                        || (matches!(op.as_str(), "jsr" | "jmp") && !routine && !arg.starts_with('@'))
+                    {
+                        break;
+                    }
+                    if routine
+                        || matches!(op.as_str(), "txa" | "txs" | "stx" | "inx" | "dex" | "cpx")
+                        || arg.ends_with(",x")
+                        || arg.ends_with(",x)")
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else if ok {
+                ok = false;
+                for l in &lines[i + len..] {
+                    let Some((op, _)) = parse(l).1 else { continue };
+                    match op.as_str() {
+                        "lda" | "pla" | "txa" | "tya" => {
+                            ok = true;
+                            break;
+                        }
+                        "ldx" | "ldy" | "clc" | "sec" | "inx" | "iny" | "dex" | "dey" => {}
+                        _ => break,
+                    }
+                }
+            }
+            if ok {
+                found = Some(end);
+                break;
+            }
         }
-        if !ok {
+        let Some(end) = found else {
             i += 1;
             continue;
-        }
+        };
         let direct = format!("({p}),y");
-        for l in &mut lines[i + 4..end] {
+        for l in &mut lines[i + len..end] {
             if l.contains(&through) {
                 *l = l.replace(&through, &direct);
             }
         }
-        lines.drain(i..i + 4);
+        lines.drain(i..i + len);
+        refs_stale = true;
     }
     let mut out = lines.join("\n");
     out.push('\n');
@@ -1164,13 +1364,13 @@ pub fn zp_direct(text: &str, in_zp: impl Fn(&str) -> bool) -> String {
 }
 
 /// Whether the program text can change machine state that the exit code
-/// restores for BASIC: the interrupt setup, the memory configuration, the
-/// VIC mode and bank, the SID.
+/// sets up again for BASIC: the interrupt setup, the memory configuration,
+/// the VIC mode and bank, the SID.
 ///
 /// The answer is "no" only if every write is to a place that is known and
 /// harmless: a label of the program, or an absolute address outside the
 /// CPU port, the interrupt vectors and the I/O area (the border and
-/// background colours `$D020`-`$D02E` are not restored and do not count).
+/// background colours `$D020`-`$D02E` are left as they are and do not count).
 /// A store through a pointer or with an index on a numeric address, a call
 /// to a numeric address outside the ROMs, an indirect jump, `sei` and
 /// labels that are names for such addresses all count as "can change it".
@@ -1253,6 +1453,59 @@ pub fn touches_hw(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether the assembly names one of the interrupt vectors `$0314`-`$0319`
+/// (by number or through a name for it): the exit code then sets the IRQ
+/// vector to the KERNAL's handler again.
+pub fn touches_irq(text: &str) -> bool {
+    let vector = |e: &str| -> bool {
+        let e = e.trim().trim_start_matches(['#', '<', '>', '(']);
+        let end = e.find(|c: char| !(c.is_ascii_alphanumeric() || c == '$' || c == '+' || c == ' ')).unwrap_or(e.len());
+        let mut sum = 0u32;
+        for part in e[..end].split('+') {
+            let part = part.trim();
+            let v = match part.strip_prefix('$') {
+                Some(h) => u32::from_str_radix(h, 16).ok(),
+                None => part.parse().ok(),
+            };
+            match v {
+                Some(v) => sum += v,
+                None => return false,
+            }
+        }
+        (0x0314..=0x0319).contains(&sum)
+    };
+    let mut names = std::collections::HashSet::new();
+    for l in text.lines() {
+        let l = l.split(';').next().unwrap_or("");
+        if let Some((name, value)) = l.split_once('=')
+            && !l.starts_with(' ')
+            && vector(value)
+        {
+            names.insert(name.trim().to_owned());
+        }
+    }
+    text.lines().any(|l| {
+        let l = l.split(';').next().unwrap_or("");
+        let mut t = l.trim();
+        if let Some(i) = t.find(':')
+            && !t[..i].contains(char::is_whitespace)
+        {
+            t = t[i + 1..].trim();
+        }
+        if t.is_empty() || t.starts_with('.') || t.contains('=') {
+            return false;
+        }
+        let Some((_, arg)) = t.split_once(char::is_whitespace) else { return false };
+        let arg = arg.trim();
+        if vector(arg) {
+            return true;
+        }
+        let base = arg.trim_start_matches(['#', '<', '>', '(']);
+        let end = base.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '@')).unwrap_or(base.len());
+        names.contains(&base[..end])
+    })
 }
 
 /// `X+2+1` -> (`X`, 3); `None` if the operand is not a symbol plus offsets.

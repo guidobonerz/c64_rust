@@ -226,6 +226,110 @@ fn rename(arg: &str, map: &HashMap<&str, String>) -> String {
     out
 }
 
+/// The copy of the result that follows the call of `callee` at line `at`
+/// of `lines`, the text of `caller`:
+///
+/// ```text
+///     jsr F5
+///     ldx #23
+/// _C7:
+///     lda L5_0-1,x
+///     sta F1v14-1,x
+///     dex
+///     bne _C7
+/// ```
+///
+/// if the text of the function can write its result to that place itself
+/// once it stands there: the copy takes all `size` bytes of the result to
+/// a variable of the caller that no pointer exists to at the call (`free`
+/// tells so for a variable; otherwise no address of it is taken anywhere
+/// in the caller), and nothing else in the caller names the result. The
+/// variable is not in use while the function runs (the copy overwrites all
+/// of it, and the function does not know the caller's variables), and it
+/// lies above everything the function calls, as the caller's whole frame
+/// does.
+///
+/// Returns the place and the number of lines of the copy.
+pub fn result_copy(
+    lines: &[String],
+    at: usize,
+    callee: usize,
+    caller: usize,
+    size: u64,
+    free: &dyn Fn(&str) -> bool,
+) -> Option<(String, usize)> {
+    let ins = |i: usize| -> Option<(&str, &str)> {
+        let l = lines.get(i)?;
+        if !l.starts_with([' ', '\t']) {
+            return None;
+        }
+        let t = l.split(';').next().unwrap_or("").trim();
+        Some(t.split_once(' ').map_or((t, ""), |(op, arg)| (op, arg.trim())))
+    };
+    let (Some(("ldx", n)), Some(("lda", src)), Some(("sta", dst)), Some(("dex", "")), Some(("bne", back))) =
+        (ins(at + 1), ins(at + 3), ins(at + 4), ins(at + 5), ins(at + 6))
+    else {
+        return None;
+    };
+    let n = n.strip_prefix('#')?;
+    let n = match n.strip_prefix('$') {
+        Some(h) => u64::from_str_radix(h, 16).ok()?,
+        None => n.parse().ok()?,
+    };
+    if n != size || lines[at + 2].trim() != format!("{back}:") {
+        return None;
+    }
+    let result = [format!("L{callee}_0"), format!("F{callee}v0")];
+    let src = src.strip_suffix("-1,x")?;
+    let src = src.strip_suffix("+0").unwrap_or(src);
+    let dst = dst.strip_suffix("-1,x")?;
+    if !result.iter().any(|r| r == src) {
+        return None;
+    }
+    // a variable or a temporary of the caller
+    let own = [format!("F{caller}v"), format!("F{caller}t")];
+    let base = dst.split('+').next().unwrap_or(dst);
+    if !own.iter().any(|o| base.strip_prefix(o.as_str()).is_some_and(|r| r.bytes().all(|b| b.is_ascii_digit())))
+        || dst.contains(['-', '(', ','])
+    {
+        return None;
+    }
+    let free = free(base);
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let words = |l: &str, w: &str| -> usize {
+        l.match_indices(w)
+            .filter(|&(i, _)| {
+                !l[..i].chars().next_back().is_some_and(is_word) && !l[i + w.len()..].chars().next().is_some_and(is_word)
+            })
+            .count()
+    };
+    for (i, l) in lines.iter().enumerate() {
+        let l = l.split(';').next().unwrap_or("");
+        // (the result: only in the copy)
+        if i != at + 3 && result.iter().any(|r| words(l, r) > 0) {
+            return None;
+        }
+        // (the address of the variable)
+        if !free && words(l, base) > 0 && (l.contains("#<") || l.contains("#>")) {
+            return None;
+        }
+    }
+    Some((dst.to_owned(), 6))
+}
+
+/// The text of a function that is pasted (`paste`), writing its result to
+/// `place` (see `result_copy`), and what the copy left in the registers.
+pub fn with_result_at(text: Vec<String>, callee: usize, place: &str) -> Vec<String> {
+    let (l, f) = (format!("L{callee}_0"), format!("F{callee}v0"));
+    let mut map: HashMap<&str, String> = HashMap::new();
+    map.insert(&l, place.to_owned());
+    map.insert(&f, place.to_owned());
+    let mut out: Vec<String> = text.iter().map(|line| rename(line, &map)).collect();
+    out.push(format!("        lda {place}"));
+    out.push("        ldx #$00".to_owned());
+    out
+}
+
 /// The lines that replace a call of `b` in function `caller`: the text
 /// with labels of its own. In place of a `jsr` every way out of the
 /// function leads to the end of the text; in place of a `jmp` at the end

@@ -21,6 +21,15 @@ unsafe extern "C" {
 static mut TEST: u8 = 0;
 static mut FAILS: u8 = 0;
 
+#[inline(never)]
+fn sum_to(n: u16) -> u32 {
+    let mut s = 7u32;
+    for i in 0..n {
+        s += i as u32;
+    }
+    s
+}
+
 fn check(ok: bool) {
     unsafe {
         TEST += 1;
@@ -97,6 +106,14 @@ fn main() {
     // 14-15: input
     check(input::joy(Port::One).idle() && input::joy(Port::Two).idle());
     check(input::key().is_none());
+
+    // 16: the result of a function with one caller (its code is put into
+    // the caller) is still there after other calls: printed after a text
+    text::clear();
+    let total = sum_to(bb(200));
+    c64::println!("T ", bb(123456u32));
+    c64::println!("S ", total);
+    check(screen_is(0x0400, b"T 123456") && screen_is(0x0428, b"S 19907"));
 
     unsafe {
         v.border.write(if FAILS == 0 { Color::Green } else { Color::Red });

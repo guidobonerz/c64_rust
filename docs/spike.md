@@ -35,10 +35,115 @@ mul/div/shift, loops, arrays, slices, iterators, closures, structs, enums,
   overlay with zero-page frames, block layout, branch relaxation, pruning
   of unused runtime; since 2026-11-23 a data-flow pass over the assembly
   of each function, `opt.rs`: values and ranges, liveness, merged copies,
-  index registers, loop counters in X/Y, loop tests at the end, invariant code out of loops, and frames that only keep the
+  index registers, loop counters in X/Y, loop tests at the end and 8 bits wide for slices of known length, an index in Y in place of an iterator's pointer, invariant code out of loops, and frames that only keep the
   bytes still in use; arguments and results in A, X and Y; since
   2026-11-24 `inline.rs`: the assembly of a function replaces its calls
   if it has one caller or is not longer than what the calls save).
+* Start and exit (2026-11-24): the exit code no longer restores saved
+  hardware registers. It sets what BASIC starts with: `$01`, the KERNAL's
+  `IOINIT`, `$D011`-`$D01A` from the KERNAL's table at `$ECC9`, and the
+  IRQ vector if the program names it. Nothing is saved at the start; most
+  programs are 105 bytes smaller. Numbers of up to 16 bits have a digit
+  routine of their own (78 bytes instead of 167), which only passes the
+  number on where the program has the 32-bit one too (`.ifdef` in a
+  library routine: `asm::prune` counts the first branch only if the other
+  routine is kept).
+* Structs and enums (2026-11-24, after the C ports of `dir` and `sd2iec`
+  came out at half the size): views of more than 16 bytes, temporaries
+  that are built where they go (`forwarded`), results that are read in
+  the callee's frame until the next call (`result_views`), `!cmp` fused
+  into the branch, comparisons that a dominating branch has made
+  (`implied`), no test for the last variant of a match whose rest is
+  unreachable, one comparison for an enum with a niche (`niche_switch`),
+  and in `opt.rs` a direct access where pointer and Y are known
+  (`Plan::Direct`). `dir` 2323 to 1945 bytes, `sd2iec` 4721 to 4004.
+  Then: several jumps back to a loop's head are led through one block,
+  so the step can sink there (`funnel`); the registers a function reads
+  at its entry are noted and the callers load only those (`entry_regs`);
+  a reference to a value without bytes that is only handed on is no
+  argument (`unpassed_args`). `dir` 1827, `sd2iec` 3840, `hello` 402.
+  Then the frames in two parts (`compact_frames`, `Frame`; values of up
+  to `FRAME_SMALL` bytes in `F<n>f`, the others in `F<n>g`, both placed
+  with the same rule, all small parts first): what the rule for inlined
+  frames below had pushed out of the zero page is back in it, and more.
+  `dir` 1744, `sd2iec` 3608, `uci` 2397; the other programs are as they
+  were (their frames were in the zero page already).
+  `RUST64_FRAME_SMALL=<n>` sets the limit for a build (1000: one part).
+  Then counters of two bytes that stay below 256 (`narrow_locals`,
+  `below` in `codegen.rs`: every assignment is a small constant, an
+  extended byte, or `n + k` under a dominating `n < c` with `c + k <=
+  256`; such a local is read as its low byte and `#$00`, the stores to
+  the high byte die in `opt.rs`), and `address + constant` folded for the
+  assembler (`fold_addr` in `opt.rs`; `span` knows `X` and `X+k`, so the
+  low-byte comparison of `narrow_test` still applies). `dir` 1710,
+  `sd2iec` 3553, `music` 1052, `rasterbars` 1314 and 1930 cycles a frame,
+  `diagonal` 1332. Lengths in structs (`Name::len`) are still two bytes.
+  Then locals that share their bytes (`join_locals`, `flow`, `Flow` in
+  `codegen.rs`): for every move of four bytes or more between two locals
+  (also through a view, and into an aggregate) the smaller one is placed
+  in the larger one if the two do not clash: one is written (also through
+  a pointer while a reference to it may exist) where the other is read or
+  holds a value that is read later. The result is in `fwd`; groups are
+  checked pair by pair; arguments and the result stay where they are.
+  Addresses noted before (`addrs`) are rewritten. In `inline_fns` a
+  pasted function writes its in-memory result to the caller's variable
+  if the copy after the call takes all of it and no reference to the
+  variable exists at the call (`inline::result_copy`, `free_dests`).
+  `dir` 1647, `sd2iec` 3421. `RUST64_NO_JOIN=1`, `RUST64_JOIN_TRACE=1`.
+  Left: the result of a function that stays a function is still copied
+  out of its frame if it is needed after the next call (`Dir::line` to
+  the entry of the loop: 23 bytes a line). Counted before building it:
+  one such copy in `dir`, two in `sd2iec`, about 11 bytes each, against a
+  new rule for the frames (the callee's frame above everything called
+  while the result is read, with the inlined cases apart). Not done.
+  Instead the test of a one-byte result, which every `match` on what
+  `open` or `chkin` returns ends in: `lda v / bne a / lda #0 / beq b /
+  a: jmp c / b:`. In `opt.rs` a load of a constant goes where A holds it
+  and the flags are known to be its flags (`bne` not taken: zero, not
+  negative); in `asm::relax_with` `bne a / beq b / a: jmp c / b:` becomes
+  `bne c`; a load that is only there for the flags becomes `ora #$00`,
+  and the store before it dies. A switch does not compare bytes of its
+  value that are constants. `dir` 1583, `sd2iec` 3348, `uci` 2233,
+  `wic64` 1944. The same test of a tag of two bytes (`if let Some(n) =
+  t.0`: the upper byte is a constant only after `asm::forward`) leaves
+  `lda #0` / `beq` as a branch that is always taken; `backward` in
+  `opt.rs` makes a `jmp` of it and drops the load where neither the
+  register nor the flags are read after it. `dir` 1566, `sd2iec` 3328,
+  `music` 1039.
+  `music` against the C port (559): 452 of its 1039 bytes are library
+  assembly (the table of frequencies 192, the SID routines 171, text 85)
+  where the C program has the frequencies as constants in its table and
+  writes the registers itself; `wait` is in the program three times
+  (rustc inlines it; `-Zinline-mir-threshold=50` and 70 change nothing
+  there and nothing in total).
+* The registers of the runtime routines and the argument areas of the
+  assembly functions in the zero page (2026-11-25). Both were in the BSS:
+  three bytes and four cycles for an access that the library's assembly
+  makes in nearly every line. Now the code generator defines them in
+  front of the code (rat takes the zero-page instruction only for a name
+  it knows already): the runtime registers the program uses, as one block
+  in their order (`RT_REGS`; the routines index from one to the other,
+  `rt_save`/`rt_save_n` for `rt_ctx_save`), then the areas, then the
+  frames. `runtime.rat` no longer defines them; `rt_args` and `rt_ret`
+  stay in the BSS. All fifteen examples: 19 440 to 18 469 bytes (8% over
+  oscar64 `-Os`, without `sd2iec` level). pi 17.49 to 14.81 million
+  cycles, the PETSCII Mandelbrot set 21.69 to 19.15, drawing 907 701 to
+  853 848; the multicolour sets 701 to 619 and 874 to 770 million. The
+  frames lose 10 to 80 bytes of the zero page; no example got larger.
+  `RUST64_NO_ZP_RT=1` and `RUST64_NO_ZP_ARGS=1` turn the two off.
+  Still open there: loops whose blocks are not next to each other in the
+  text (the passes of `opt.rs` take a loop as a range of lines), 16-bit
+  lengths in structs where a byte would do, fat pointers that are
+  copied out of memory before they are used, and results of functions
+  that stay functions and are needed after the next call.
+* Two errors found on the way (2026-11-24). The frame of an inlined
+  function that the holder's code treats as its own lay where the frames
+  of other functions the holder calls lie: now above them (`merged` in
+  codegen.rs; `dir` and `sd2iec` lose zero-page frames by that, about 100
+  bytes each). And three loop steps of `opt.rs` (`promote`, `hoist`,
+  `index_loop`) did not see what a return needs when the `rts` stands
+  between the blocks of the loop: a 32-bit result built in a loop was
+  left in registers.
 * rustc's MIR inliner: raising `-Zinline-mir-threshold` alone (functions
   without `#[inline]`) gives mixed sizes. `cargo c64` sets it to 100 and
   `-Zinline-mir-hint-threshold` (functions with `#[inline]`: the helpers of
