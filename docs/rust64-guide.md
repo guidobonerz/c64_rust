@@ -954,6 +954,11 @@ handlers are installed. If a handler runs past the next handler's line,
 that one follows immediately. Handlers can call any function (they get
 their own copies, see [5.3](#static-frames)); keep them short.
 
+What an interrupt costs besides the handler depends on the handler: the
+dispatcher saves only what the handlers' code can change (see "Runtime
+registers"). Two handlers that write registers of the VIC cost about
+530 cycles per frame together, most of it the KERNAL's keyboard scan.
+
 ### c64::input â€” joystick and keyboard
 
 | Item | Description |
@@ -991,7 +996,7 @@ File names are ASCII and converted to PETSCII capitals.
 | Function | Description |
 |---|---|
 | `peek(a)`, `poke(a, v)`, `peek_word(a)`, `poke_word(a, v)` | volatile accesses |
-| `copy(dst, src, n)` | fast copy, front to back; up to 255 bytes it is a loop in place (two bytes per round when `n` is even), more goes through `rt_memcpy` |
+| `copy(dst, src, n)` | fast copy, front to back; up to 255 bytes it is a loop in place, two bytes per round (15.5 cycles a byte; for an odd `n` one byte first), more goes through `rt_memcpy` |
 | `fill(dst, n, v)` | fast fill; up to 255 bytes a loop in place (two bytes per round when `n` is even) |
 | `unsafe bytes(a, n) -> &'static mut [u8]` | memory as a slice |
 | `addr(a) -> *mut u8` | a pointer to an address |
@@ -1036,7 +1041,7 @@ C64 has. A program names the ones it needs in its `Cargo.toml`
 in the program. Each has an example in `examples/` (except the sampler)
 and a test in `tests/e2e/`.
 
-**`c64-sd2iec`** — directories, disk images and settings of an SD2IEC,
+**`c64-sd2iec`** â€” directories, disk images and settings of an SD2IEC,
 sent on the command channel; files are read with `c64::dos` as usual.
 
 ```rust
@@ -1057,7 +1062,7 @@ if sd::detect(8) {
 | `check(dev)`, `status(dev, buf)` | the error number / status text of the last command (39 = path not found) |
 | `set_device`, `hide_extensions`, `images_as`, `save_settings`, `version`, `command` | settings and anything else |
 
-**`c64-uci`** — the Ultimate command interface of the 1541 Ultimate-II(+)
+**`c64-uci`** â€” the Ultimate command interface of the 1541 Ultimate-II(+)
 and Ultimate 64 (`$DF1C`; enable it in the Ultimate's menu): files on its
 storage, TCP/UDP sockets, control.
 
@@ -1083,7 +1088,7 @@ if uci::present() {
 | `begin`, `put`, `put_u16`, `put_bytes`, `push`, `read`, `status`, `code`, `accept`, `finish`, `request` | the steps of a command, for commands without a function |
 | `Error(n)` | the number of the status text (`82,FILE NOT FOUND`) |
 
-**`c64-wic64`** — the WiC64 WiFi module on the user port: one request,
+**`c64-wic64`** â€” the WiC64 WiFi module on the user port: one request,
 one response.
 
 ```rust
@@ -1105,7 +1110,7 @@ if wic::present() {
 | `set_wait`, `set_remote_timeout`, `status_message`, `echo` | time-outs, the text of the last error, a connection test |
 | `Error(n)` | 1 internal, 2 client, 3 no WiFi, 4 network, 5 server, 255 no WiC64 |
 
-**`c64-uaudio`** — Ultimate Audio, the sampler of the Ultimate-II+ and
+**`c64-uaudio`** â€” Ultimate Audio, the sampler of the Ultimate-II+ and
 Ultimate 64 (`$DF20`; needs the REU and "Map Ultimate Audio" switched on):
 seven voices play samples from REU memory.
 
@@ -1231,11 +1236,12 @@ fn raster_bars() {
 }
 ```
 
-A handler costs a few raster lines of overhead, so keep the lines some
-distance apart. It costs more when its code uses the runtime's arithmetic
-helpers (about 16 lines more: the dispatcher saves their registers), and
-in a debug build nearly every handler does, through rustc's runtime
-checks. Where the screen allows it, leave a handler 30 lines or more
+A handler that only writes hardware registers starts within about two
+raster lines of its line. It starts later when its code uses the scratch
+pointers (three lines more) or the runtime's arithmetic helpers (about 16
+lines more: the dispatcher saves their registers), and in a debug build
+nearly every handler does, through rustc's runtime checks. Keep the lines
+some distance apart. Where the screen allows it, leave a handler 30 lines or more
 before its effect is needed (`examples/scroller` does), or build with
 `--release`.
 
@@ -1820,6 +1826,12 @@ Finally, for the program as a whole:
   registers and nothing else. A function that is also called through a
   pointer has a copy of its own for that, which takes all its arguments.
   `RUST64_NO_CONST_ARGS=1` turns this off.
+* **Multiplication.** Two 16-bit values widened for a 32-bit product
+  (`x as i32 * y as i32`) go to a routine for exactly that. The same holds
+  for one widened value and a constant that fits 16 bits
+  (`f[b] as u32 * 10000`); a constant with up to three bits set is shifts
+  and additions in place instead. A product with zero returns at once.
+  `RUST64_NO_MUL16K=1` turns the case with the constant off.
 * **A `match` as a table.** A `match` on a byte whose arms only give a
   constant byte each,
 
@@ -2031,6 +2043,34 @@ cargo test
   (`rat build x.rat --sym x.sym`) to see function names.
 * `RUST64_TRACE=1` prints the MIR of every compiled function.
 * Backend errors name the call path from `main` to the function.
+* If generated code looks wrong, build again with one of the switches
+  below: they turn single steps of the backend off, and the one that
+  changes the result names the step. All are environment variables for
+  `cargo c64 build`; delete `target/rust64/backend-*.stamp` (or change a
+  source file) so that the build runs again.
+
+| Switch | Turns off |
+|---|---|
+| `RUST64_NO_OPT=1` | the data-flow pass and everything after it (inlining on the assembly, constant arguments, unread stores) |
+| `RUST64_NO_INLINE=1` | inlining on the assembly |
+| `RUST64_NO_JOIN=1` | variables that share their bytes |
+| `RUST64_NO_NARROW=1`, `RUST64_NO_NARROW_MORE=1` | counters that fit a byte; the lengths that are a byte |
+| `RUST64_NO_ADDR_SUMS=1`, `RUST64_NO_PTR_SYMS=1` | known addresses through slices and `NonNull`; the same behind references |
+| `RUST64_NO_FOLD=1` | addresses the assembler adds |
+| `RUST64_NO_CONST_ARGS=1` | arguments that are the same in every call |
+| `RUST64_NO_JOIN_EQ=1` | values that stay known where branches meet |
+| `RUST64_NO_LOOKUP=1` | a `match` as a table |
+| `RUST64_NO_EQ_LOOP=1` | arrays compared in a loop in place |
+| `RUST64_NO_MUL16K=1` | the 16-bit routine for a widened value times a constant |
+| `RUST64_NO_INDEX_ADD=1` | an index plus a constant in the address |
+| `RUST64_NO_ORA=1` | `ora #$00` in place of a load that is only needed for the flags |
+| `RUST64_KEEP_STORES=1` | the removal of stores nothing reads at the end |
+| `RUST64_NO_ZP_RT=1`, `RUST64_NO_ZP_ARGS=1` | runtime registers and assembly argument areas in the zero page |
+| `RUST64_CTX_ALL=1` | (turns on) saving the scratch pointers and `rt_jvec` in every interrupt |
+| `RUST64_FRAME_SMALL=<n>` | sets the size up to which a value counts as small for the two parts of a frame (default 4) |
+
+  `RUST64_OPT_TRACE=1` and `RUST64_JOIN_TRACE=1` print what the data-flow
+  pass and the sharing of variables do.
 
 ---
 
@@ -2051,7 +2091,7 @@ cargo test
 | `rat failed on the generated assembly` | an undefined label in your rat code, or a branch too far; the listing is kept |
 | red border right away | a panic: index out of bounds, `unwrap` on `None`, overflow in debug |
 | the program hangs in a busy loop | do not compare the raster line for equality, use `hw::wait_raster`; debug code is slow |
-| a handler makes the program crawl | the handler uses runtime arithmetic (multiplication, division): the dispatcher then saves all runtime registers, and the unoptimized code is slow; keep handlers simple |
+| a handler makes the program crawl | the handler uses runtime arithmetic (multiplication, division): the dispatcher then saves all runtime registers, and the unoptimized code is slow; keep handlers simple (one that only writes hardware registers has nothing saved for it) |
 | `error: could not create LLVM MCSubtargetInfo` | rustc ran without the backend: use `cargo c64`, not plain `cargo build` |
 | `backend ... not found` | build `rustc_codegen_rust64` (same profile as `cargo-c64`) or set `RUST64_BACKEND` |
 
@@ -2072,18 +2112,24 @@ rust64 follows the phases in `PLAN.md`:
 | 6. Tooling: `cargo c64 new/test`, Rust source spans for rat errors, memory map, debugger labels, `c64::asm!` | |
 | 7. Extensions: recursion on a software stack, `alloc`, `dyn Trait`, `f32`, cartridges | |
 
-Code quality: the data-flow pass of chapter 10 made the release builds of
-the examples 30% smaller in total than the code generator alone gives
-(`diagonal`: 3155 to 1444 bytes, `rasterbars`: 1733 to 1327, `wic64`: 3392
-to 2340) and compiled loops more than twice as fast. Compared with
-oscar64, an optimizing C compiler for the 6502, rust64 is level or ahead
-where the library's assembly does the work; where compiled code does, its
-programs are 15 to 28% larger and within 6% in time per frame (ahead in
-two of three) (the
-README has the numbers).
-Still open: an index for an iterator's pointer where the loop uses Y for something else or the elements are larger than a byte, a counter in a
+Code quality: the passes of chapter 10 make the release builds of the
+examples 24% smaller in total than the code generator alone gives
+(`RUST64_NO_OPT=1`; `diagonal`: 1823 to 1265 bytes, `sd2iec`: 3902 to
+2497, `wic64`: 2665 to 1741). Compared with oscar64 `-Os`, an optimizing
+C compiler for the 6502, the fifteen examples that have a C port are
+0.4% larger in total (six smaller, nine larger; from 86% smaller to 79%
+larger, where the library brings more than the program needs), and
+every program that is timed needs fewer cycles (0.5% to 41%); against
+`-O2` and `-O3` one of them needs 6 to 9% more. The README has the
+numbers.
+There is one level of optimization: the backend does the same for every
+`--release` build, mostly for size, and does not read `opt-level`
+(rustc's own passes before it do).
+Still open: an index for an iterator's pointer where the loop uses Y for
+something else or the elements are larger than a byte, a counter in a
 register also where the loop needs both index registers (a block copy in
-its body).
+its body), loops whose way back is a conditional branch or that hold an
+`asm!` block.
 Release builds (`opt-level = "s"`) give the best code. Debug builds
 include rustc's runtime checks and are much bigger and slower.
 

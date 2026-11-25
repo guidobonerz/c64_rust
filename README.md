@@ -314,6 +314,8 @@ against each other on the emulated screen.
 #### Summary
 
 rust64 `--release` against oscar64 `-Os`; less is better in every column.
+rust64 has one level of optimization (the backend does the same for every
+`--release` build); oscar64's `-O2` and `-O3` are in the tables further down.
 
 | Program | Work is done by | `.prg` bytes rust64 | oscar64 | rust64 is | Cycles rust64 | oscar64 | rust64 needs |
 |---|---|---:|---:|---|---:|---:|---|
