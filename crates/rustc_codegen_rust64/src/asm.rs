@@ -224,6 +224,12 @@ impl Asm {
         self.setup_val(src, 0);
         self.setup(dst, 2);
         for i in 0..size {
+            // (a byte of a view that already is where it goes)
+            if let (Addr::Abs(d), Val::Imm(b)) = (dst, src)
+                && b.get(i as usize).is_some_and(|s| if i == 0 { s == d } else { *s == format!("{d}+{i}") })
+            {
+                continue;
+            }
             self.lda(src, i, 0);
             self.sta(dst, i, 2);
         }
@@ -724,6 +730,21 @@ pub fn relax_with(text: &str, size: &dyn Fn(&str, &str) -> i64, range: i64) -> S
                 let target = target.clone();
                 lines[i] = Line::Ins(opp.to_owned(), target);
                 lines[j] = Line::Other(String::new());
+                changed = true;
+            }
+        }
+        // 3c. bne a / beq b / a:  ->  beq b
+        // (the first branch only skips the second)
+        for i in 0..lines.len() {
+            let Line::Ins(op, la) = &lines[i] else { continue };
+            let Some(opp) = opposite(op) else { continue };
+            let Some(j) = next_ins(&lines, i + 1) else { continue };
+            let Line::Ins(op2, _) = &lines[j] else { continue };
+            if op2 == opp
+                && !(i + 1..j).any(|m| matches!(lines[m], Line::Label(_)))
+                && label_follows(&lines, j, la)
+            {
+                lines[i] = Line::Other(String::new());
                 changed = true;
             }
         }

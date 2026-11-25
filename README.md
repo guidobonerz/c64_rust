@@ -244,22 +244,22 @@ c64-uci = { path = "../c64_rust/lib/c64-uci" }
 | Example | Shows | Main modules | Bytes |
 |---|---|---|---:|
 | `border` | the smallest program, without the library | | 20 |
-| `hello` | printing, a loop, the border colour | `hw`, `fmt` | 379 |
-| `joystick` | reading the joystick | `input` | 781 |
-| `ui` | boxes on the text screen | `ui`, `text` | 1109 |
-| `music` | notes and a SID tune | `sound` | 1008 |
-| `sprites` | a moving sprite | `sprite` | 1217 |
-| `rasterbars` | a stable raster interrupt in assembly, colours from Rust | `rat_source!`, `mem` | 1300 |
-| `scroller` | a horizontal soft scroll with two raster interrupts | `irq`, `mem` | 1418 |
-| `drawing` | lines, a rectangle and circles on the hires bitmap | `gfx` | 2076 |
-| `diagonal` | the whole screen scrolling diagonally, custom character set | `hw`, `mem` | 1311 |
-| `mandelbrot` | the Mandelbrot set in fixed point: PETSCII, or the multicolour bitmap with `--features multicolor` | `text`, `gfx` | 806 |
-| `julia` | a Julia set, in the same two ways | `text`, `gfx` | 814 |
-| `pi` | 100 digits of pi with 32-bit arithmetic | `kernal` | 1379 |
-| `dir` | the disk directory | `dos` | 1543 |
-| `wic64` | the WiFi module | `c64-wic64` | 1877 |
-| `uci` | the Ultimate command interface | `c64-uci` | 2173 |
-| `sd2iec` | directories and disk images | `c64-sd2iec` | 3308 |
+| `hello` | printing, a loop, the border colour | `hw`, `fmt` | 367 |
+| `joystick` | reading the joystick | `input` | 767 |
+| `ui` | boxes on the text screen | `ui`, `text` | 1053 |
+| `music` | notes and a SID tune | `sound` | 1000 |
+| `sprites` | a moving sprite | `sprite` | 1177 |
+| `rasterbars` | a stable raster interrupt in assembly, colours from Rust | `rat_source!`, `mem` | 1294 |
+| `scroller` | a horizontal soft scroll with two raster interrupts | `irq`, `mem` | 1378 |
+| `drawing` | lines, a rectangle and circles on the hires bitmap | `gfx` | 2068 |
+| `diagonal` | the whole screen scrolling diagonally, custom character set | `hw`, `mem` | 1265 |
+| `mandelbrot` | the Mandelbrot set in fixed point: PETSCII, or the multicolour bitmap with `--features multicolor` | `text`, `gfx` | 819 |
+| `julia` | a Julia set, in the same two ways | `text`, `gfx` | 827 |
+| `pi` | 100 digits of pi with 32-bit arithmetic | `kernal` | 1380 |
+| `dir` | the disk directory | `dos` | 1288 |
+| `wic64` | the WiFi module | `c64-wic64` | 1741 |
+| `uci` | the Ultimate command interface | `c64-uci` | 2056 |
+| `sd2iec` | directories and disk images | `c64-sd2iec` | 2497 |
 
 ```
 cd examples/drawing
@@ -317,26 +317,26 @@ rust64 `--release` against oscar64 `-Os`; less is better in every column.
 
 | Program | Work is done by | `.prg` bytes rust64 | oscar64 | rust64 is | Cycles rust64 | oscar64 | rust64 needs |
 |---|---|---:|---:|---|---:|---:|---|
-| drawing, clipped | library assembly | **2076** | 3147 | 34% smaller | **853 848** | 968 876 | 12% fewer |
-| drawing, unclipped | library assembly | **1754** | 2046 | 14% smaller | **833 811** | 884 436 | 6% fewer |
-| scroller | interrupts, one block copy | **1418** | 1355 | 5% larger | **253** | 385 | 34% fewer |
-| rasterbars | small fills and copies | **1300** | 1096 | 19% larger | **1925** | 1877 | 3% more |
-| diagonal | compiled code, block copies | **1311** | 1126 | 16% larger | **2350** | 2485 | 5% fewer |
-| mandelbrot, PETSCII | compiled code, 32-bit products | **806** | 938 | 14% smaller | **19 148 080** | 18 817 639 | 2% more |
-| mandelbrot, multicolour | the same, and the libraries' pixels | **1131** | 1269 | 11% smaller | **618 951 569** | 627 249 821 | 1% fewer |
-| julia, PETSCII | compiled code, 32-bit products | **814** | 949 | 14% smaller | **23 737 296** | 24 981 058 | 5% fewer |
-| julia, multicolour | the same, and the libraries' pixels | **1139** | 1277 | 11% smaller | **770 051 419** | 813 110 831 | 5% fewer |
-| pi | compiled code, 32-bit multiplication and division | **1379** | 1250 | 10% larger | **14 814 781** | 14 553 959 | 2% more |
+| drawing, clipped | library assembly | **2068** | 3147 | 34% smaller | **853 261** | 968 876 | 12% fewer |
+| drawing, unclipped | library assembly | **1746** | 2046 | 15% smaller | **833 265** | 884 436 | 6% fewer |
+| scroller | interrupts, one block copy | **1378** | 1355 | 2% larger | **228** | 385 | 41% fewer |
+| rasterbars | small fills and copies | **1294** | 1096 | 18% larger | **1837** | 1877 | 2% fewer |
+| diagonal | compiled code, block copies | **1265** | 1126 | 12% larger | **2353** | 2485 | 5% fewer |
+| mandelbrot, PETSCII | compiled code, 32-bit products | **819** | 938 | 13% smaller | **17 888 993** | 18 817 639 | 5% fewer |
+| mandelbrot, multicolour | the same, and the libraries' pixels | **1144** | 1269 | 10% smaller | **588 388 518** | 627 249 821 | 6% fewer |
+| julia, PETSCII | compiled code, 32-bit products | **827** | 949 | 13% smaller | **23 722 120** | 24 981 058 | 5% fewer |
+| julia, multicolour | the same, and the libraries' pixels | **1152** | 1277 | 10% smaller | **770 268 253** | 813 110 831 | 5% fewer |
+| pi | compiled code, 32-bit multiplication and division | **1380** | 1250 | 10% larger | **14 480 741** | 14 553 959 | 0.5% fewer |
 
 Cycles: the whole program for drawing, the whole computation for mandelbrot,
 julia and pi, the average frame for the others.
 
 **The result in one sentence:** where the work is done by the library's
 assembly, rust64 is ahead of oscar64 in size and speed; where it is done by
-compiled code, oscar64's effect programs are 4–16% smaller, and the two are
-close in speed (per frame rust64 needs 34% and 5% fewer cycles for scroller
-and diagonal and 3% more for rasterbars); in arithmetic the two are within
-5% of each other, rust64 with the smaller programs for the two sets.
+compiled code, oscar64's effect programs are 2–15% smaller, and rust64
+needs fewer cycles per frame than `-Os` in all three (41%, 5% and 2% for
+scroller, diagonal and rasterbars); in arithmetic rust64 needs 0.5–6%
+fewer cycles, with the smaller programs for the two sets.
 
 #### What was compared
 
@@ -397,12 +397,12 @@ colour matrix and switches the mode; *cells* is the loop over
 
 | Build | `.prg` bytes | rust64 is | setup | lines | rect | circles | cells | **total** | seconds | rust64 needs |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
-| **rust64** `--release`, clipped | **2076** | | 108 061 | 433 455 | 14 940 | 295 736 | 1 656 | **853 848** | 0.87 | |
+| **rust64** `--release`, clipped | **2068** | | 108 055 | 433 474 | 14 940 | 295 736 | 1 056 | **853 261** | 0.87 | |
 | oscar64 `-O1`, clipped | 4153 | 50% smaller | 103 501 | 388 147 | 31 470 | 461 001 | 1 188 | 985 307 | 1.00 | 13.3% fewer cycles |
 | oscar64 `-Os`, clipped | 3147 | 34% smaller | 108 050 | 371 991 | 28 068 | 459 661 | 1 106 | 968 876 | 0.98 | 11.9% fewer |
 | oscar64 `-O2`, clipped | 3202 | 35% smaller | 103 117 | 378 440 | 29 725 | 458 098 | 1 063 | 970 443 | 0.98 | 12.0% fewer |
 | oscar64 `-O3`, clipped | 3658 | 43% smaller | 103 301 | 371 179 | 27 457 | 415 822 | 1 132 | 918 891 | 0.93 | 7.1% fewer |
-| **rust64** `--release`, unclipped | **1754** | | 108 061 | 432 137 | 14 416 | 277 581 | 1 616 | **833 811** | 0.85 | |
+| **rust64** `--release`, unclipped | **1746** | | 108 055 | 432 148 | 14 415 | 277 591 | 1 056 | **833 265** | 0.85 | |
 | oscar64 `-O1`, unclipped | 2724 | 36% smaller | 103 454 | 370 254 | 27 687 | 390 819 | 1 102 | 893 316 | 0.91 | 6.7% fewer |
 | oscar64 `-Os`, unclipped | 2046 | 14% smaller | 108 035 | 363 284 | 27 012 | 384 917 | 1 188 | 884 436 | 0.90 | 5.7% fewer |
 | oscar64 `-O2`, unclipped | 2004 | 12% smaller | 103 306 | 362 185 | 27 085 | 384 992 | 1 192 | 878 760 | 0.89 | 5.1% fewer |
@@ -414,15 +414,15 @@ colour matrix and switches the mode; *cells* is the loop over
 
 | Program | Build | `.prg` bytes | average frame | worst frame | other |
 |---|---|---:|---:|---:|---|
-| rasterbars | **rust64** `--release` | **1300** | **1925** | | |
+| rasterbars | **rust64** `--release` | **1294** | **1837** | | |
 | | oscar64 `-Os` | 1096 | 1877 | | |
 | | oscar64 `-O2` | 1136 | 1737 | | |
 | | oscar64 `-O3` | 1151 | 1684 | | |
-| scroller | **rust64** `--release` | **1418** | **253** | **938** | interrupts per frame: **983** |
+| scroller | **rust64** `--release` | **1378** | **228** | **838** | interrupts per frame: **533** |
 | | oscar64 `-Os` | 1355 | 385 | 1695 | 826 |
 | | oscar64 `-O2` | 1498 | 369 | 1621 | 824 |
 | | oscar64 `-O3` | 1498 | 385 | 1694 | 817 |
-| diagonal | **rust64** `--release` | **1311** | **2350** | **5359** | start-up: **81 623** |
+| diagonal | **rust64** `--release` | **1265** | **2353** | **5357** | start-up: **66 067** |
 | | oscar64 `-Os` | 1126 | 2485 | 5634 | 69 490 |
 | | oscar64 `-O2` | 1161 | 2484 | 5630 | 67 915 |
 | | oscar64 `-O3` | 1161 | 2398 | 5464 | 68 075 |
@@ -453,41 +453,46 @@ Where the library's assembly does the work (drawing, and the scroller's block co
   calling `bm_set` for every pixel.
 * **Setup** is two memory fills on both sides; rust64 is level with `-Os`
   and up to 5% slower than the other levels.
-* **scroller: rust64's main loop is faster** (31–34% fewer cycles on average,
-  42–45% fewer in the worst frame, the one that moves the 39 bytes of the
-  row: a copy loop in place in rust64, `memmove` in C).
-* **scroller interrupts: about level.** rust64 needs 983 cycles per frame,
-  oscar64 about 820, and most of both is the KERNAL's keyboard scan. A Rust
-  function as a handler goes through a dispatcher that saves registers;
-  oscar64's handler is a handful of generated instructions.
+* **scroller: rust64's main loop is faster** (38–41% fewer cycles on average,
+  48–51% fewer in the worst frame, the one that moves the 39 bytes of the
+  row: a copy loop in place in rust64, two bytes per round, `memmove` in C).
+* **scroller interrupts: rust64 needs 35% fewer cycles.** 533 per frame
+  against about 820; much of both is the KERNAL's keyboard scan, which the
+  rust64 version runs once per frame. A Rust function as a handler goes
+  through a dispatcher. It saves the scratch pointers, the runtime's
+  registers and the vector of indirect calls only if the handlers or the
+  program use them; these handlers write two registers of the VIC and
+  need none of that.
 
 Where compiled code does the work:
 
-* **Size: oscar64 wins rasterbars and diagonal.** rust64's are 13–19%
-  larger for rasterbars and 13–16% larger for diagonal; the scroller is 5%
-  larger than `-Os` and 5% smaller than `-O2` and `-O3`.
-* **diagonal: 2–5% less time per frame, but a start-up that takes 1.2
-  times as long.** The per-frame work is mostly block copies of 40 bytes:
-  a loop in place on both sides, and `mem::copy` moves two bytes per round
-  when the length is even. The start-up is compiled code: in Rust nested
-  loops over arrays with `iter_mut().enumerate()`. A loop that only walks
-  arrays of bytes gets an index in Y; the one that fills the tile rows
-  needs Y for a table too and still walks a 16-bit pointer. The C port
-  counts with `char` and indexes.
-* **rasterbars: rust64 needs 3–14% more cycles per frame** for one fill and
-  three small copies. Both sides expand them in place; rust64 goes through
-  a pointer (`sta (ptr),y`, two bytes per round: 9.5 cycles per byte),
-  oscar64 knows the address
+* **Size: oscar64 wins rasterbars and diagonal.** rust64's are 12–18%
+  larger for rasterbars and 9–13% larger for diagonal; the scroller is 2%
+  larger than `-Os` and 8% smaller than `-O2` and `-O3`.
+* **diagonal: 2–5% less time per frame, and a start-up that is 3–5%
+  shorter.** The per-frame work is mostly block copies of 40 bytes: a
+  loop in place on both sides, and `mem::copy` moves two bytes per round.
+  The start-up is compiled code: in Rust nested loops over arrays with
+  `iter_mut().enumerate()`, and for every cell a `match` that turns a
+  character of the tile into a character number. That `match` is a table
+  lookup in rust64 (it was a chain of eleven comparisons, and the
+  start-up took 1.2 times as long as the C port's). The loop still walks
+  a 16-bit pointer where the C port counts with `char` and indexes.
+* **rasterbars: rust64 needs 2% fewer cycles per frame than `-Os` and
+  6–9% more than `-O2` and `-O3`** for one fill and three small copies.
+  Both sides expand them in place; rust64 goes through a pointer
+  (`sta (ptr),y`, two bytes per round: 9.5 cycles per byte for the fill,
+  15.5 for a copy), oscar64 knows the address
   of the table (`sta table,x`). Part of rust64's size is not code:
   `raster.rat` aligns its timed code to a page (112 bytes of padding in
   front of it) and keeps the colour table in the program file, while the C
   version has the table outside the file.
 * **The *cells* loop of drawing** is the only phase of that program that is
-  purely compiler output on both sides, and there oscar64 needs 26–30
-  cycles per iteration and rust64 40–41. Both keep the counter in an index
-  register, store with the other one (`sta matrix+$300,x`) and test at
-  the end of the loop; rust64 keeps the colour in a temporary in memory
-  while it computes the address, and compares through A (`tya` / `cmp`).
+  purely compiler output on both sides, and there both need 26–30 cycles
+  per iteration (rust64 26). Both keep the counter in an index register,
+  store with it (`sta matrix+$3c0,y`) and test at the end of the loop.
+  rust64 had the row's offset added to the counter in the other index
+  register, and the colour in a temporary meanwhile: 40 cycles.
 
 What rust64 does about compiled code is in the guide (chapter 10: a
 data-flow pass over the assembly of each function). The open optimizations
@@ -509,31 +514,30 @@ digits on both sides.
 
 | Program | Build | `.prg` bytes | cycles | rust64 needs |
 |---|---|---:|---:|---|
-| mandelbrot, PETSCII | **rust64** `--release` | **806** | **19 148 080** | |
-| | oscar64 `-Os` | 938 | 18 817 639 | 1.8% more |
-| | oscar64 `-O2` | 940 | 18 448 282 | 3.8% more |
-| | oscar64 `-O3` | 940 | 18 499 742 | 3.5% more |
-| mandelbrot, multicolour | **rust64** `--release` | **1131** | **618 951 569** | |
-| | oscar64 `-Os` | 1269 | 627 249 821 | 1.3% fewer |
-| | oscar64 `-O2` | 1273 | 612 946 565 | 1.0% more |
-| | oscar64 `-O3` | 1201 | 614 949 025 | 0.7% more |
-| julia, PETSCII | **rust64** `--release` | **814** | **23 737 296** | |
+| mandelbrot, PETSCII | **rust64** `--release` | **819** | **17 888 993** | |
+| | oscar64 `-Os` | 938 | 18 817 639 | 4.9% fewer |
+| | oscar64 `-O2` | 940 | 18 448 282 | 3.0% fewer |
+| | oscar64 `-O3` | 940 | 18 499 742 | 3.3% fewer |
+| mandelbrot, multicolour | **rust64** `--release` | **1144** | **588 388 518** | |
+| | oscar64 `-Os` | 1269 | 627 249 821 | 6.2% fewer |
+| | oscar64 `-O2` | 1273 | 612 946 565 | 4.0% fewer |
+| | oscar64 `-O3` | 1201 | 614 949 025 | 4.3% fewer |
+| julia, PETSCII | **rust64** `--release` | **827** | **23 722 120** | |
 | | oscar64 `-Os` | 949 | 24 981 058 | 5.0% fewer |
-| | oscar64 `-O2` | 951 | 24 475 617 | 3.0% fewer |
+| | oscar64 `-O2` | 951 | 24 475 617 | 3.1% fewer |
 | | oscar64 `-O3` | 951 | 24 722 277 | 4.0% fewer |
-| julia, multicolour | **rust64** `--release` | **1139** | **770 051 419** | |
+| julia, multicolour | **rust64** `--release` | **1152** | **770 268 253** | |
 | | oscar64 `-Os` | 1277 | 813 110 831 | 5.3% fewer |
 | | oscar64 `-O2` | 1281 | 797 501 735 | 3.4% fewer |
 | | oscar64 `-O3` | 1209 | 803 192 014 | 4.1% fewer |
-| pi | **rust64** `--release` | **1379** | **14 814 781** | |
-| | oscar64 `-Os` | 1250 | 14 553 959 | 1.8% more |
-| | oscar64 `-O2` | 1239 | 14 453 155 | 2.5% more |
-| | oscar64 `-O3` | 1239 | 14 476 057 | 2.3% more |
+| pi | **rust64** `--release` | **1380** | **14 480 741** | |
+| | oscar64 `-Os` | 1250 | 14 553 959 | 0.5% fewer |
+| | oscar64 `-O2` | 1239 | 14 453 155 | 0.2% more |
+| | oscar64 `-O3` | 1239 | 14 476 057 | level |
 
-* **The two are within 5% of each other: rust64 needs 3–5% fewer cycles
-  for the Julia set, 2–4% more for pi and the PETSCII Mandelbrot set, and
-  is within 1.3% for the multicolour one. In size rust64's sets are 6–14%
-  smaller and pi is 10–11% larger.** Nearly all of the time is spent in
+* **rust64 needs 3–6% fewer cycles for both sets, and pi is level
+  (0.5% fewer than `-Os`, 0.2% more than `-O2`). In size rust64's sets
+  are 5–13% smaller and pi is 10–11% larger.** Nearly all of the time is spent in
   the runtime's multiplication and division on both sides, so this
   compares those routines and the code around the calls more than the
   compilers' loops.
@@ -545,7 +549,10 @@ digits on both sides.
   multiplication and unsigned division have routines of their own (a
   division skips the leading zero bytes and works with a 16-bit remainder
   for a small divisor); `d % g` and `d / g` next to each other are one
-  division; and a shift by 8 bits or more moves bytes first.
+  division; and a shift by 8 bits or more moves bytes first. A 16-bit
+  value times a constant of 16 bits (`f[b] as u32 * 10000` in pi) goes
+  to the 16-bit routine too, and a product with zero (the first round
+  of every point of the Mandelbrot set) is done at once.
 * **The registers of these routines are in the zero page**, like
   oscar64's, where the program leaves room for them (all of these do).
   With them in the BSS, as they were at first, rust64 needed 7–20% more
@@ -553,8 +560,7 @@ digits on both sides.
   every instruction.
 * **What is left** is per call: rust64 copies the operands to the
   runtime's registers and the result back; the fixed-point shift after
-  each product is three more passes over the bytes. In pi the 32-bit product
-  with the constant 10000 still goes through the general 32-bit routine.
+  each product is three more passes over the bytes.
 
 #### All examples: size
 
@@ -568,47 +574,49 @@ of the table above (`pwsh bench/examples.ps1`).
 | Example | rust64 `--release` | oscar64 `-Os` | `-O2` | `-O3` | rust64 against `-Os` |
 |---|---:|---:|---:|---:|---|
 | border | **20** | 142 | 142 | 142 | 86% smaller |
-| hello | **379** | 553 | 538 | 557 | 31% smaller |
-| joystick | **781** | 732 | 698 | 709 | 7% larger |
-| ui | **1109** | 954 | 948 | 1488 | 16% larger |
-| music | **1008** | 559 | 617 | 617 | 80% larger |
-| sprites | **1217** | 1132 | 1123 | 1088 | 8% larger |
-| rasterbars | **1300** | 1096 | 1136 | 1151 | 19% larger |
-| scroller | **1418** | 1355 | 1498 | 1498 | 5% larger |
-| drawing | **2076** | 3147 | 3202 | 3658 | 34% smaller |
-| diagonal | **1311** | 1126 | 1161 | 1161 | 16% larger |
-| mandelbrot | **806** | 938 | 940 | 940 | 14% smaller |
-| julia | **814** | 949 | 951 | 951 | 14% smaller |
-| pi | **1379** | 1250 | 1239 | 1239 | 10% larger |
-| dir | **1543** | 1320 | 1251 | 2673 | 17% larger |
-| sd2iec | **3308** | 1886 | 1867 | 3782 | 75% larger |
-| **total** | **18 469** | 17 139 | 17 311 | 21 654 | 8% larger |
+| hello | **367** | 553 | 538 | 557 | 34% smaller |
+| joystick | **767** | 732 | 698 | 709 | 5% larger |
+| ui | **1053** | 954 | 948 | 1488 | 10% larger |
+| music | **1000** | 559 | 617 | 617 | 79% larger |
+| sprites | **1177** | 1132 | 1123 | 1088 | 4% larger |
+| rasterbars | **1294** | 1096 | 1136 | 1151 | 18% larger |
+| scroller | **1378** | 1355 | 1498 | 1498 | 2% larger |
+| drawing | **2068** | 3147 | 3202 | 3658 | 34% smaller |
+| diagonal | **1265** | 1126 | 1161 | 1161 | 12% larger |
+| mandelbrot | **819** | 938 | 940 | 940 | 13% smaller |
+| julia | **827** | 949 | 951 | 951 | 13% smaller |
+| pi | **1380** | 1250 | 1239 | 1239 | 10% larger |
+| dir | **1288** | 1320 | 1251 | 2673 | 2% smaller |
+| sd2iec | **2497** | 1886 | 1867 | 3782 | 32% larger |
+| **total** | **17 200** | 17 139 | 17 311 | 21 654 | 0.4% larger |
 
-* **rust64 is smaller in five of the fifteen and larger in ten; over all
-  of them it is 8% larger than `-Os`, without `sd2iec` the same size
-  (0.6% smaller).**
+* **rust64 is smaller in six of the fifteen and larger in nine; over all
+  of them it is 0.4% larger than `-Os`, without `sd2iec` 4% smaller.**
 * **The small programs go to rust64 because of the start code:** oscar64's
   smallest program is 142 bytes. Its text goes through `puts` and `utoa`
   here; with `printf` hello is 4211 bytes.
-* **music is 80% larger** because `c64::sound` brings its table of 96
+* **music is 79% larger** because `c64::sound` brings its table of 96
   notes (192 bytes) and routines for any voice with copies of the control
   registers, where the C program has the six frequencies it plays as
   constants and stores to the registers directly.
 * **joystick, ui and sprites** write text to the screen. The C programs
   have it as screen codes in the file (`s"..."`); `c64::text` converts
   ASCII at run time and addresses the screen through a table of rows.
-* **dir and sd2iec are where compiled Rust is weakest.** The same
-  directory is read line by line on both sides; in Rust through
+* **sd2iec is where compiled Rust is weakest; dir is 2% smaller.** The
+  same directory is read line by line on both sides; in Rust through
   `Result`, `Option`, an iterator and entries that are returned by value
-  (1.2 KB and 2.9 KB of compiled code), in C through `int` and a pointer
+  (0.4 KB and 1.4 KB of compiled code), in C through `int` and a pointer
   to one entry. The first ports were 2323 and 4721 bytes; what was done
   since is in the guide (views of structs, results that stay where the
   call left them, matches on enums, checks that were made, arguments that
   are not read, frames in two parts, counters that fit a byte, variables
-  that share their bytes). What is left: lengths of 16 bits in structs
-  where a byte would do, string slices that are copied out of memory
-  before they are used, and results of functions that are needed after
-  the next call.
+  that share their bytes, arrays compared in a loop in place, pointers
+  whose address is known through slices, arguments that are the same in
+  every call, values that stay known where branches meet). The library changed too:
+  `c64::dos` appends the parts of a file name or command one after the
+  other, with a length of one byte, where it walked a list of them. What
+  is left: string slices that are copied out of memory before they are
+  used, and results of functions that are needed after the next call.
 
 #### Caveats
 

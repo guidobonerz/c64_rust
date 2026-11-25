@@ -63,6 +63,20 @@ fn bump(n: u16) -> u16 {
     x / 3 + 1
 }
 
+static mut MARKS: [u8; 8] = [0; 8];
+static mut MARK_AT: u8 = 0;
+
+/// A handler that writes through a pointer: it uses the scratch pointers
+/// that the main program is using when the interrupt comes.
+fn mark() {
+    unsafe {
+        let at = core::ptr::read_volatile(&raw const MARK_AT);
+        let p = bb(&raw mut MARKS as *mut u8).add((at & 7) as usize);
+        *p = (*p).wrapping_add(1);
+        core::ptr::write_volatile(&raw mut MARK_AT, at.wrapping_add(1));
+    }
+}
+
 fn tick() {
     unsafe {
         TICKS = bump(TICKS);
@@ -210,6 +224,51 @@ fn main() {
             && t1.wrapping_sub(t0) <= 3
             && c64::kernal::rdtim() as u16 >= t1,
     );
+
+    // The last: interrupts whose handler uses the scratch pointers, while
+    // the main program copies through pointers and calls through one.
+    irq::add(60, mark);
+    irq::add(160, mark);
+    let f: fn(u8, u8) -> u16 = bb(add);
+    let mut ok = true;
+    let mut src = [0u8; 48];
+    let mut dst = [0u8; 48];
+    let mut round = 0u8;
+    while unsafe { core::ptr::read_volatile(&raw const MARK_AT) } < 20 {
+        for (i, s) in bb(&mut src[..]).iter_mut().enumerate() {
+            *s = round.wrapping_add(i as u8);
+        }
+        bb(&mut dst[..]).copy_from_slice(bb(&src[..]));
+        for (i, d) in bb(&dst[..]).iter().enumerate() {
+            ok &= *d == round.wrapping_add(i as u8);
+        }
+        ok &= f(round, 1) == round as u16 + 1;
+        round = round.wrapping_add(1);
+    }
+    irq::stop();
+    let marks: u16 = unsafe { (*(&raw const MARKS)).iter().map(|&m| m as u16).sum() };
+    check(ok && marks >= 20 && round > 2);
+
+    // Copies of an odd and of an even number of bytes, and of one
+    let mut from = [0u8; 64];
+    for (i, b) in from.iter_mut().enumerate() {
+        *b = 0x40 + i as u8;
+    }
+    let mut ok = true;
+    for n in [1u16, 2, 3, 11, 39, 40, 63] {
+        let mut to = [0xeeu8; 64];
+        mem::copy(to.as_mut_ptr() as u16, from.as_ptr() as u16, bb(n));
+        for (i, &b) in to.iter().enumerate() {
+            ok &= b == if (i as u16) < n { 0x40 + i as u8 } else { 0xee };
+        }
+    }
+    let mut to = [0xeeu8; 12];
+    mem::copy(to.as_mut_ptr() as u16, from.as_ptr() as u16, 11);
+    ok &= to[10] == 0x4a && to[11] == 0xee && to[0] == 0x40;
+    // (front to back: a move down by one where the ranges overlap)
+    mem::copy(from.as_mut_ptr() as u16, from.as_ptr() as u16 + 1, 39);
+    ok &= from[0] == 0x41 && from[38] == 0x67 && from[39] == 0x67;
+    check(ok);
 
     unsafe {
         hw::vic().border.write(if FAILS == 0 { Color::Green } else { Color::Red });

@@ -452,9 +452,12 @@ use registers of their own: `rt_a`, `rt_b`, `rt_r`, `rt_t` (8 bytes each),
 (32 bytes), `rt_ret` (16 bytes) and `rt_jvec`. The interrupt dispatcher saves them
 (`rt_ctx_save`), but only the groups that the code reached by handlers
 uses: the arithmetic registers (39 bytes), `rt_args`/`rt_ret` (48 bytes),
-the argument areas of assembly functions. Otherwise it saves only the six
-zero-page pointer bytes and `rt_jvec`. Only the helpers a program uses are
-part of it.
+the argument areas of assembly functions. The six zero-page pointer
+bytes are saved if that code uses the scratch pointers or any of these
+groups, `rt_jvec` if the program calls through function pointers
+anywhere. Handlers that only write hardware registers cost nothing here
+(`RUST64_CTX_ALL=1` saves pointers and vector always). Only the helpers a
+program uses are part of it.
 
 ### Zero page
 
@@ -975,7 +978,7 @@ for e in dos::Dir::open(2, 8)? { ... }
 |---|---|
 | `load(name, dev, addr)`, `load_abs(name, dev)` | load to `addr` / to the file's address; returns the end |
 | `save(name, dev, start, end)` | save `start..end` |
-| `command(dev, cmd)`, `scratch(dev, name)`, `rename(dev, from, to)` | DOS commands |
+| `command(dev, cmd)`, `command_arg(dev, cmd, arg)`, `scratch(dev, name)`, `rename(dev, from, to)` | DOS commands (`command_arg`: a command and what it applies to, `"S0:"` and a name) |
 | `status(dev, buf) -> Option<(len, code)>` | the drive status (`00, OK,00,00`) |
 | `File::open(lfn, dev, sa, name)` | `get()`, `read(buf)`, `eof()`, `write(bytes)`, `write_str(s)`; closed on drop |
 | `Dir::open(lfn, dev)` | an `Iterator<Item = DirEntry>`; `header`, `free()` |
@@ -1779,6 +1782,87 @@ Finally, for the program as a whole:
   in the data (`for p in &parts`) is its address plus a constant: the
   code loads `#<(X+12)` instead of adding at run time, and a loop over at
   most 255 bytes compares only the low byte of its pointer with it.
+  A pointer keeps its known address on the way through a slice
+  (`&mut name[..]`, `iter_mut()`), through `NonNull` and through
+  `ptr.add(16)`; the length of such an iterator, end minus start, is then
+  a constant too. `RUST64_NO_ADDR_SUMS=1` turns this off.
+* **Lengths that are a byte.** `&name[..len as usize]` with a `u8` length
+  ends at `start + len`, and its iterator asks for `end - start` again:
+  that is `len`, without the subtraction. What is made of such lengths
+  stays a byte: the smaller of two (`zip` of two iterators), a copy, a
+  counter that is stepped below one of them. A loop like
+  `for (to, &from) in out.iter_mut().zip(e.name())` then is
+
+  ```text
+  loop:   tax
+          lda name,x
+          sta out,x
+          iny
+  test:   tya
+          cmp len
+          bcc loop
+  ```
+
+  where it added the counter to both addresses in 16 bits in every round.
+  The slice may lie behind a reference (`&self.text[..self.len as
+  usize]`): what counts is that start and end are made of the same
+  pointer, one that does not change in the function. The access is then
+  `lda (ptr),y` with the counter in Y. `RUST64_NO_NARROW_MORE=1` turns
+  the byte lengths off, `RUST64_NO_PTR_SYMS=1` the part behind
+  references.
+* **Arguments that are the same in every call.** The first three bytes
+  of the arguments travel in A, X and Y, the rest in memory. A byte there
+  that is the same constant at every call of a function (the upper byte
+  of a length when all the texts are short, a flag that is always off)
+  is not passed: the function is compiled with the constant in place of
+  the byte, and the callers lose the store, often with the load in front
+  of it. `c64::println!("score: ", n)` then costs a call with three
+  registers and nothing else. A function that is also called through a
+  pointer has a copy of its own for that, which takes all its arguments.
+  `RUST64_NO_CONST_ARGS=1` turns this off.
+* **A `match` as a table.** A `match` on a byte whose arms only give a
+  constant byte each,
+
+  ```rust
+  match c { b'/' => 2, b'#' => 3, b'.' => 4, b'o' => 5, _ => 0 }
+  ```
+
+  is a table with one byte for every value from the smallest case to the
+  largest, and `sec` / `sbc #first` / `cmp #count` / `bcs other` / `tax` /
+  `lda table,x` in place of a comparison per case. It is taken from four
+  cases on where the table is not larger than the comparisons it
+  replaces (about 11 bytes per case): the cases of `diagonal`'s tile, 77
+  values apart, are a table; four cases spread over all 256 values stay
+  comparisons. `RUST64_NO_LOOKUP=1` turns this off.
+* **An index plus a constant.** `matrix[960 + c]` with `c` in Y came
+  out as `tya` / `adc #$c0` / `tax` / `sta matrix+768,x`. Where the
+  addition cannot carry (the optimizer knows the range of `c`), the
+  constant goes into the address, `sta matrix+960,y`, and the second
+  index register and the temporary that held the value meanwhile are
+  free. `RUST64_NO_INDEX_ADD=1` turns this off.
+* **Where branches meet.** After `let r = if ok { a } else { b };` or a
+  `match` with a value, each way leaves the value in A and in the
+  variable. Where the ways meet, the optimizer still knows that both
+  hold the same, so the load of the variable that follows goes, and
+  with it often the stores. (Not at the head of a loop: there the step
+  of a counter would have to bring it to A, an addition in place of an
+  `inc`.) `RUST64_NO_JOIN_EQ=1` turns this off.
+* **Arrays compared as a whole.** `kind == *b"DIR"` or
+  `&s[i..i + 6] == b"SD2IEC"` (up to 128 bytes) is a loop in place:
+
+  ```text
+          ldx #0
+          ldy #2
+  next:   lda kind,y
+          cmp text,y
+          bne done
+          dey
+          bpl next
+          inx             ; all equal: the result is 1
+  done:
+  ```
+
+  Longer ones call `rt_memcmp`. `RUST64_NO_EQ_LOOP=1` turns the loop off.
 * **Inlining.** rustc inlines small functions before the code generator
   starts; some only show to be small, or to have one caller, in the
   finished program. So at the end the assembly of a function replaces the

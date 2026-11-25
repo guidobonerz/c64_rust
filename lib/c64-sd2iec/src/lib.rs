@@ -35,16 +35,6 @@ pub enum Images {
     Both = 2,
 }
 
-/// Sends the command made of `parts`.
-fn send(dev: u8, parts: &[&str]) -> Result<(), Error> {
-    let mut b = Buf::<40>::new();
-    for p in parts {
-        b.write_str(p);
-    }
-    // The parts are strings and the buffer only drops whole bytes.
-    dos::command(dev, unsafe { core::str::from_utf8_unchecked(b.as_bytes()) })
-}
-
 /// Whether device `dev` is an SD2IEC: it answers `UI` with its name.
 pub fn detect(dev: u8) -> bool {
     if dos::command(dev, "UI").is_err() {
@@ -85,11 +75,8 @@ pub fn check(dev: u8) -> Result<u8, u8> {
 /// Changes into a directory (or a disk image) of the current directory.
 /// `path` can also be a path from the root: `"/games/arcade"`.
 pub fn cd(dev: u8, path: &str) -> Result<(), Error> {
-    if path.as_bytes().first() == Some(&b'/') {
-        send(dev, &["CD/", path])
-    } else {
-        send(dev, &["CD:", path])
-    }
+    let cmd = if path.as_bytes().first() == Some(&b'/') { "CD/" } else { "CD:" };
+    dos::command_arg(dev, cmd, path)
 }
 
 /// Changes to the parent directory (out of a disk image, too).
@@ -104,18 +91,18 @@ pub fn cd_root(dev: u8) -> Result<(), Error> {
 
 /// Creates a directory.
 pub fn mkdir(dev: u8, name: &str) -> Result<(), Error> {
-    send(dev, &["MD:", name])
+    dos::command_arg(dev, "MD:", name)
 }
 
 /// Removes an empty directory.
 pub fn rmdir(dev: u8, name: &str) -> Result<(), Error> {
-    send(dev, &["RD:", name])
+    dos::command_arg(dev, "RD:", name)
 }
 
 /// Mounts a disk image (D64, D71, D81, ...) of the current directory: from
 /// now on the device behaves like a drive with that disk.
 pub fn mount(dev: u8, image: &str) -> Result<(), Error> {
-    send(dev, &["CD:", image])
+    dos::command_arg(dev, "CD:", image)
 }
 
 /// Leaves the mounted disk image.

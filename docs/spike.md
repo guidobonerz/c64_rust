@@ -136,6 +136,141 @@ mul/div/shift, loops, arrays, slices, iterators, closures, structs, enums,
   lengths in structs where a byte would do, fat pointers that are
   copied out of memory before they are used, and results of functions
   that stay functions and are needed after the next call.
+* dir and sd2iec, library and compiler (2026-11-25). All fifteen
+  examples: 18 469 to 17 573 bytes (3% over oscar64 `-Os`, without
+  `sd2iec` 2% under), with the constant arguments at the end of this
+  entry 17 391; `dir` 1543 to 1351, `sd2iec` 3308 to 2617, `diagonal`
+  1311 to 1298 (2353 cycles per frame, worst 5353, start 81 582).
+  - Library: `dos::Name::new(&[name])` was a loop over a list of one
+    slice around a loop over its bytes, with a `usize` length and a
+    checked `&buf[..len]`. Now `Name::new(s)` and `push(s)`, a `u8`
+    length, `kernal::setnam_len`; `dos::command_arg(dev, cmd, arg)` for
+    the commands of two parts, which `c64-sd2iec` built in a buffer of
+    its own before (`dir` -194, `sd2iec` -407).
+  - A view of an aggregate whose bytes already are where they go (after
+    `join_locals`) was copied byte by byte onto itself: 16 times
+    `lda x` / `sta x` in `sd2iec`. `Asm::copy` skips such a byte (-96).
+  - `raw_eq` up to 128 bytes: a loop in place (X counts the result, Y
+    the bytes) instead of two pointers, a length and `rt_memcmp`; an
+    address in brackets must not get `,y` behind it (it would read as
+    indirect). The call that is left makes its result with `cmp #1` /
+    `lda #0` / `rol` / `eor #1` (-87).
+  - `addr_locals` follows an address through pointers to slices (which
+    keep their storage: only where they point to is noted), through
+    wrappers like `NonNull` (only for locals that are used as a whole)
+    and through `Offset` by a constant; `ptr_offset_from` of two known
+    addresses in the same object is a constant.
+  - `sums`: a pointer that is a known address plus a local (bytes, the
+    local assigned once and not borrowed); `ptr_offset_from` of it and
+    that address is the local. Sound because each of the locals on the
+    way is assigned once: the assignment of the local then dominates the
+    sum, and the sum its use. `narrow_locals` runs in rounds and takes
+    copies of narrow locals, `integer_min` with one narrow operand, such
+    a difference, and `n + 1` below a narrow local (-85 in `sd2iec`).
+  - Checks 81-85 in `tests/e2e/core`, 11-12 in `tests/e2e/sd2iec`
+    (`scratch` and `rename` of a file that is not there: 01 and 62).
+  - The same for slices behind a reference (`&self`): `syms` in
+    `addr_locals` notes for every thin pointer local that never changes
+    (assigned once and not borrowed, or an argument that is not
+    assigned) what it is made of, a root local plus a constant, through
+    copies, casts, pointers to slices, `&(*p).field` and `Offset` by a
+    constant; `sym_sums` is such a value plus a local, and `sum_diff`
+    matches it against the root and constant of the other pointer. A
+    length that is an extended byte may be a view without storage
+    (`lazy_cand`): `narrow_locals` takes it as fitting all the same.
+    No example has this pattern; `zipped` in `tests/e2e/core` goes from
+    a 16-bit counter and two 16-bit additions per round to
+    `lda (ptr),y` / `sta out,x`.
+  - Arguments that are the same constant in every call (`const_args`
+    in codegen.rs, before `drop_dead_args`). `opt::optimize` reports
+    the stores to slots of other functions (`L<id>_<n>`) with the value
+    of the register if it is a constant; a byte counts if every store
+    in the text was reported with the same value, nothing else names
+    the slot outside the function (wrappers of function pointers do, so
+    those copies are out), and the function does not store to it. The
+    function is optimized again with the bytes as constants at its
+    entry (`Opt::entry_consts`), and `drop_dead_args` removes the stores
+    for the bytes that nothing reads any more; if the function still
+    reads one (through an index, as an address), the callers keep
+    storing it and both sides stay right. All fifteen examples 17 573
+    to 17 391 (1% over oscar64 `-Os`, without `sd2iec` 3% under): `ui`
+    1109 to 1077, `hello` 379 to 367, `dir` 1351 to 1323 (oscar64
+    1320), `sd2iec` 2617 to 2555, `wic64` 1877 to 1759, `uci` 2173 to
+    2135; cycles within 0.1% (diagonal 2356 per frame, drawing 853 861).
+    Checks 86-87. Also `bne a` / `beq b` / `a:` to `beq b` in `relax`
+    (13 places in the examples).
+  - `Opt::join` keeps what is equal: places with the same value number
+    on every edge into a block get one number there (that of the first
+    of them) instead of one each, so "A and this byte hold the same" is
+    still known after the arms of an `if` or `match`. Not for a place
+    that already had its own number (the analysis must end), and not
+    where an edge comes from further down in the text (`ahead`): at a
+    loop head it made the counter live in A, and the step became `clc`
+    / `lda` / `adc #1` / `sta` in place of `inc` (julia and mandelbrot
+    +6). `dir` 1323 to 1288 (oscar64 1320), `sd2iec` 2555 to 2497,
+    `uci` 2135 to 2056, `wic64` 1759 to 1741; all fifteen 17 284.
+    The `match` in `diagonal` (twelve arms of `lda #k` / `sta v` /
+    `jmp`) does not gain: the store through a pointer that follows
+    sets up the pointer first, which takes A. With the join a branch in
+    `diagonal` no longer reached its target: the optimizer had only
+    ever happened not to lengthen code between a short branch and its
+    label. `optimize_fn` now runs `asm::widen` on its result.
+  - `rt_ctx_save` saved the six bytes of the scratch pointers and
+    `rt_jvec` in every interrupt, in two loops, and restored them: 250
+    cycles per interrupt. Now the pointers only if the code reached
+    through pointers names `zp_p` or uses runtime or assembly routines
+    (`PtrCtx::zp`), `rt_jvec` only if the program text has an indirect
+    call (`PtrCtx::jvec`; the dispatcher in `irq.rat` is the only user
+    in the library). scroller: interrupts 983 to 533 cycles per frame
+    (oscar64 826), 1410 to 1368 bytes; sprites 1207 to 1165, ui 1077 to
+    1053. All fifteen 17 176 (0.2% over oscar64 `-Os`).
+    A handler now starts about three raster lines earlier: the colour
+    band of `sprites` (lines 50 to 66) sits three lines higher on the
+    screen than before. Check 18 in `tests/e2e/lib2`: two handlers per
+    frame that write through a pointer while the main program fills,
+    copies and compares arrays and calls through a function pointer.
+  - Not done: loops of `opt.rs` whose way back is a conditional branch
+    or that hold an `asm!` block (`narrow_test` skips them: the loop
+    over `MELODY` in `music`, with a step of 3 and a 16-bit counter of
+    `enumerate`).
+* Run time (2026-11-25): every timed row is now at or below oscar64
+  `-Os`.
+  - `lookup_switch` in codegen.rs: a `SwitchInt` on a byte whose targets
+    (and the default, unless it is unreachable) are blocks of one
+    assignment of a constant byte to the same local and a `goto` to the
+    same block becomes a table `T<n>` (emitted behind the data) and an
+    indexed load. The arm blocks stay in the MIR and lose their only
+    way in; the optimizer drops them. From four cases, if
+    `range + 16 <= 11 * cases`. diagonal: start-up 81 599 to 67 548
+    cycles (oscar64 69 490), 1292 to 1267 bytes.
+  - `mem::copy` of an odd number of bytes from 3 on: one byte, then two
+    per round like the even case (+10 bytes per call). rasterbars 1925
+    to 1837 cycles per frame (oscar64 1877), scroller 253 to 228 on
+    average and 938 to 838 in the worst frame.
+  - `x as u32 * K` with `x` of 16 bits and `K` below 65 536 (signed:
+    below 32 768) with more than three bits set: `rt_mul16u`/`rt_mul16s`
+    in place of `rt_mul32`, which found out at run time that both
+    halves were small. pi 14 814 781 to 14 463 527 cycles.
+  - `rt_mul16u` returns at once for a multiplier of zero (the check is
+    on the way that takes eight rounds: 5 cycles for a multiplier below
+    256, nothing for others). The first round of every point of the
+    Mandelbrot set multiplies 0 by 0 three times: PETSCII 19 148 140 to
+    17 888 993 (oscar64 18 817 639), multicolour 618 951 569 to
+    588 388 518; 13 bytes.
+  - Checks 88-90 in `tests/e2e/core`, 19 in `tests/e2e/lib2`.
+  - An access `op base,x` where X is Y plus a constant by an addition
+    that is known not to carry (`adds`, `cout` false) becomes
+    `op base+k,y` (and the other way round); what made X is then dead.
+    The cells loop of drawing: 40 to 26 cycles per round (1656 to 1056
+    for the phase; oscar64 1106 to 1188), 2076 to 2068 bytes.
+  - `drop_unread_stores` in codegen.rs, after `zp_direct` and the last
+    peephole: those take loads away after the optimizer of the
+    functions has run, and the store that fed them stayed. A plain
+    store to a frame byte that no line of the finished program reads
+    (by `p.layouts`; a name used in any way but as a plain operand
+    reads all its bytes) goes. diagonal: 3 cycles per cell, start-up
+    67 548 to 66 067.
+  - All fifteen examples 17 200 bytes (0.4% over oscar64 `-Os`).
 * Two errors found on the way (2026-11-24). The frame of an inlined
   function that the holder's code treats as its own lay where the frames
   of other functions the holder calls lie: now above them (`merged` in

@@ -283,6 +283,11 @@ struct Live {
 }
 
 struct Opt<'a> {
+    /// Frame bytes with a known value at the entry of the function.
+    entry_consts: Vec<(usize, Loc)>,
+    /// The stores to argument slots of other functions that the last
+    /// `forward` saw: name, offset, and the value if it is a constant.
+    stores: Vec<(String, u64, Option<u8>)>,
     id: usize,
     layout: &'a FrameLayout,
     lines: Vec<Line>,
@@ -423,7 +428,10 @@ pub fn optimize(
     call_args: &dyn Fn(&str) -> Option<u64>,
     call_reads: &dyn Fn(&str) -> Option<u8>,
     entry: &mut Option<u8>,
+    entry_consts: &[(usize, u8)],
+    stores: &mut Vec<(String, u64, Option<u8>)>,
 ) -> String {
+    stores.clear();
     let call_regs = |sym: &str| {
         call_args(sym).map(|n| {
             let taken = match n {
@@ -462,6 +470,8 @@ pub fn optimize(
         is_io,
         call_regs: &call_regs,
         is_const,
+        entry_consts: Vec::new(),
+        stores: Vec::new(),
     };
     let trace = std::env::var_os("RUST64_OPT_TRACE").is_some();
     if !o.parse(text) {
@@ -472,6 +482,12 @@ pub fn optimize(
     }
     if trace {
         eprintln!("opt F{id}: {} lines, {} cells, escaped {}", o.lines.len(), o.ncells, o.escaped.iter().filter(|e| **e).count());
+    }
+    for &(c, v) in entry_consts {
+        if c < o.nframe && !o.escaped[c] {
+            let v = o.imm(&format!("#${v:02x}"));
+            o.entry_consts.push((c, v));
+        }
     }
     for round in 0..400 {
         o.early = round < 2;
@@ -491,6 +507,7 @@ pub fn optimize(
         let live_in = o.liveness(&blocks);
         *entry = Some(live_in[0].regs & (RA | RX | RY));
     }
+    *stores = std::mem::take(&mut o.stores);
     o.emit()
 }
 
@@ -828,7 +845,7 @@ impl Opt<'_> {
     // ---- forward: values ----
 
     fn entry_state(&self) -> St {
-        St {
+        let mut st = St {
             l: (0..self.ncells + 3).map(|i| full(ENTRY + i as u64)).collect(),
             c: Tri::U,
             z: Tri::U,
@@ -836,7 +853,12 @@ impl Opt<'_> {
             csrc: None,
             zsrc: ZSrc::None,
             cadd: None,
+        };
+        // (argument bytes that are the same constant in every call)
+        for (c, v) in &self.entry_consts {
+            st.l[3 + c] = v.clone();
         }
+        st
     }
 
     /// The value of the operand of the instruction at line `li`.
@@ -1288,7 +1310,7 @@ impl Opt<'_> {
     /// has changed: ranges and flags only ever get less precise, and a
     /// value that keeps changing gets a number of its own, so the analysis
     /// comes to an end.
-    fn join(&self, b: usize, old: Option<&St>, incoming: &[&St], changes: u32) -> Option<St> {
+    fn join(&self, b: usize, old: Option<&St>, incoming: &[&St], changes: u32, ahead: bool) -> Option<St> {
         let (first, rest) = incoming.split_first()?;
         let nlocs = (self.ncells + 3) as u64;
         let phi = |i: usize| PHI + b as u64 * nlocs + i as u64;
@@ -1340,6 +1362,32 @@ impl Opt<'_> {
             }
             if old.cadd.is_none() {
                 new.cadd = None;
+            }
+        }
+        // Places that hold the same value on every edge (each arm of a
+        // `match` leaves its result in A and in a variable) hold the same
+        // value here: the later one gets the number of the earlier one.
+        // (Not one that had its own number before: that is final. And not
+        // at the head of a loop, `ahead` false: a counter that is known
+        // to be in A there has to be brought there by its step, which
+        // then is an addition where it was an `inc`.)
+        if ahead && !rest.is_empty() && std::env::var_os("RUST64_NO_JOIN_EQ").is_none() {
+            let mut merged: HashMap<u64, Vec<usize>> = HashMap::new();
+            for j in 0..new.l.len() {
+                if new.l[j].vn != phi(j) {
+                    continue;
+                }
+                let key = first.l[j].vn;
+                let same = merged.get(&key).and_then(|c| {
+                    c.iter().copied().find(|&i| incoming.iter().all(|s| s.l[i].vn == s.l[j].vn))
+                });
+                match same {
+                    Some(i) if !old.is_some_and(|o| o.l[j].vn == phi(j)) => {
+                        new.l[j].vn = phi(i);
+                    }
+                    Some(_) => {}
+                    None => merged.entry(key).or_default().push(j),
+                }
             }
         }
         for c in new.l.iter_mut() {
@@ -1445,7 +1493,8 @@ impl Opt<'_> {
                 if t == 0 {
                     incoming.push(&entry);
                 }
-                let new = self.join(t, inn[t].as_ref(), &incoming, changes[t]);
+                let ahead = preds[t].iter().all(|&(p, _)| p < t);
+                let new = self.join(t, inn[t].as_ref(), &incoming, changes[t], ahead);
                 if new.is_some() && new != inn[t] {
                     inn[t] = new;
                     changes[t] += 1;
@@ -1473,6 +1522,8 @@ impl Opt<'_> {
                 }
             }
         }
+        // (what is stored to the argument slots of other functions)
+        let mut passed: Vec<(String, u64, Option<u8>)> = Vec::new();
         for (b, block) in blocks.iter().enumerate() {
             let Some(mut st) = inn[b].clone() else { continue };
             for i in block.start..block.end {
@@ -1569,6 +1620,45 @@ impl Opt<'_> {
                     };
                     if st.l[3 + c].vn == st.l[r].vn && c < self.nframe {
                         gone = true;
+                    }
+                } else if matches!(ins.mode, Mode::MemX | Mode::MemY)
+                    && matches!(ins.op, "lda" | "sta" | "adc" | "sbc" | "and" | "ora" | "eor" | "cmp")
+                    && !self.early
+                    && std::env::var_os("RUST64_NO_INDEX_ADD").is_none()
+                {
+                    // The index is the other index register plus a constant
+                    // (and that did not carry): the constant goes into the
+                    // address, and the register that was made for the
+                    // access is not needed.
+                    let (r, other, from, to) =
+                        if ins.mode == Mode::MemX { (1, 2, ",x", ",y") } else { (2, 1, ",y", ",x") };
+                    if let Some(d) = self.adds.get(&st.l[r].vn)
+                        && d.cin == Cin::Zero
+                        && d.cout == Tri::F
+                    {
+                        let base = st.l[other].vn;
+                        let k = if d.x == base && d.y < 256 {
+                            Some(d.y)
+                        } else if d.y == base && d.x < 256 {
+                            Some(d.x)
+                        } else {
+                            None
+                        };
+                        if let (Some(k), Some(at)) = (k, ins.arg.strip_suffix(from))
+                            && !at.contains(['(', ')'])
+                        {
+                            new = Some((ins.op, format!("{at}+{k}{to}")));
+                        }
+                    }
+                } else if matches!(ins.op, "sta" | "stx" | "sty") && ins.mode == Mode::Mem && ins.arg.starts_with('L') {
+                    let r = match ins.op {
+                        "sta" => 0,
+                        "stx" => 1,
+                        _ => 2,
+                    };
+                    if let Some((base, off)) = sym_off(&ins.arg) {
+                        let v = &st.l[r];
+                        passed.push((base.to_owned(), off as u64, (v.lo == v.hi).then_some(v.lo as u8)));
                     }
                 } else if matches!(ins.op, "tax" | "tay" | "txa" | "tya") {
                     let (from, to) = match ins.op {
@@ -1688,6 +1778,7 @@ impl Opt<'_> {
                 ins.via_y = via_y;
             }
         }
+        self.stores = passed;
         self.adds_valid = true;
         // The branch at the end of each block, when the block is entered
         // from the one in front of it (for `rotate`: the first test of a

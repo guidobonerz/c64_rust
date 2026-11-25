@@ -82,6 +82,36 @@ pub fn copy(dst: u16, src: u16, n: u16) {
                 dst = in(reg) dst,
                 pairs = in(reg) pairs,
             )
+        } else if n < 256 && n != 1 {
+            // An odd number of bytes from 3 to 255: one, then two per
+            // round.
+            let pairs = n >> 1;
+            crate::asm!(
+                "lda {src}",
+                "sta zp_p0",
+                "lda {src}+1",
+                "sta zp_p0+1",
+                "lda {dst}",
+                "sta zp_p1",
+                "lda {dst}+1",
+                "sta zp_p1+1",
+                "ldy #0",
+                "lda (zp_p0),y",
+                "sta (zp_p1),y",
+                "iny",
+                "ldx {pairs}",
+                "@copy: lda (zp_p0),y",
+                "sta (zp_p1),y",
+                "iny",
+                "lda (zp_p0),y",
+                "sta (zp_p1),y",
+                "iny",
+                "dex",
+                "bne @copy",
+                src = in(reg) src,
+                dst = in(reg) dst,
+                pairs = in(reg) pairs,
+            )
         } else if n < 256 {
             // Up to 255 bytes: a loop in place, without the call.
             crate::asm!(

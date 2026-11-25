@@ -339,6 +339,124 @@ fn first_quad(n: u16) -> Result<Quad, u8> {
     Ok(q)
 }
 
+/// A name of up to 16 bytes with its length in one byte.
+struct Label {
+    text: [u8; 16],
+    len: u8,
+}
+
+impl Label {
+    fn text(&self) -> &[u8] {
+        &self.text[..self.len as usize]
+    }
+}
+
+/// Copies through two iterators that run together: the shorter one ends
+/// the loop, and its length is a byte.
+#[inline(never)]
+fn zipped(l: &Label) -> ([u8; 16], usize) {
+    let mut out = [0xeeu8; 16];
+    for (to, &from) in out.iter_mut().zip(l.text()) {
+        *to = from;
+    }
+    (out, l.text().len())
+}
+
+/// The same into a shorter array: the array ends the loop.
+#[inline(never)]
+fn zipped_short(l: &Label) -> [u8; 4] {
+    let mut out = [0xeeu8; 4];
+    for (to, &from) in out.iter_mut().zip(l.text()) {
+        *to = from;
+    }
+    out
+}
+
+/// Arrays and parts of arrays compared as a whole.
+#[inline(never)]
+fn same3(a: &[u8; 3], b: &[u8; 3]) -> bool {
+    a == b
+}
+
+#[inline(never)]
+fn find6(s: &[u8; 40], n: usize) -> Option<usize> {
+    let mut i = 0;
+    while i + 6 <= n {
+        if &s[i..i + 6] == b"SD2IEC" {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Arguments that go in memory (after the first three bytes). `scale` and
+/// `add` are the same constants in every call of `mix`; in `mix_some` one
+/// call differs, and `mix_ptr` is also called through a pointer.
+#[inline(never)]
+fn mix(a: u8, b: u8, c: u8, scale: u16, add: u16) -> u16 {
+    (a as u16 + b as u16 + c as u16).wrapping_mul(scale).wrapping_add(add)
+}
+
+#[inline(never)]
+fn mix_some(a: u8, b: u8, c: u8, scale: u16, add: u16) -> u16 {
+    (a as u16 + b as u16 + c as u16).wrapping_mul(scale).wrapping_add(add)
+}
+
+#[inline(never)]
+fn mix_ptr(a: u8, b: u8, c: u8, scale: u16, add: u16) -> u16 {
+    (a as u16 + b as u16 + c as u16).wrapping_mul(scale).wrapping_add(add)
+}
+
+#[inline(never)]
+fn mix_twice(n: u8) -> u16 {
+    mix(n, 1, 1, 3, 0x0100) + mix_some(n, 1, 1, 3, 0x0100) + mix_ptr(n, 1, 1, 3, 0x0100)
+}
+
+/// A match that gives a byte for a byte: a table.
+#[inline(never)]
+fn glyph(c: u8) -> u8 {
+    match c {
+        b'\\' => 1,
+        b'/' => 2,
+        b'#' => 3,
+        b'.' => 4,
+        b'o' => 5,
+        b'R' => 6,
+        b'U' => 7,
+        b'S' => 8,
+        b'T' => 9,
+        b'6' => 10,
+        b'4' => 11,
+        _ => 0,
+    }
+}
+
+/// The same with cases from 0 on and a value for everything else.
+#[inline(never)]
+fn weight(n: u8) -> u8 {
+    match n {
+        0 => 7,
+        1 => 3,
+        2 => 9,
+        3 => 1,
+        5 => 4,
+        6 => 2,
+        _ => 0xee,
+    }
+}
+
+/// A 16-bit value times a constant, as a 32-bit product.
+#[inline(never)]
+fn scaled(x: u16) -> u32 {
+    x as u32 * 10000
+}
+
+#[inline(never)]
+fn scaled_signed(x: i16) -> i32 {
+    x as i32 * 10000
+}
+
 #[inline(never)]
 fn set_far(a: &mut [u16; 400]) {
     a[399] = 0x1234;
@@ -629,6 +747,90 @@ pub extern "C" fn main() {
         Err(_) => false,
     };
     check(ok && first_quad(bb(7)) == Err(0));
+
+    // 81-83: two iterators that run together, with a length of one byte
+    let mut l = Label { text: [0; 16], len: bb(5) };
+    for (i, c) in l.text.iter_mut().enumerate() {
+        *c = 0x41 + i as u8;
+    }
+    let (out, n) = zipped(&l);
+    check(n == 5 && out[..5] == *b"ABCDE" && out[5..].iter().all(|&c| c == 0xee));
+    l.len = bb(16);
+    let (out, n) = zipped(&l);
+    check(n == 16 && out == *b"ABCDEFGHIJKLMNOP" && zipped_short(&l) == *b"ABCD");
+    l.len = bb(0);
+    let (out, n) = zipped(&l);
+    l.len = bb(2);
+    check(n == 0 && out == [0xee; 16] && zipped_short(&l) == [0x41, 0x42, 0xee, 0xee]);
+    // 84-85: arrays compared as a whole, and a part of one with a constant
+    let kind = [bb(b'D'), b'I', b'R'];
+    check(
+        same3(&kind, b"DIR")
+            && !same3(&kind, b"DIS")
+            && !same3(&kind, b"EIR")
+            && !same3(&kind, b"DAR")
+            && kind == *b"DIR"
+            && kind != *b"PRG",
+    );
+    let mut s = [b' '; 40];
+    s[7..13].copy_from_slice(b"SD2IEC");
+    s[20..25].copy_from_slice(b"SD2IE");
+    check(
+        find6(&s, bb(40)) == Some(7)
+            && find6(&s, bb(12)) == None
+            && find6(&s, bb(13)) == Some(7)
+            && find6(&s, bb(5)) == None
+            && {
+                s[7] = b'X';
+                find6(&s, bb(40)) == None
+            },
+    );
+
+    // 86-87: arguments in memory that are the same in every call, and
+    // ones that are not
+    let f: fn(u8, u8, c: u8, u16, u16) -> u16 = bb(mix_ptr);
+    check(
+        mix(bb(1), 2, 3, 3, 0x0100) == 18 + 256
+            && mix(bb(10), 20, 30, 3, 0x0100) == 180 + 256
+            && mix_twice(bb(2)) == 3 * (12 + 256),
+    );
+    check(
+        mix_some(bb(1), 2, 3, 3, 0x0100) == 18 + 256
+            && mix_some(bb(1), 2, 3, 0x0103, 0x0200) == 6 * 0x0103 + 0x0200
+            && mix_ptr(bb(1), 2, 3, 3, 0x0100) == 18 + 256
+            && f(bb(1), 2, 3, 0x0203, 0x0300) == 6 * 0x0203 + 0x0300,
+    );
+
+    // 88-89: matches that are tables: every case, the gaps, both ends
+    let pairs = [
+        (b'\\', 1), (b'/', 2), (b'#', 3), (b'.', 4), (b'o', 5), (b'R', 6),
+        (b'U', 7), (b'S', 8), (b'T', 9), (b'6', 10), (b'4', 11),
+        (b'"', 0), (b'$', 0), (b'5', 0), (b'p', 0), (b'n', 0), (0, 0), (255, 0), (b' ', 0),
+    ];
+    check(pairs.iter().all(|&(c, k)| glyph(bb(c)) == k));
+    check(
+        weight(bb(0)) == 7
+            && weight(bb(1)) == 3
+            && weight(bb(2)) == 9
+            && weight(bb(3)) == 1
+            && weight(bb(4)) == 0xee
+            && weight(bb(5)) == 4
+            && weight(bb(6)) == 2
+            && weight(bb(7)) == 0xee
+            && weight(bb(255)) == 0xee,
+    );
+    // 90: a widened value times a constant of 16 bits; times zero
+    check(
+        scaled(bb(0)) == 0
+            && scaled(bb(1)) == 10000
+            && scaled(bb(1234)) == 12_340_000
+            && scaled(bb(65535)) == 655_350_000
+            && scaled_signed(bb(-3)) == -30000
+            && scaled_signed(bb(0)) == 0
+            && scaled_signed(bb(32767)) == 327_670_000
+            && (bb(0i16) as i32) * (bb(-77i16) as i32) == 0
+            && (bb(300i16) as i32) * (bb(0i16) as i32) == 0,
+    );
 
     unsafe {
         write_volatile(0xd020 as *mut u8, if FAILS == 0 { 5 } else { 2 });

@@ -75,6 +75,10 @@ fn main() {
             && sd::version(DEV).is_ok()
             && matches!(sd::status(DEV, &mut s), Some((n, 3)) if n > 10 && &s[3..9] == b"SD2IEC"),
     );
+    // 11-12: commands made of parts: deleting a file that is not there
+    // deletes nothing (01), renaming one is "file not found" (62)
+    check(dos::scratch(DEV, "nofile").is_ok() && sd::check(DEV) == Ok(1));
+    check(dos::rename(DEV, "nofile", "other").is_ok() && sd::check(DEV) == Err(62));
     unsafe {
         hw::vic().border.write(if FAILS == 0 { Color::Green } else { Color::Red });
     }

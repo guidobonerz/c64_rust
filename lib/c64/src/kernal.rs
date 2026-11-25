@@ -138,12 +138,17 @@ pub fn setlfs(lfn: u8, dev: u8, sa: u8) {
 /// [`crate::p!`]) and must stay valid until the file is opened, loaded or
 /// saved.
 pub fn setnam(name: &[u8]) {
+    setnam_len(name.as_ptr(), name.len() as u8)
+}
+
+/// [`setnam`] for the first `len` bytes at `name`.
+pub(crate) fn setnam_len(name: *const u8, len: u8) {
     #[cfg(target_os = "c64")]
     unsafe {
-        c64_setnam(name.as_ptr(), name.len() as u8)
+        c64_setnam(name, len)
     }
     #[cfg(not(target_os = "c64"))]
-    let _ = name;
+    let _ = (name, len);
 }
 
 /// Opens the file set up with [`setlfs`]/[`setnam`] (OPEN, `$FFC0`).

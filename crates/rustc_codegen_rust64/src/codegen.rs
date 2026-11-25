@@ -135,6 +135,16 @@ struct Program<'tcx> {
     /// 2: Y), as far as known: an argument byte that is not read is not
     /// loaded by the callers.
     entry_regs: FxIndexMap<usize, u8>,
+    /// The tables of matches that became a lookup (`T<n>`), as assembly
+    /// for the data of the program, and their number.
+    tables: String,
+    ntables: usize,
+    /// Bytes of arguments in memory that are the same constant in every
+    /// call of a function (`const_args`): name of the slot, offset, value.
+    const_args: FxIndexMap<usize, Vec<(String, u64, u8)>>,
+    /// What each function stores to the argument slots of others, as its
+    /// last optimization saw it (the value if it is a constant).
+    arg_stores: FxIndexMap<usize, Vec<(String, u64, Option<u8>)>>,
     /// For each function: the arguments that are not passed
     /// (`unpassed_args`; `None` while the function is being looked at).
     unpassed: FxIndexMap<Instance<'tcx>, Option<Vec<bool>>>,
@@ -274,6 +284,10 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
         calls: Vec::new(),
         merged: Vec::new(),
         entry_regs: FxIndexMap::default(),
+        tables: String::new(),
+        ntables: 0,
+        const_args: FxIndexMap::default(),
+        arg_stores: FxIndexMap::default(),
         unpassed: FxIndexMap::default(),
         unpassed_of: FxIndexMap::default(),
         free_dests: FxIndexMap::default(),
@@ -383,6 +397,9 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     lib.push_str(&exported_data.text);
     lib.push_str("\n; ---- constants ----\n");
     lib.push_str(&const_data.text);
+    // (the dispatcher of `c64::irq` is the one place in the library that
+    // calls through `rt_jvec`)
+    p.ptr_ctx.jvec = p.asm.text.contains("rt_jsrind") || p.rat.matches("rt_jsrind").count() > 1;
     lib.push_str(&ctx_save(p.ptr_ctx));
 
     // Arguments nobody reads are not passed; what that frees in the
@@ -390,6 +407,9 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     {
         let program = format!("{}{}{}", p.asm.text, wrappers, data.text);
         let kept = crate::asm::prune(&lib, &program);
+        if std::env::var_os("RUST64_NO_OPT").is_none() && std::env::var_os("RUST64_NO_CONST_ARGS").is_none() {
+            const_args(&mut p, &[&wrappers, &data.text, &kept]);
+        }
         let code = crate::asm::drop_dead_args(&p.asm.text, &[&wrappers, &data.text, &kept], &|name| {
             // F<id>v<n>, F<id>t, L<id>_<n>
             let id = name
@@ -656,6 +676,20 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     let code = crate::asm::zp_direct(&p.asm.text, in_zp);
     // (a value that was stored for the pointer setup and loaded again)
     let code = crate::asm::peephole(&code);
+    // (and the store, if that was the only reader)
+    let code = if std::env::var_os("RUST64_NO_OPT").is_none() && std::env::var_os("RUST64_KEEP_STORES").is_none() {
+        drop_unread_stores(&code, &[&wrappers, &data.text, &lib], &|name| {
+            let id = name
+                .strip_prefix('F')
+                .and_then(|r| r.split_once(['v', 't']))
+                .or_else(|| name.strip_prefix('L').and_then(|r| r.split_once('_')))
+                .and_then(|(id, _)| id.parse::<usize>().ok())?;
+            let &(o, n) = p.layouts.get(&id)?.0.get(name)?;
+            Some((id, o, n))
+        })
+    } else {
+        code
+    };
     // Branch distances with the real sizes: frames in the zero page are
     // known now.
     let code = crate::asm::relax_with(
@@ -669,6 +703,7 @@ pub fn build_program(tcx: TyCtxt<'_>) -> String {
     out.push_str(&wrappers);
     out.push_str("\n; ---- data ----\n");
     out.push_str(&data.text);
+    out.push_str(&p.tables);
     out.push_str("\n; ---- bss (not in the file) ----\n__bss:\n");
     out.push_str(&p.defs);
     let _ = writeln!(out, "__bss_end = __bss + {}", p.bss);
@@ -1610,6 +1645,15 @@ struct FnCx<'a, 'tcx> {
     /// Pointer locals that always hold the same known address (an
     /// assembler expression): dereferencing them is a direct access.
     addrs: Vec<Option<String>>,
+    /// Pointers that are a pointer with a known address plus a local, in
+    /// bytes (`addr_locals`): that pointer and the local.
+    sums: Vec<Option<(Local, Local)>>,
+    /// Pointers whose value is a pointer local that never changes plus a
+    /// constant (`addr_locals`): that local and the constant. For a pointer
+    /// to a slice: where it points to.
+    syms: Vec<Option<(Local, u64)>>,
+    /// Pointers that are such a value plus a local, in bytes.
+    sym_sums: Vec<Option<(Local, u64, Local)>>,
     uses: Uses<'tcx>,
     /// Locals that are not stored: single-use temporaries that are a copy,
     /// zero-extension or truncation of another value (see `lazy_locals`).
@@ -1686,6 +1730,9 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
         span: mir.span,
         consts: const_locals(tcx, inst, mir, 3),
         addrs: Vec::new(),
+        sums: Vec::new(),
+        syms: Vec::new(),
+        sym_sums: Vec::new(),
         uses: Uses::new(tcx, mir),
         lazy_cand: Vec::new(),
         lazy_def: vec![None; mir.local_decls.len()],
@@ -1716,6 +1763,7 @@ fn compile_fn(p: &mut Program<'_>, id: usize) {
         let text = &f.p.asm.text[start..];
         let mut c = f.p.ptr_ctx;
         c.foreign |= text.contains("__args") || text.contains("__res");
+        c.zp |= text.contains("zp_p");
         for (i, _) in text.match_indices("rt_") {
             let r = &text[i..];
             if r.starts_with("rt_args") || r.starts_with("rt_ret") {
@@ -2073,6 +2121,7 @@ fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> S
     }
     let mut opt = crate::asm::forward(&opt, id, &layout, args_end, &mut |l, o| const_byte(p, l, o));
     let mut found = None;
+    let mut stores = Vec::new();
     if std::env::var_os("RUST64_NO_OPT").is_none() {
         // The data-flow pass follows every byte of the frame at every point
         // of the function. Large locals (arrays) would make that slow and
@@ -2165,6 +2214,15 @@ fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> S
         let call_reads = |sym: &str| {
             sym.strip_prefix('F').and_then(|n| n.parse::<usize>().ok()).and_then(|n| entry_regs.get(&n).copied())
         };
+        let consts: Vec<(usize, u8)> = p
+            .const_args
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, off, v)| {
+                layout.get(name).filter(|&&(_, n)| *off < n).map(|&(o, _)| ((o + off) as usize, *v))
+            })
+            .collect();
         let mut entry = None;
         for _ in 0..4 {
             let next = crate::asm::relax(&crate::opt::optimize(
@@ -2176,6 +2234,8 @@ fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> S
                 &call_args,
                 &call_reads,
                 &mut entry,
+                &consts,
+                &mut stores,
             ));
             if next == opt {
                 break;
@@ -2190,7 +2250,187 @@ fn optimize_fn(p: &mut Program<'_>, text: &str, id: usize, extra: &[usize]) -> S
         Some(regs) => p.entry_regs.insert(id, regs),
         None => p.entry_regs.swap_remove(&id),
     };
+    p.arg_stores.insert(id, stores);
+    // (the optimizer may have put more between a branch and its target
+    // than the branch reaches)
+    let mut lines: Vec<String> = opt.lines().map(str::to_owned).collect();
+    crate::asm::widen(&mut lines);
+    let mut opt = lines.join("\n");
+    opt.push('\n');
     crate::asm::peephole(&crate::asm::relax(&opt))
+}
+
+/// Removes the stores to frame bytes that nothing reads, in the finished
+/// code: the last passes take loads away (a pointer in the zero page is
+/// used where it is, a value is still in A) after the optimizer of the
+/// functions has run. `frame` gives the frame, offset and size of a frame
+/// name; `others` is the rest of the program. A plain load or operand
+/// reads its byte; a name used in any other way (indexed, as an address,
+/// as a pointer) reads all its bytes.
+fn drop_unread_stores(code: &str, others: &[&str], frame: &dyn Fn(&str) -> Option<(usize, u64, u64)>) -> String {
+    use std::collections::HashSet;
+    let words = |line: &'_ str| -> Vec<String> {
+        line.split(';')
+            .next()
+            .unwrap_or("")
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| w.starts_with(['F', 'L']))
+            .map(str::to_owned)
+            .collect()
+    };
+    // a plain operand `name+k`: its byte
+    let plain = |arg: &str| -> Option<(usize, u64)> {
+        let (base, off) = FnCx::split_offset(arg.trim());
+        let (id, o, n) = frame(base)?;
+        (off < n).then_some((id, o + off))
+    };
+    let mut read: HashSet<(usize, u64)> = HashSet::new();
+    let all = |line: &str, read: &mut HashSet<(usize, u64)>| {
+        for w in words(line) {
+            if let Some((id, o, n)) = frame(&w) {
+                read.extend((o..o + n).map(|b| (id, b)));
+            }
+        }
+    };
+    for text in others {
+        for line in text.lines() {
+            all(line, &mut read);
+        }
+    }
+    let parts = |line: &'_ str| -> Option<(String, String)> {
+        let t = line.split(';').next().unwrap_or("").trim();
+        if !line.starts_with([' ', '\t']) {
+            return None;
+        }
+        let (op, arg) = t.split_once(' ')?;
+        Some((op.to_owned(), arg.trim().to_owned()))
+    };
+    for line in code.lines() {
+        match parts(line) {
+            Some((op, arg)) if matches!(op.as_str(), "sta" | "stx" | "sty") && plain(&arg).is_some() => {}
+            Some((_, arg)) if plain(&arg).is_some() => {
+                read.insert(plain(&arg).unwrap());
+            }
+            _ => all(line, &mut read),
+        }
+    }
+    let mut out = String::with_capacity(code.len());
+    for line in code.lines() {
+        if let Some((op, arg)) = parts(line)
+            && matches!(op.as_str(), "sta" | "stx" | "sty")
+            && plain(&arg).is_some_and(|b| !read.contains(&b))
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Finds the bytes of arguments in memory that are the same constant in
+/// every call (the upper byte of a length that is always short), and
+/// optimizes the functions again that take them: they then have the
+/// constant in place of the byte, and `drop_dead_args` takes the stores
+/// out of the callers if nothing reads the byte any more.
+///
+/// A byte counts if all that names its slot outside the function are plain
+/// stores (`others`: the rest of the program, which must not name it at
+/// all), the function itself does not store to it, and the optimizer saw
+/// every one of the stores with the same constant in the register.
+fn const_args(p: &mut Program<'_>, others: &[&str]) {
+    use std::collections::{HashMap, HashSet};
+    // the argument slots a line names: the function and the name
+    fn slots(line: &str) -> impl Iterator<Item = (usize, &str)> {
+        let line = line.split(';').next().unwrap_or("");
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter_map(|w| {
+            let (id, k) = w.strip_prefix('L')?.split_once('_')?;
+            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((id.parse().ok()?, w))
+        })
+    }
+    let entry = |line: &str| line.strip_prefix('F').and_then(|r| r.strip_suffix(':')).and_then(|r| r.parse::<usize>().ok());
+    let mut bad: HashSet<String> = HashSet::new();
+    for text in others {
+        for line in text.lines() {
+            bad.extend(slots(line).map(|(_, w)| w.to_owned()));
+        }
+    }
+    let mut count: HashMap<(String, u64), usize> = HashMap::new();
+    let mut cur = usize::MAX;
+    for line in p.asm.text.lines() {
+        if let Some(id) = entry(line) {
+            cur = id;
+        }
+        let t = line.split(';').next().unwrap_or("").trim();
+        for (id, w) in slots(line) {
+            let store = t
+                .split_once(' ')
+                .filter(|(op, _)| matches!(*op, "sta" | "stx" | "sty"))
+                .map(|(_, arg)| FnCx::split_offset(arg.trim()))
+                .filter(|(base, _)| *base == w);
+            match store {
+                Some((_, off)) if id != cur => *count.entry((w.to_owned(), off)).or_default() += 1,
+                None if id == cur => {}
+                _ => {
+                    bad.insert(w.to_owned());
+                }
+            }
+        }
+    }
+    let mut vals: HashMap<(&str, u64), Vec<Option<u8>>> = HashMap::new();
+    for list in p.arg_stores.values() {
+        for (name, off, v) in list {
+            vals.entry((name.as_str(), *off)).or_default().push(*v);
+        }
+    }
+    let mut found: Vec<(usize, String, u64, u8)> = Vec::new();
+    for ((name, off), n) in &count {
+        let Some(v) = vals.get(&(name.as_str(), *off)) else { continue };
+        let Some(&Some(first)) = v.first() else { continue };
+        let Some((id, _)) = slots(name).next() else { continue };
+        if !bad.contains(name) && v.len() == *n && v.iter().all(|x| *x == Some(first)) {
+            found.push((id, name.clone(), *off, first));
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    found.sort();
+    let mut args: FxIndexMap<usize, Vec<(String, u64, u8)>> = FxIndexMap::default();
+    for (id, name, off, v) in found {
+        args.entry(id).or_default().push((name, off, v));
+    }
+    p.const_args = args;
+    // the functions that take them, again
+    let text = std::mem::take(&mut p.asm.text);
+    let mut out = String::with_capacity(text.len());
+    let mut chunk: Option<(usize, String)> = None;
+    let flush = |p: &mut Program<'_>, out: &mut String, chunk: Option<(usize, String)>| {
+        if let Some((id, text)) = chunk {
+            if p.const_args.contains_key(&id) {
+                out.push_str(&optimize_fn(p, &text, id, &[]));
+            } else {
+                out.push_str(&text);
+            }
+        }
+    };
+    for line in text.lines() {
+        if let Some(id) = entry(line) {
+            flush(p, &mut out, chunk.take());
+            chunk = Some((id, String::new()));
+        }
+        let to = match &mut chunk {
+            Some((_, c)) => c,
+            None => &mut out,
+        };
+        to.push_str(line);
+        to.push('\n');
+    }
+    flush(p, &mut out, chunk.take());
+    p.asm.text = out;
 }
 
 /// `rt_ctx_save` / `rt_ctx_restore` for interrupt dispatchers: copy what
@@ -2203,6 +2443,11 @@ struct PtrCtx {
     arith: bool,
     calls: bool,
     foreign: bool,
+    /// That code uses the scratch pointers itself.
+    zp: bool,
+    /// The program calls through function pointers (`rt_jvec`, which a
+    /// dispatcher sets too).
+    jvec: bool,
 }
 
 fn ctx_save(c: PtrCtx) -> String {
@@ -2229,8 +2474,16 @@ fn ctx_save(c: PtrCtx) -> String {
             a.ins(format!("bne {lloop}"));
             a.label(&ldone);
         };
-        copy(&mut a, "$f9", "rt_ctxbuf+256", "6", false);
-        copy(&mut a, "rt_jvec", "rt_ctxbuf+262", "2", false);
+        // The scratch pointers: only if the code that an interrupt runs
+        // uses them, itself or in a routine it calls. `rt_jvec`: only if
+        // the program can be interrupted between setting it and the call.
+        let all = std::env::var_os("RUST64_CTX_ALL").is_some();
+        if all || c.zp || c.arith || c.calls || c.foreign {
+            copy(&mut a, "$f9", "rt_ctxbuf+256", "6", false);
+        }
+        if all || c.jvec {
+            copy(&mut a, "rt_jvec", "rt_ctxbuf+262", "2", false);
+        }
         // Assembly functions may use the arithmetic registers too.
         if c.arith || c.foreign {
             copy(&mut a, "rt_save", "rt_ctxbuf", "rt_save_n", false);
@@ -3882,10 +4135,17 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         if std::env::var_os("RUST64_NO_NARROW").is_some() {
             return out;
         }
+        let wide = std::env::var_os("RUST64_NO_NARROW_MORE").is_none();
+        // (in rounds: a local may fit because another one does)
+        for _ in 0..8 {
+        let mut changed = false;
         // (the result too: it keeps its bytes for the caller)
         'locals: for l in std::iter::once(0).chain(mir.arg_count + 1..n) {
             let local = Local::from_usize(l);
             let ty = self.local_ty(local);
+            if out[l] {
+                continue;
+            }
             if !matches!(ty.kind(), ty::Uint(_))
                 || self.layout(ty).size.bytes() != 2
                 || u.borrowed[l]
@@ -3900,11 +4160,62 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 continue;
             }
             for &d in &u.def_locs[l] {
-                let Some(stmt) = blocks[d.block].statements.get(d.statement_index) else { continue 'locals };
+                // (a local that fits: one of these, or a byte that is
+                // extended, which may be a view without storage)
+                let fits_local = |q: Local| {
+                    let i = q.as_usize();
+                    out[i]
+                        || (u.defs[i] == 1 && !u.borrowed[i] && {
+                            let stmt = match &u.def_locs[i][..] {
+                                &[loc] => blocks[loc.block].statements.get(loc.statement_index),
+                                _ => None,
+                            };
+                            matches!(stmt.map(|s| &s.kind), Some(StatementKind::Assign(b))
+                                if b.0.projection.is_empty()
+                                    && matches!(&b.1, Rvalue::Cast(CastKind::IntToInt, src, _) if {
+                                        let from = self.monomorphize(src.ty(&mir.local_decls, self.tcx()));
+                                        matches!(from.kind(), ty::Uint(_)) && self.layout(from).size.bytes() == 1
+                                    }))
+                        })
+                };
+                let fits = |o: &Operand<'tcx>| {
+                    self.const_bits(o).is_some_and(|v| v < 256)
+                        || matches!(o, Operand::Copy(p) | Operand::Move(p)
+                            if p.projection.is_empty() && fits_local(p.local))
+                };
+                let Some(stmt) = blocks[d.block].statements.get(d.statement_index) else {
+                    // the result of a call: the smaller of two values of
+                    // which one fits, or `(a + n) - a` where `n` fits
+                    let TerminatorKind::Call { func, args, destination, .. } = &blocks[d.block].terminator().kind
+                    else {
+                        continue 'locals;
+                    };
+                    let name = func
+                        .const_fn_def()
+                        .filter(|(id, _)| wide && self.tcx().intrinsic(*id).is_some())
+                        .map(|(id, _)| self.tcx().item_name(id));
+                    let ok = destination.projection.is_empty()
+                        && match name.as_ref().map(|n| n.as_str()) {
+                            Some("integer_min") => args.iter().any(|a| fits(&a.node)),
+                            Some("ptr_offset_from_unsigned") if args.len() == 2 => {
+                                let ty = self.monomorphize(args[0].node.ty(&mir.local_decls, self.tcx()));
+                                ty.builtin_deref(true).is_some_and(|t| self.layout(t).size.bytes() == 1)
+                                    && self
+                                        .sum_diff(&args[0].node, &args[1].node)
+                                        .is_some_and(fits_local)
+                            }
+                            _ => false,
+                        };
+                    if !ok {
+                        continue 'locals;
+                    }
+                    continue;
+                };
                 let StatementKind::Assign(b) = &stmt.kind else { continue 'locals };
                 let ok = b.0.projection.is_empty()
                     && match &b.1 {
                         Rvalue::Use(k @ Operand::Constant(_), ..) => self.const_bits(k).is_some_and(|v| v < 256),
+                        Rvalue::Use(k @ (Operand::Copy(_) | Operand::Move(_)), ..) => wide && fits(k),
                         Rvalue::Cast(CastKind::IntToInt, src, _) => {
                             let from = self.monomorphize(src.ty(&mir.local_decls, self.tcx()));
                             matches!(from.kind(), ty::Uint(_)) && self.layout(from).size.bytes() == 1
@@ -3913,7 +4224,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                             (Operand::Copy(x) | Operand::Move(x), k @ Operand::Constant(_))
                                 if x.projection.is_empty() =>
                             {
-                                self.const_bits(k).is_some_and(|k| k < 256 && self.below(local, x.local, d, 256 - k))
+                                self.const_bits(k).is_some_and(|k| {
+                                    k < 256 && self.below(local, x.local, d, 256 - k, if wide { &out } else { &[] })
+                                })
                             }
                             _ => false,
                         },
@@ -3924,6 +4237,11 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 }
             }
             out[l] = true;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
         }
         out
     }
@@ -3931,8 +4249,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// Whether `x`, which is `local` or a copy of it, is below a constant
     /// of at most `limit` at `at`, where `local` is assigned: a block that
     /// every way to `at` passes is only entered by the true branch of
-    /// `local < c`, and `local` is not assigned from there to `at`.
-    fn below(&self, local: Local, x: Local, at: Location, limit: u128) -> bool {
+    /// `local < c`, and `local` is not assigned from there to `at`. With a
+    /// `limit` of 255, `c` may also be a local that fits a byte (`narrow`).
+    fn below(&self, local: Local, x: Local, at: Location, limit: u128, narrow: &[bool]) -> bool {
         let mir = self.mir;
         let blocks = &mir.basic_blocks;
         let preds = blocks.predecessors();
@@ -3979,7 +4298,11 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     BinOp::Ge => t_false == Target::Block(q),
                     _ => false,
                 };
-                if !holds || !self.const_bits(c).is_some_and(|c| c <= limit) {
+                let bound = self.const_bits(c).is_some_and(|c| c <= limit)
+                    || (limit >= 255
+                        && matches!(c, Operand::Copy(m) | Operand::Move(m)
+                            if m.projection.is_empty() && narrow.get(m.local.as_usize()) == Some(&true)));
+                if !holds || !bound {
                     break 'here;
                 }
                 // what is compared is the local as it is at the end of `p`
@@ -4039,6 +4362,122 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     }
 
     /// A `match` on an enum with two variants that is stored without a tag
+    /// A `match` on a byte whose arms only give one variable a constant
+    /// byte each (`match c { b'/' => 2, b'#' => 3, .. , _ => 0 }`): a table
+    /// with the values from the smallest to the largest case, and
+    ///
+    /// ```text
+    ///         lda c
+    ///         sec
+    ///         sbc #first
+    ///         cmp #count
+    ///         bcs other
+    ///         tax
+    ///         lda table,x
+    /// ```
+    ///
+    /// in place of a comparison per case. Taken where the table is not
+    /// larger than the comparisons and arms it replaces (about 11 bytes per
+    /// case); true if it was compiled that way.
+    fn lookup_switch(
+        &mut self,
+        discr: &Operand<'tcx>,
+        targets: &rustc_middle::mir::SwitchTargets,
+        next: Option<BasicBlock>,
+    ) -> bool {
+        if std::env::var_os("RUST64_NO_LOOKUP").is_some() {
+            return false;
+        }
+        let mir = self.mir;
+        let ty = self.monomorphize(discr.ty(&mir.local_decls, self.tcx()));
+        if self.layout(ty).size.bytes() != 1 || targets.iter().count() < 4 {
+            return false;
+        }
+        // what an arm is: the variable, its value, and where it goes on
+        let arm = |this: &Self, bb: BasicBlock| -> Option<(Local, u8, BasicBlock)> {
+            let data = &mir.basic_blocks[bb];
+            let TerminatorKind::Goto { target, .. } = data.terminator().kind else { return None };
+            let mut found = None;
+            for stmt in &data.statements {
+                match &stmt.kind {
+                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
+                    StatementKind::Assign(b) if found.is_none() => {
+                        let (place, Rvalue::Use(k @ Operand::Constant(_), ..)) = &**b else { return None };
+                        let size = this.layout(this.local_ty(place.local)).size.bytes();
+                        if !place.projection.is_empty() || size != 1 {
+                            return None;
+                        }
+                        found = Some((place.local, this.const_bits(k)? as u8, target));
+                    }
+                    _ => return None,
+                }
+            }
+            found
+        };
+        let other = &mir.basic_blocks[targets.otherwise()];
+        let impossible = matches!(other.terminator().kind, TerminatorKind::Unreachable);
+        let default = arm(self, targets.otherwise());
+        if default.is_none() && !impossible {
+            return false;
+        }
+        let mut cases: Vec<(u8, u8)> = Vec::new();
+        let mut same: Option<(Local, BasicBlock)> = default.map(|(l, _, j)| (l, j));
+        for (value, target) in targets.iter() {
+            let Some((l, k, j)) = arm(self, target) else { return false };
+            if value > 255 || same.is_some_and(|s| s != (l, j)) {
+                return false;
+            }
+            same = Some((l, j));
+            cases.push((value as u8, k));
+        }
+        let Some((dest, join)) = same else { return false };
+        let (Some(&min), Some(&max)) = (cases.iter().map(|c| &c.0).min(), cases.iter().map(|c| &c.0).max()) else {
+            return false;
+        };
+        let range = (max - min) as usize + 1;
+        if range + 16 > 11 * cases.len() {
+            return false;
+        }
+        let fill = default.map_or(0, |d| d.1);
+        let mut table = vec![fill; range];
+        for &(value, k) in &cases {
+            table[(value - min) as usize] = k;
+        }
+        let name = format!("T{}", self.p.ntables);
+        self.p.ntables += 1;
+        let _ = writeln!(self.p.tables, "; the values of a match in {}\n{name}:", self.p.name(self.id));
+        for row in table.chunks(16) {
+            let bytes: Vec<String> = row.iter().map(|b| format!("${b:02x}")).collect();
+            let _ = writeln!(self.p.tables, "        .byte {}", bytes.join(","));
+        }
+        let (v, _) = self.operand(discr);
+        let (d, _, _) = self.place(Place::from(dest));
+        let a = &mut self.p.asm;
+        a.setup_val(&v, 0);
+        a.setup(&d, 2);
+        a.lda(&v, 0, 0);
+        if min != 0 {
+            a.ins("sec");
+            a.ins(format!("sbc #${min:02x}"));
+        }
+        let (lother, lstore) = (a.new_label(), a.new_label());
+        if !impossible || default.is_some() {
+            if range < 256 {
+                a.ins(format!("cmp #${range:02x}"));
+                a.ins(format!("bcs {lother}"));
+            }
+        }
+        a.ins("tax");
+        a.ins(format!("lda {name},x"));
+        a.ins(format!("jmp {lstore}"));
+        a.label(&lother);
+        a.ins(format!("lda #${fill:02x}"));
+        a.label(&lstore);
+        a.sta(&d, 0, 2);
+        self.goto(join, next);
+        true
+    }
+
     /// of its own (`Option<&T>`, `Result<Dir, Error>` with the error in a
     /// value the data cannot have): the block ends with the discriminant
     /// and a switch on it, and the discriminant is used nowhere else. Then
@@ -4253,10 +4692,24 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
     /// For each local: the address it always holds, if it is a thin pointer
     /// that is assigned exactly once (from a constant, a copy or cast of
-    /// such a local, or a reference to a place with a known address) and
-    /// never borrowed or written through a projection.
+    /// such a local, such a local plus a constant, or a reference to a
+    /// place with a known address) and never borrowed or written through a
+    /// projection. A pointer in a wrapper (`NonNull`) counts where the
+    /// local is only used as a whole.
     fn addr_locals(&mut self) -> Vec<Option<String>> {
+        struct Parts(Vec<bool>);
+        impl<'tcx> Visitor<'tcx> for Parts {
+            fn visit_place(&mut self, place: &Place<'tcx>, _: PlaceContext, _: Location) {
+                if !place.projection.is_empty() {
+                    self.0[place.local.as_usize()] = true;
+                }
+            }
+        }
         let n = self.mir.local_decls.len();
+        let mut parts = Parts(vec![false; n]);
+        parts.visit_body(self.mir);
+        let parts = parts.0;
+        let extended = std::env::var_os("RUST64_NO_ADDR_SUMS").is_none();
         let mut assigns = vec![0u32; n];
         let mut blocked = vec![false; n];
         for a in 1..=self.mir.arg_count {
@@ -4295,21 +4748,64 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             }
         }
         let mut addrs: Vec<Option<String>> = vec![None; n];
-        for _ in 0..6 {
+        // (where the pointers to slices point to: those keep their storage,
+        // but a thin pointer made of one has a known address again)
+        let mut fat: Vec<Option<String>> = vec![None; n];
+        // (a known address plus a local that is assigned once: the
+        // difference to that address is the local again)
+        let mut sums: Vec<Option<(Local, Local)>> = vec![None; n];
+        for _ in 0..if extended { 12 } else { 6 } {
             let mut changed = false;
             for &(l, rv) in &cands {
                 let i = l.as_usize();
-                if assigns[i] != 1 || blocked[i] || addrs[i].is_some() {
+                if assigns[i] != 1 || blocked[i] || addrs[i].is_some() || fat[i].is_some() || sums[i].is_some() {
                     continue;
                 }
                 let ty = self.local_ty(l);
-                if ty.builtin_deref(true).is_none() || self.layout(ty).size.bytes() != 2 {
+                let layout = self.layout(ty);
+                if extended && layout.size.bytes() == 4 && (ty.builtin_deref(true).is_some() || !parts[i]) {
+                    let v = match rv {
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _)
+                        | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _)
+                            if p.projection.is_empty() =>
+                        {
+                            let q = p.local.as_usize();
+                            let pointer = self.local_ty(p.local).builtin_deref(true).is_some() || !parts[q];
+                            fat[q].clone().or_else(|| addrs[q].clone()).filter(|_| pointer)
+                        }
+                        Rvalue::Ref(_, _, p) | Rvalue::RawPtr(_, p)
+                            if p.projection.len() == 1 && p.projection[0] == ProjectionElem::Deref =>
+                        {
+                            fat[p.local.as_usize()].clone()
+                        }
+                        // (a pointer to a slice made of its address and length)
+                        Rvalue::Aggregate(kind, fields) if matches!(**kind, AggregateKind::RawPtr(..)) => {
+                            match fields.iter().next() {
+                                Some(Operand::Copy(p) | Operand::Move(p)) if p.projection.is_empty() => {
+                                    addrs[p.local.as_usize()].clone()
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if v.is_some() {
+                        fat[i] = v;
+                        changed = true;
+                    }
+                    continue;
+                }
+                let wrapped = extended
+                    && !parts[i]
+                    && matches!(layout.backend_repr, rustc_abi::BackendRepr::Scalar(s) if matches!(s.primitive(), Primitive::Pointer(_)));
+                if (ty.builtin_deref(true).is_none() && !wrapped) || layout.size.bytes() != 2 {
                     continue;
                 }
                 let v = match rv {
                     Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => match op {
                         Operand::Copy(p) | Operand::Move(p) if p.projection.is_empty() => {
-                            addrs[p.local.as_usize()].clone()
+                            let q = p.local.as_usize();
+                            addrs[q].clone().or_else(|| fat[q].clone().filter(|_| matches!(rv, Rvalue::Cast(..))))
                         }
                         Operand::Constant(c) => {
                             let (v, l) = self.constant(c);
@@ -4318,10 +4814,61 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                         _ => None,
                     },
                     Rvalue::Ref(_, _, p) | Rvalue::RawPtr(_, p) => self.static_place_addr(*p, &addrs),
+                    Rvalue::BinaryOp(BinOp::Offset, pair) if extended => match &**pair {
+                        (Operand::Copy(p) | Operand::Move(p), k) if p.projection.is_empty() => {
+                            let elem = self
+                                .local_ty(p.local)
+                                .builtin_deref(true)
+                                .map(|t| self.layout(t).size.bytes());
+                            match (addrs[p.local.as_usize()].clone(), self.const_bits(k), elem) {
+                                (Some(e), Some(k), Some(elem)) if !e.starts_with('$') => {
+                                    let k = (k as u64).wrapping_mul(elem) & 0xffff;
+                                    Some(if k == 0 { e } else { format!("{e}+{k}") })
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    },
                     _ => None,
                 };
                 if v.is_some() {
                     addrs[i] = v;
+                    changed = true;
+                    continue;
+                }
+                if !extended {
+                    continue;
+                }
+                let sum = match rv {
+                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _)
+                    | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _)
+                        if p.projection.is_empty() =>
+                    {
+                        sums[p.local.as_usize()]
+                    }
+                    Rvalue::BinaryOp(BinOp::Offset, pair) => match &**pair {
+                        (Operand::Copy(p) | Operand::Move(p), Operand::Copy(k) | Operand::Move(k))
+                            if p.projection.is_empty() && k.projection.is_empty() =>
+                        {
+                            let q = k.local.as_usize();
+                            let bytes = self
+                                .local_ty(p.local)
+                                .builtin_deref(true)
+                                .is_some_and(|t| self.layout(t).size.bytes() == 1);
+                            (bytes
+                                && addrs[p.local.as_usize()].is_some()
+                                && assigns[q] == 1
+                                && !blocked[q]
+                                && self.layout(self.local_ty(k.local)).size.bytes() == 2)
+                                .then_some((p.local, k.local))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if sum.is_some() {
+                    sums[i] = sum;
                     changed = true;
                 }
             }
@@ -4329,7 +4876,212 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 break;
             }
         }
+        self.sums = sums;
+        // The same for pointers whose address is not known: what they are
+        // made of. A pointer local that never changes (assigned once and
+        // not borrowed, or an argument that is not assigned) is a root; a
+        // copy, a cast, a reference to a field behind it, or it plus a
+        // constant is that root plus a constant.
+        if extended && std::env::var_os("RUST64_NO_PTR_SYMS").is_none() {
+            let args = self.mir.arg_count;
+            let kinds: Vec<u64> = (0..n)
+                .map(|l| {
+                    let stable = (assigns[l] == 1 && !blocked[l])
+                        || ((1..=args).contains(&l) && assigns[l] == 0 && !self.uses.borrowed[l]);
+                    let ty = self.local_ty(Local::from_usize(l));
+                    let layout = self.layout(ty);
+                    let pointer = |s: rustc_abi::Scalar| matches!(s.primitive(), Primitive::Pointer(_));
+                    let ptr = ty.builtin_deref(true).is_some()
+                        || (!parts[l]
+                            && match layout.backend_repr {
+                                rustc_abi::BackendRepr::Scalar(s) => pointer(s),
+                                rustc_abi::BackendRepr::ScalarPair { a: s, .. } => pointer(s),
+                                _ => false,
+                            });
+                    let size = layout.size.bytes();
+                    if stable && ptr && (size == 2 || size == 4) { size } else { 0 }
+                })
+                .collect();
+            let mut def: Vec<Option<&'tcx Rvalue<'tcx>>> = vec![None; n];
+            for &(l, rv) in &cands {
+                if assigns[l.as_usize()] == 1 {
+                    def[l.as_usize()] = Some(rv);
+                }
+            }
+            let field_off = |p: &Place<'tcx>| -> Option<u64> {
+                let mut layout = self.layout(self.local_ty(p.local).builtin_deref(true)?);
+                let mut off = 0;
+                for elem in p.projection.iter().skip(1) {
+                    match elem {
+                        ProjectionElem::Field(fi, ty) => {
+                            off += layout.fields.offset(fi.as_usize()).bytes();
+                            layout = self.layout(self.monomorphize(ty));
+                        }
+                        ProjectionElem::Downcast(_, v) => layout = layout.for_variant(&self.p.cx, v),
+                        ProjectionElem::ConstantIndex { offset, from_end: false, .. } => {
+                            let e = layout.field(&self.p.cx, 0);
+                            off += offset * e.size.bytes();
+                            layout = e;
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(off)
+            };
+            // Err: not made of another pointer (a root); Ok(None): of one
+            // that is not known (yet)
+            let derive = |i: usize, sym: &[Option<(Local, u64)>]| -> Result<Option<(Local, u64)>, ()> {
+                let Some(rv) = def[i] else { return Err(()) };
+                match rv {
+                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _)
+                    | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _)
+                        if p.projection.is_empty() && kinds[p.local.as_usize()] != 0 =>
+                    {
+                        Ok(sym[p.local.as_usize()])
+                    }
+                    Rvalue::Ref(_, _, p) | Rvalue::RawPtr(_, p)
+                        if p.projection.first() == Some(&ProjectionElem::Deref) =>
+                    {
+                        let q = p.local.as_usize();
+                        if kinds[q] != 0 && p.projection.len() == 1 {
+                            Ok(sym[q])
+                        } else if kinds[q] == 2 {
+                            let off = field_off(p).ok_or(())?;
+                            Ok(sym[q].map(|(r, o)| (r, o + off)))
+                        } else {
+                            Err(())
+                        }
+                    }
+                    Rvalue::BinaryOp(BinOp::Offset, pair) => match &**pair {
+                        (Operand::Copy(p) | Operand::Move(p), k)
+                            if p.projection.is_empty() && kinds[p.local.as_usize()] == 2 =>
+                        {
+                            let k = self.const_bits(k).ok_or(())? as u64;
+                            let elem = self.local_ty(p.local).builtin_deref(true).ok_or(())?;
+                            let k = k.wrapping_mul(self.layout(elem).size.bytes()) & 0xffff;
+                            Ok(sym[p.local.as_usize()].map(|(r, o)| (r, o + k)))
+                        }
+                        _ => Err(()),
+                    },
+                    Rvalue::Aggregate(kind, fields) if matches!(**kind, AggregateKind::RawPtr(..)) => {
+                        match fields.iter().next() {
+                            Some(Operand::Copy(p) | Operand::Move(p))
+                                if p.projection.is_empty() && kinds[p.local.as_usize()] == 2 =>
+                            {
+                                Ok(sym[p.local.as_usize()])
+                            }
+                            _ => Err(()),
+                        }
+                    }
+                    _ => Err(()),
+                }
+            };
+            let mut sym: Vec<Option<(Local, u64)>> = vec![None; n];
+            loop {
+                let mut changed = false;
+                for i in 0..n {
+                    if kinds[i] == 0 || sym[i].is_some() {
+                        continue;
+                    }
+                    match derive(i, &sym) {
+                        Ok(Some(v)) => {
+                            sym[i] = Some(v);
+                            changed = true;
+                        }
+                        Err(()) if kinds[i] == 2 => {
+                            sym[i] = Some((Local::from_usize(i), 0));
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if !changed {
+                    // (made of a pointer that stays unknown: a root too)
+                    match (0..n).find(|&i| kinds[i] == 2 && sym[i].is_none()) {
+                        Some(i) => sym[i] = Some((Local::from_usize(i), 0)),
+                        None => break,
+                    }
+                }
+            }
+            let mut sum: Vec<Option<(Local, u64, Local)>> = vec![None; n];
+            loop {
+                let mut changed = false;
+                for &(l, rv) in &cands {
+                    let i = l.as_usize();
+                    if kinds[i] != 2 || sum[i].is_some() || def[i].is_none() {
+                        continue;
+                    }
+                    let v = match rv {
+                        Rvalue::Use(Operand::Copy(p) | Operand::Move(p), _)
+                        | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _)
+                            if p.projection.is_empty() =>
+                        {
+                            sum[p.local.as_usize()]
+                        }
+                        Rvalue::BinaryOp(BinOp::Offset, pair) => match &**pair {
+                            (Operand::Copy(p) | Operand::Move(p), Operand::Copy(k) | Operand::Move(k))
+                                if p.projection.is_empty() && k.projection.is_empty() =>
+                            {
+                                let (q, c) = (p.local.as_usize(), k.local.as_usize());
+                                let bytes = self
+                                    .local_ty(p.local)
+                                    .builtin_deref(true)
+                                    .is_some_and(|t| self.layout(t).size.bytes() == 1);
+                                match sym[q] {
+                                    Some((r, o))
+                                        if bytes
+                                            && kinds[q] == 2
+                                            && assigns[c] == 1
+                                            && !blocked[c]
+                                            && self.layout(self.local_ty(k.local)).size.bytes() == 2 =>
+                                    {
+                                        Some((r, o, k.local))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if v.is_some() {
+                        sum[i] = v;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            for i in 0..n {
+                if kinds[i] != 2 {
+                    sym[i] = None;
+                }
+            }
+            self.syms = sym;
+            self.sym_sums = sum;
+        }
         addrs
+    }
+
+    /// For the difference of two pointers to bytes, `a - b`: the local `n`
+    /// if `a` is `b + n` (`sums`).
+    fn sum_diff(&self, a: &Operand<'tcx>, b: &Operand<'tcx>) -> Option<Local> {
+        let (Operand::Copy(a) | Operand::Move(a), Operand::Copy(b) | Operand::Move(b)) = (a, b) else {
+            return None;
+        };
+        if !a.projection.is_empty() || !b.projection.is_empty() {
+            return None;
+        }
+        if let Some(&Some((p, n))) = self.sums.get(a.local.as_usize())
+            && let Some(base) = self.addrs[p.as_usize()].as_ref()
+            && self.addrs[b.local.as_usize()].as_ref() == Some(base)
+        {
+            return Some(n);
+        }
+        // (the same root and constant)
+        let &(r, o, n) = self.sym_sums.get(a.local.as_usize())?.as_ref()?;
+        (self.syms.get(b.local.as_usize()) == Some(&Some((r, o)))).then_some(n)
     }
 
     /// The location an operand that is a pointer points to.
@@ -5369,6 +6121,28 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         dst: &Addr,
         dl: TyAndLayout<'tcx>,
     ) {
+        // A 16-bit value widened for a 32-bit product with a constant that
+        // fits 16 bits (`f[b] as u32 * 10000`): the same, where the
+        // constant is not one for a few shifts and additions.
+        if matches!(op, BinOp::Mul | BinOp::MulUnchecked) && std::env::var_os("RUST64_NO_MUL16K").is_none() {
+            let found = match (self.widened(x), self.widened(y)) {
+                (Some((s, signed)), None) => self.const_bits(y).map(|c| (s, signed, c)),
+                (None, Some((s, signed))) => self.const_bits(x).map(|c| (s, signed, c)),
+                _ => None,
+            };
+            if let Some((s, signed, c)) = found
+                && c.count_ones() > 3
+                && c < if signed { 0x8000 } else { 0x1_0000 }
+            {
+                let (va, _) = self.operand(s);
+                let a = &mut self.p.asm;
+                a.copy(&Addr::Abs("rt_a".into()), &va, 2);
+                a.copy(&Addr::Abs("rt_b".into()), &Val::imm_u64(c as u64, 2), 2);
+                a.ins(if signed { "jsr rt_mul16s" } else { "jsr rt_mul16u" });
+                a.copy(dst, &Val::Mem(Addr::Abs("rt_r".into())), 4);
+                return;
+            }
+        }
         // Two 16-bit values widened for a 32-bit product (fixed point):
         // the routine takes them as they are.
         if matches!(op, BinOp::Mul | BinOp::MulUnchecked)
@@ -6081,6 +6855,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     self.goto(targets.target_for_value(c), next);
                     return;
                 }
+                if self.lookup_switch(discr, targets, next) {
+                    return;
+                }
                 let (v, l) = self.operand(discr);
                 let n = l.size.bytes();
                 self.a().setup_val(&v, 0);
@@ -6488,18 +7265,60 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let db = self.deref_val(&pb);
                 let (d, _, _) = self.place(dest);
                 let a = &mut self.p.asm;
+                // Up to 128 bytes: a loop here, which counts the result up
+                // when it runs to its end.
+                if (1..=128).contains(&size) && std::env::var_os("RUST64_NO_EQ_LOOP").is_none() {
+                    let side = |a: &mut Asm, x: &Addr, zp: &str| {
+                        // (an address in brackets would read as a pointer)
+                        let plain = match x {
+                            Addr::Abs(e) if !e.contains('$') => {
+                                let inner = e.strip_prefix('(').and_then(|e| e.strip_suffix(')'));
+                                match inner {
+                                    Some(i) if !i.contains(['(', ')']) => Some(i),
+                                    None if !e.starts_with('(') => Some(e.as_str()),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        match plain {
+                            Some(e) => format!("{e},y"),
+                            None => {
+                                a.addr_to(x, zp);
+                                format!("({zp}),y")
+                            }
+                        }
+                    };
+                    let (x, y) = (side(a, &da, "zp_p0"), side(a, &db, "zp_p1"));
+                    let (next, end) = (a.new_label(), a.new_label());
+                    a.ins("ldx #0");
+                    a.ins(format!("ldy #{}", size - 1));
+                    a.label(&next);
+                    a.ins(format!("lda {x}"));
+                    a.ins(format!("cmp {y}"));
+                    a.ins(format!("bne {end}"));
+                    a.ins("dey");
+                    a.ins(format!("bpl {next}"));
+                    a.ins("inx");
+                    a.label(&end);
+                    if let Addr::Abs(to) = &d {
+                        a.ins(format!("stx {to}"));
+                    } else {
+                        a.ins("stx rt_r");
+                        a.copy(&d, &Val::Mem(Addr::Abs("rt_r".into())), 1);
+                    }
+                    return true;
+                }
                 a.addr_to(&da, "zp_p0");
                 a.addr_to(&db, "zp_p1");
                 a.copy(&Addr::Abs("rt_n".into()), &Val::imm_u64(size, 2), 2);
                 a.ins("jsr rt_memcmp");
-                let (leq, lend) = (a.new_label(), a.new_label());
-                a.ins("cmp #0");
-                a.ins(format!("beq {leq}"));
+                // A is 0 for equal, else 1 or $ff: the carry of `cmp #1`
+                // is the result turned around
+                a.ins("cmp #1");
                 a.ins("lda #0");
-                a.ins(format!("jmp {lend}"));
-                a.label(&leq);
-                a.ins("lda #1");
-                a.label(&lend);
+                a.ins("rol");
+                a.ins("eor #1");
                 a.ins("sta rt_r");
                 a.copy(&d, &Val::Mem(Addr::Abs("rt_r".into())), 1);
             }
@@ -6544,10 +7363,36 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.binop(op, &args[0], &args[1], &d, dl);
             }
             "ptr_offset_from" | "ptr_offset_from_unsigned" => {
+                // (a + n) - a
+                let bytes = |o: &Operand<'tcx>| {
+                    let ty = self.monomorphize(o.ty(&self.mir.local_decls, self.tcx()));
+                    ty.builtin_deref(true).is_some_and(|t| self.layout(t).size.bytes() == 1)
+                };
+                if bytes(&args[0])
+                    && let Some(n) = self.sum_diff(&args[0], &args[1])
+                {
+                    let (v, _) = self.operand(&Operand::Copy(Place::from(n)));
+                    let (d, _, _) = self.place(dest);
+                    self.a().copy(&d, &v, 2);
+                    return true;
+                }
                 let (va, la) = self.operand(&args[0]);
                 let (vb, _) = self.operand(&args[1]);
                 let elem = self.layout(la.ty.builtin_deref(true).unwrap()).size.bytes();
                 let signed = name.as_str() == "ptr_offset_from";
+                // two addresses in the same object: a constant
+                if let (Some(x), Some(y)) = (Self::imm_addr(&va), Self::imm_addr(&vb))
+                    && let ((bx, ox), (by, oy)) = (Self::split_offset(&x), Self::split_offset(&y))
+                    && bx == by
+                    && !bx.starts_with('$')
+                    && ox >= oy
+                    && elem > 0
+                    && (ox - oy) % elem == 0
+                {
+                    let (d, _, _) = self.place(dest);
+                    self.a().copy(&d, &Val::imm_u64((ox - oy) / elem, 2), 2);
+                    return true;
+                }
                 let t = self.temp(2);
                 let a = &mut self.p.asm;
                 a.setup_val(&va, 0);

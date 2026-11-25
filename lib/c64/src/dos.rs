@@ -27,31 +27,34 @@ pub const STATUS_MISSING: u8 = 0x80;
 /// A file name or command converted to PETSCII.
 struct Name {
     buf: [u8; 40],
-    len: usize,
+    len: u8,
 }
 
 impl Name {
-    fn new(parts: &[&str]) -> Name {
+    fn new(s: &str) -> Name {
         let mut n = Name { buf: [0; 40], len: 0 };
-        for p in parts {
-            for &c in p.as_bytes() {
-                if n.len < n.buf.len() {
-                    n.buf[n.len] = if c.is_ascii_lowercase() { c - 0x20 } else { c };
-                    n.len += 1;
-                }
-            }
-        }
+        n.push(s);
         n
     }
 
+    /// Appends `s`; what does not fit is left out.
+    fn push(&mut self, s: &str) {
+        for &c in s.as_bytes() {
+            if let Some(b) = self.buf.get_mut(self.len as usize) {
+                *b = if c.is_ascii_lowercase() { c - 0x20 } else { c };
+                self.len += 1;
+            }
+        }
+    }
+
     fn set(&self) {
-        kernal::setnam(&self.buf[..self.len]);
+        kernal::setnam_len(self.buf.as_ptr(), self.len);
     }
 }
 
 /// Loads a file to `addr` and returns the address after its last byte.
 pub fn load(name: &str, dev: u8, addr: u16) -> Result<u16, Error> {
-    let n = Name::new(&[name]);
+    let n = Name::new(name);
     n.set();
     kernal::setlfs(1, dev, 0);
     kernal::load(false, addr)
@@ -59,7 +62,7 @@ pub fn load(name: &str, dev: u8, addr: u16) -> Result<u16, Error> {
 
 /// Loads a file to the address in its first two bytes.
 pub fn load_abs(name: &str, dev: u8) -> Result<u16, Error> {
-    let n = Name::new(&[name]);
+    let n = Name::new(name);
     n.set();
     kernal::setlfs(1, dev, 1);
     kernal::load(false, 0)
@@ -67,7 +70,7 @@ pub fn load_abs(name: &str, dev: u8) -> Result<u16, Error> {
 
 /// Saves `start..end` as a program file (with `start` as load address).
 pub fn save(name: &str, dev: u8, start: u16, end: u16) -> Result<(), Error> {
-    let n = Name::new(&[name]);
+    let n = Name::new(name);
     n.set();
     kernal::setlfs(1, dev, 0);
     kernal::save(start, end)
@@ -84,17 +87,28 @@ fn command_name(dev: u8, n: &Name) -> Result<(), Error> {
 /// Sends a DOS command (`"S0:NAME"`, `"R0:NEW=OLD"`, `"I0"`, `"V0"`,
 /// `"N0:NAME,ID"`).
 pub fn command(dev: u8, cmd: &str) -> Result<(), Error> {
-    command_name(dev, &Name::new(&[cmd]))
+    command_name(dev, &Name::new(cmd))
+}
+
+/// Sends the DOS command `cmd` followed by `arg` (`"S0:"` and a name).
+pub fn command_arg(dev: u8, cmd: &str, arg: &str) -> Result<(), Error> {
+    let mut n = Name::new(cmd);
+    n.push(arg);
+    command_name(dev, &n)
 }
 
 /// Deletes a file.
 pub fn scratch(dev: u8, name: &str) -> Result<(), Error> {
-    command_name(dev, &Name::new(&["S0:", name]))
+    command_arg(dev, "S0:", name)
 }
 
 /// Renames a file.
 pub fn rename(dev: u8, from: &str, to: &str) -> Result<(), Error> {
-    command_name(dev, &Name::new(&["R0:", to, "=", from]))
+    let mut n = Name::new("R0:");
+    n.push(to);
+    n.push("=");
+    n.push(from);
+    command_name(dev, &n)
 }
 
 /// Reads the drive status (`"00, OK,00,00"`) into `buf` and returns the
@@ -143,7 +157,7 @@ impl File {
     /// Opens a file: `name` may carry type and mode (`"DATA,S,R"`,
     /// `"OUT,S,W"`).
     pub fn open(lfn: u8, dev: u8, sa: u8, name: &str) -> Result<File, Error> {
-        let n = Name::new(&[name]);
+        let n = Name::new(name);
         n.set();
         kernal::setlfs(lfn, dev, sa);
         kernal::open()?;

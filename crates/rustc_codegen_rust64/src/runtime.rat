@@ -273,6 +273,13 @@ rt_mul16u:
         lda rt_b+1
         bne @count
         ldx #8
+        lda rt_b
+        bne @count
+        sta rt_r                ; times zero (the first round of an
+        sta rt_r+1              ; iteration that starts at 0)
+        sta rt_r+2
+        sta rt_r+3
+        rts
 @count: stx rt_cnt
         lda #0                  ; A is the top byte of the product
         sta rt_r+2
