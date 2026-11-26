@@ -62,6 +62,29 @@ macro_rules! pm {
     }};
 }
 
+/// A string literal as screen codes for the upper case/graphics character
+/// set, converted at compile time: `c64::s!("SCORE")` is a
+/// `&'static [u8; 5]`. Use it with [`text::put_codes`] (or store the bytes
+/// in the screen): the program then needs no conversion at run time, which
+/// [`text::put_str`] does for every character.
+#[macro_export]
+macro_rules! s {
+    ($s:literal) => {{
+        const S: [u8; $s.len()] = $crate::text::screen_str::<{ $s.len() }>($s, false);
+        &S
+    }};
+}
+
+/// A string literal as screen codes for the lower/upper case character set
+/// (see [`s!`]).
+#[macro_export]
+macro_rules! sm {
+    ($s:literal) => {{
+        const S: [u8; $s.len()] = $crate::text::screen_str::<{ $s.len() }>($s, true);
+        &S
+    }};
+}
+
 /// Inline assembly: the lines become part of the function, without a call.
 ///
 /// ```ignore

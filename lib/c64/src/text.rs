@@ -79,6 +79,28 @@ pub const fn petscii_str<const N: usize>(s: &str, lower: bool) -> [u8; N] {
     out
 }
 
+/// Converts an ASCII string to screen codes at compile time (see
+/// [`crate::s!`]): `lower` selects the lower/upper case character set.
+pub const fn screen_str<const N: usize>(s: &str, lower: bool) -> [u8; N] {
+    let mut out = petscii_str::<N>(s, lower);
+    let mut i = 0;
+    while i < N {
+        let c = out[i];
+        out[i] = match c {
+            0x00..=0x1f => c + 0x80,
+            0x20..=0x3f => c,
+            0x40..=0x5f => c - 0x40,
+            0x60..=0x7f => c - 0x20,
+            0x80..=0x9f => c + 0x40,
+            0xa0..=0xbf => c - 0x40,
+            0xff => 0x5e,
+            _ => c - 0x80,
+        };
+        i += 1;
+    }
+    out
+}
+
 /// Prints PETSCII bytes as they are (no conversion), e.g. a [`crate::p!`]
 /// literal or a file name read from disk.
 pub fn print_petscii(s: &[u8]) {
@@ -143,6 +165,18 @@ impl Write for Console {
     fn write_bytes(&mut self, s: &[u8]) {
         unsafe { c64_text_print(s.as_ptr(), s.len() as u16, 1) }
     }
+
+    // Numbers: the digits go from the routine that makes them to the
+    // screen, without a copy.
+    #[cfg(target_os = "c64")]
+    fn write_u16(&mut self, n: u16) {
+        unsafe { c64_text_dec16(n) }
+    }
+
+    #[cfg(target_os = "c64")]
+    fn write_u32(&mut self, n: u32) {
+        unsafe { c64_text_digits(crate::fmt::c64_fmt_dec(n)) }
+    }
 }
 
 #[cfg(target_os = "c64")]
@@ -151,8 +185,11 @@ crate::rat_source!(TEXT_RAT, "rat/text.rat");
 #[cfg(target_os = "c64")]
 unsafe extern "C" {
     fn c64_text_print(s: *const u8, len: u16, convert: u8);
+    fn c64_text_dec16(n: u16);
+    fn c64_text_digits(len: u8);
     fn c64_text_put_char(col: u8, row: u8, code: u8, color: u8);
     fn c64_text_put_str(col: u8, row: u8, s: *const u8, len: u16, color: u8);
+    fn c64_text_put_codes(col: u8, row: u8, s: *const u8, len: u16, color: u8);
 }
 
 /// Prints `s` at the cursor.
@@ -237,6 +274,25 @@ pub fn put_str(col: u8, row: u8, s: &str, color: Color) {
     }
 }
 
+/// Writes screen codes (a [`crate::s!`] literal) at a position with a
+/// colour, without moving the cursor: [`put_str`] without the conversion.
+pub fn put_codes(col: u8, row: u8, codes: &[u8], color: Color) {
+    #[cfg(target_os = "c64")]
+    unsafe {
+        c64_text_put_codes(col, row, codes.as_ptr(), codes.len() as u16, color as u8)
+    }
+    #[cfg(not(target_os = "c64"))]
+    {
+        let mut off = offset(col, row);
+        let scr = screen_addr();
+        for &b in codes {
+            mem::poke(scr + off, b);
+            mem::poke(COLOR_RAM + off, color as u8);
+            off += 1;
+        }
+    }
+}
+
 /// Fills the whole screen with a screen code and colour.
 pub fn fill(code: u8, color: Color) {
     mem::fill(screen_addr(), 1000, code);
@@ -281,6 +337,17 @@ pub fn set_charset(addr: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_literals() {
+        assert_eq!(crate::s!("Ab 1@"), &[1, 2, 32, 49, 0]);
+        assert_eq!(crate::sm!("Ab"), &[65, 2]);
+        let s = "Hello, World! 0-9 [x]";
+        let lit = crate::s!("Hello, World! 0-9 [x]");
+        for (i, &b) in s.as_bytes().iter().enumerate() {
+            assert_eq!(lit[i], screen_code(b));
+        }
+    }
 
     #[test]
     fn codes() {

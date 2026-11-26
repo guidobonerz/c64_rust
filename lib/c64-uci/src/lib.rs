@@ -71,6 +71,24 @@ unsafe extern "C" {
     fn c64_uci_read(buf: *mut u8, max: u16) -> u16;
     fn c64_uci_status(buf: *mut u8, max: u8) -> u8;
     fn c64_uci_code() -> u8;
+    fn c64_uci_finish(out: *mut u8, max: u16) -> Answer;
+    fn c64_uci_run(out: *mut u8, max: u16) -> Answer;
+}
+
+/// What `c64_uci_finish` and `c64_uci_run` return: the length of the data
+/// and the first error.
+#[cfg(target_os = "c64")]
+#[repr(C)]
+struct Answer {
+    n: u16,
+    err: u8,
+}
+
+#[cfg(target_os = "c64")]
+impl Answer {
+    fn result(self) -> Result<usize, Error> {
+        if self.err == 0 { Ok(self.n as usize) } else { Err(Error(self.err)) }
+    }
 }
 
 /// Whether the command interface is there and switched on.
@@ -191,19 +209,39 @@ pub fn accept() -> bool {
 /// After [`push`]: collects the data of all packets in `out` (what does
 /// not fit is dropped) and returns its length, or the first error.
 pub fn finish(out: &mut [u8]) -> Result<usize, Error> {
-    let mut n = 0;
-    let mut err = 0;
-    loop {
-        n += read(&mut out[n..]);
-        let c = code();
-        if err == 0 {
-            err = c;
-        }
-        if !accept() {
-            break;
-        }
+    #[cfg(target_os = "c64")]
+    {
+        unsafe { c64_uci_finish(out.as_mut_ptr(), out.len() as u16) }.result()
     }
-    if err == 0 { Ok(n) } else { Err(Error(err)) }
+    #[cfg(not(target_os = "c64"))]
+    {
+        let mut n = 0;
+        let mut err = 0;
+        loop {
+            n += read(&mut out[n..]);
+            let c = code();
+            if err == 0 {
+                err = c;
+            }
+            if !accept() {
+                break;
+            }
+        }
+        if err == 0 { Ok(n) } else { Err(Error(err)) }
+    }
+}
+
+/// [`push`] and [`finish`]: runs the command and collects its answer.
+fn done(out: &mut [u8]) -> Result<usize, Error> {
+    #[cfg(target_os = "c64")]
+    {
+        unsafe { c64_uci_run(out.as_mut_ptr(), out.len() as u16) }.result()
+    }
+    #[cfg(not(target_os = "c64"))]
+    {
+        push()?;
+        finish(out)
+    }
 }
 
 /// Runs a whole command: `params` after the target and command bytes, the
@@ -211,14 +249,13 @@ pub fn finish(out: &mut [u8]) -> Result<usize, Error> {
 pub fn request(target: u8, command: u8, params: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     begin(target, command);
     put_bytes(params);
-    push()?;
-    finish(out)
+    done(out)
 }
 
 /// Files and directories on the Ultimate's storage (target
 /// [`target::DOS1`]). One file can be open at a time.
 pub mod dos {
-    use super::{Error, begin, finish, push, put, put_bytes, put_u16, target::DOS1};
+    use super::{Error, begin, done, push, put, put_bytes, put_u16, target::DOS1};
 
     /// Flags of [`open`].
     pub const READ: u8 = 0x01;
@@ -231,8 +268,7 @@ pub mod dos {
     fn run(command: u8, name: &str, out: &mut [u8]) -> Result<usize, Error> {
         begin(DOS1, command);
         put_bytes(name.as_bytes());
-        push()?;
-        finish(out)
+        done(out)
     }
 
     /// The name and version of the file interface
@@ -247,8 +283,7 @@ pub mod dos {
         begin(DOS1, 0x02);
         put(flags);
         put_bytes(name.as_bytes());
-        push()?;
-        finish(&mut []).map(|_| ())
+        done(&mut []).map(|_| ())
     }
 
     /// Closes the open file.
@@ -261,8 +296,7 @@ pub mod dos {
     pub fn read(out: &mut [u8]) -> Result<usize, Error> {
         begin(DOS1, 0x04);
         put_u16(if out.len() > 0xffff { 0xffff } else { out.len() as u16 });
-        push()?;
-        finish(out)
+        done(out)
     }
 
     /// Writes `data` to the open file.
@@ -275,8 +309,7 @@ pub mod dos {
             begin(DOS1, 0x05);
             put_u16(0);
             put_bytes(now);
-            push()?;
-            finish(&mut [])?;
+            done(&mut [])?;
             rest = later;
         }
         Ok(())
@@ -286,8 +319,7 @@ pub mod dos {
     pub fn seek(pos: u32) -> Result<(), Error> {
         begin(DOS1, 0x06);
         put_bytes(&pos.to_le_bytes());
-        push()?;
-        finish(&mut []).map(|_| ())
+        done(&mut []).map(|_| ())
     }
 
     /// Information about the open file: size (4 bytes, low byte first),
@@ -344,16 +376,14 @@ pub mod dos {
         begin(DOS1, 0x23);
         put(drive);
         put_bytes(image.as_bytes());
-        push()?;
-        finish(&mut []).map(|_| ())
+        done(&mut []).map(|_| ())
     }
 
     /// Removes the disk from a drive.
     pub fn unmount(drive: u8) -> Result<(), Error> {
         begin(DOS1, 0x24);
         put(drive);
-        push()?;
-        finish(&mut []).map(|_| ())
+        done(&mut []).map(|_| ())
     }
 
     /// The date and time of the Ultimate's clock: `"2026/11/11 12:34:56"`.
@@ -365,21 +395,19 @@ pub mod dos {
 /// TCP and UDP through the Ultimate's network (target
 /// [`target::NETWORK`]).
 pub mod net {
-    use super::{Error, begin, finish, push, put, put_bytes, put_u16, target::NETWORK};
+    use super::{Error, begin, done, push, put, put_bytes, put_u16, target::NETWORK};
 
     /// The name and version of the network interface.
     pub fn identify(out: &mut [u8]) -> Result<usize, Error> {
         begin(NETWORK, 0x01);
-        push()?;
-        finish(out)
+        done(out)
     }
 
     /// The number of network interfaces.
     pub fn interface_count() -> Result<u8, Error> {
         let mut n = [0u8; 1];
         begin(NETWORK, 0x02);
-        push()?;
-        finish(&mut n)?;
+        done(&mut n)?;
         Ok(n[0])
     }
 
@@ -389,8 +417,7 @@ pub mod net {
         let mut a = [0u8; 12];
         begin(NETWORK, 0x05);
         put(interface);
-        push()?;
-        finish(&mut a)?;
+        done(&mut a)?;
         Ok(a)
     }
 
@@ -400,8 +427,7 @@ pub mod net {
         put_u16(port);
         put_bytes(host.as_bytes());
         put(0);
-        push()?;
-        finish(&mut s)?;
+        done(&mut s)?;
         Ok(s[0])
     }
 
@@ -419,8 +445,7 @@ pub mod net {
     pub fn close(socket: u8) -> Result<(), Error> {
         begin(NETWORK, 0x09);
         put(socket);
-        push()?;
-        finish(&mut []).map(|_| ())
+        done(&mut []).map(|_| ())
     }
 
     /// Reads what has arrived on a socket, up to `out.len()` bytes (and at
@@ -455,8 +480,7 @@ pub mod net {
             begin(NETWORK, 0x11);
             put(socket);
             put_bytes(now);
-            push()?;
-            finish(&mut count)?;
+            done(&mut count)?;
             sent += u16::from_le_bytes(count) as usize;
             rest = later;
         }
@@ -466,21 +490,19 @@ pub mod net {
 
 /// The machine itself (target [`target::CONTROL`]).
 pub mod control {
-    use super::{Error, begin, finish, push, put, target::CONTROL};
+    use super::{Error, begin, done, push, put, target::CONTROL};
 
     /// The name and version of the control interface.
     pub fn identify(out: &mut [u8]) -> Result<usize, Error> {
         begin(CONTROL, 0x01);
-        push()?;
-        finish(out)
+        done(out)
     }
 
     /// The name of the hardware (`"ULTIMATE 64"`).
     pub fn hardware(out: &mut [u8]) -> Result<usize, Error> {
         begin(CONTROL, 0x28);
         put(0);
-        push()?;
-        finish(out)
+        done(out)
     }
 
     /// Restarts the C64. Does not return if it works.

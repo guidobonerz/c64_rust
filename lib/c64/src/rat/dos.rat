@@ -1,0 +1,369 @@
+; c64::dos: file names, files, the directory and the drive status
+; (calling convention: see c64::rat_source!).
+;
+; A file (dos.rs: File) is two bytes: the logical file number and 1 once
+; its end was reached. zp_p0 points to it in the routines below; the
+; KERNAL leaves the scratch pointers and the runtime registers alone.
+
+; c64_dos_push(n: *mut Name, s: *const u8, len: u16): appends the ASCII
+; text s to a name (its length, then 40 bytes) as PETSCII: a-z become
+; upper case. What does not fit is left out.
+c64_dos_push:
+        sta zp_p0
+        stx zp_p0+1
+        lda c64_dos_push__args+2
+        sta zp_p1
+        lda c64_dos_push__args+3
+        sta zp_p1+1
+        ldy #0
+        sec
+        lda #40
+        sbc (zp_p0),y           ; the room that is left
+        ldx c64_dos_push__args+5
+        bne @count
+        cmp c64_dos_push__args+4
+        bcc @count
+        lda c64_dos_push__args+4
+@count: tax                     ; X: the bytes to append
+        beq @done
+        sec                     ; zp_p2: where they go (n + 1 + length)
+        lda (zp_p0),y
+        adc zp_p0
+        sta zp_p2
+        tya
+        adc zp_p0+1
+        sta zp_p2+1
+        clc
+        txa
+        adc (zp_p0),y
+        sta (zp_p0),y
+@loop:  lda (zp_p1),y
+        cmp #$61
+        bcc @put
+        cmp #$7b
+        bcs @put
+        sbc #$1f                ; a-z: - $20 (the carry is clear)
+@put:   sta (zp_p2),y
+        iny
+        dex
+        bne @loop
+@done:  rts
+
+; c64_dos_cmd(dev: u8) -> error: sends the name that was set (SETNAM) to
+; the command channel of a drive.
+c64_dos_cmd:
+        tax
+        lda #15
+        tay
+        jsr $ffba               ; SETLFS
+        jsr c64_open
+        pha
+        lda #15
+        jsr $ffc3               ; CLOSE
+        pla
+        rts
+
+; Makes the file at zp_p0 the input channel. Carry set if it is at its
+; end or cannot be read.
+c64_dos_in:
+        ldy #1
+        lda (zp_p0),y
+        cmp #1
+        bcs @no
+        dey
+        lda (zp_p0),y
+        tax
+        jmp $ffc6               ; CHKIN
+@no:    rts
+
+; One byte from the input channel for the file at zp_p0: A = 1 and the
+; byte in zp_p1, or A = 0 (and 0 in zp_p1) at the end of the file or on an
+; error. Any status marks the file as ended; with only the end-of-file
+; bit the byte still counts.
+c64_dos_rd:
+        ldy #1
+        lda (zp_p0),y
+        bne @none
+        jsr $ffcf               ; CHRIN
+        sta zp_p1
+        jsr $ffb7               ; READST
+        tax
+        beq @ok
+        ldy #1
+        tya
+        sta (zp_p0),y
+        txa
+        and #$bf
+        bne @none
+@ok:    lda #1
+        rts
+@none:  lda #0
+        sta zp_p1
+        rts
+
+; c64_dos_get(f: *mut File) -> { ok, byte }: one byte of a file.
+c64_dos_get:
+        sta zp_p0
+        stx zp_p0+1
+        jsr c64_dos_in
+        bcs @none
+        jsr c64_dos_rd
+        pha
+        jsr $ffcc               ; CLRCHN
+        ldx zp_p1
+        pla
+        rts
+@none:  lda #0
+        rts
+
+; c64_dos_read(f: *mut File, buf: *mut u8, max: u16) -> u16: up to max
+; bytes of a file, without changing the channel for every byte.
+c64_dos_read:
+        sta zp_p0
+        stx zp_p0+1
+        lda #0
+        sta rt_t
+        sta rt_t+1
+        jsr c64_dos_in
+        bcs @end
+        lda c64_dos_read__args+2
+        sta zp_p2
+        lda c64_dos_read__args+3
+        sta zp_p2+1
+@loop:  lda rt_t
+        cmp c64_dos_read__args+4
+        lda rt_t+1
+        sbc c64_dos_read__args+5
+        bcs @done
+        jsr c64_dos_rd
+        beq @done
+        ldy #0
+        lda zp_p1
+        sta (zp_p2),y
+        inc zp_p2
+        bne @count
+        inc zp_p2+1
+@count: inc rt_t
+        bne @loop
+        inc rt_t+1
+        bne @loop
+@done:  jsr $ffcc               ; CLRCHN
+@end:   lda rt_t
+        ldx rt_t+1
+        rts
+
+; c64_dos_write(f: *mut File, data: *const u8, len: u16) -> error: writes
+; bytes as they are. c64_dos_write_str (same arguments) converts ASCII to
+; PETSCII; that part is only in programs that call it.
+c64_dos_write_str:
+        ldy #5
+@copy:  lda c64_dos_write_str__args,y
+        sta c64_dos_write__args,y
+        dey
+        bpl @copy
+        lda #$80
+        bne c64_dos_wr
+c64_dos_write:
+        lda #0
+c64_dos_wr:
+        sta rt_t
+        lda c64_dos_write__args
+        sta zp_p2
+        lda c64_dos_write__args+1
+        sta zp_p2+1
+        ldy #0
+        lda (zp_p2),y
+        tax
+        jsr $ffc9               ; CHKOUT
+        bcs @err
+        lda c64_dos_write__args+2
+        sta zp_p2
+        lda c64_dos_write__args+3
+        sta zp_p2+1
+@loop:  lda c64_dos_write__args+4
+        bne @some
+        lda c64_dos_write__args+5
+        beq @done
+        dec c64_dos_write__args+5
+@some:  dec c64_dos_write__args+4
+        ldy #0
+        lda (zp_p2),y
+.ifdef c64_dos_write_str {
+        bit rt_t
+        bpl @raw
+        jsr c64_text_petscii
+}
+@raw:   jsr $ffd2               ; CHROUT
+        inc zp_p2
+        bne @loop
+        inc zp_p2+1
+        bne @loop
+@done:  jsr $ffcc               ; CLRCHN
+        lda #0
+@err:   rts
+
+; c64_dos_line(d: *mut Dir) -> 1 if there is one: parses one BASIC line of
+; the directory listing into the entry of the directory (dos.rs: the file
+; at 0, then the entry: blocks at 2, name at 4, its length at 20, type at
+; 21). The entry is empty (zeros, the type three spaces) where the line
+; says nothing; 0 at the end of the listing.
+;
+; rt_t: the low byte of the link, then 0 before the name, 1 in it, 2 after
+; it; rt_t+1: the characters of the type.
+c64_dos_line:
+        sta zp_p0
+        stx zp_p0+1
+        ldy #23
+@init:  lda #$20
+        cpy #21
+        bcs @set
+        lda #0
+@set:   sta (zp_p0),y
+        dey
+        cpy #2
+        bcs @init
+        jsr c64_dos_in
+        bcs @fail
+        jsr @parse
+        pha
+        jsr $ffcc               ; CLRCHN
+        pla
+        rts
+@fail:  lda #0
+        rts
+@parse: jsr c64_dos_rd          ; the link to the next line: 0 at the end
+        beq @no
+        lda zp_p1
+        sta rt_t
+        jsr c64_dos_rd
+        beq @no
+        lda zp_p1
+        ora rt_t
+        beq @no
+        jsr c64_dos_rd          ; the line number: the blocks
+        lda zp_p1
+        ldy #2
+        sta (zp_p0),y
+        jsr c64_dos_rd
+        lda zp_p1
+        ldy #3
+        sta (zp_p0),y
+        lda #0
+        sta rt_t
+        sta rt_t+1
+@next:  jsr c64_dos_rd
+        beq @yes
+        ldx zp_p1
+        beq @yes                ; the end of the line
+        cpx #$22
+        bne @char
+        inc rt_t
+        bne @next
+@char:  ldy rt_t
+        dey
+        bne @kind
+        ldy #20                 ; in the name: up to 16 characters
+        lda (zp_p0),y
+        cmp #16
+        bcs @next
+        adc #1
+        sta (zp_p0),y
+        adc #3
+@store: tay
+        txa
+        sta (zp_p0),y
+        bne @next
+@kind:  dey
+        bne @next
+        cpx #$20                ; after the name: three that are no spaces
+        beq @next
+        lda rt_t+1
+        cmp #3
+        bcs @next
+        inc rt_t+1
+        adc #21
+        bne @store
+@yes:   lda #1
+        rts
+@no:    lda #0
+        rts
+
+; c64_dos_status(dev: u8, buf: *mut u8, max: u16) -> { n, code, ok }: reads
+; the status line of a drive ("00, OK,00,00") into buf, at most 255 bytes
+; of it. n is the number of bytes, code the number in its first two
+; digits; ok is 0 if the drive does not answer.
+;
+; rt_t: the room in buf, rt_t+1: n.
+c64_dos_status:
+        pha
+        lda #0
+        jsr $ffbd               ; SETNAM: no name
+        pla
+        tax
+        lda #15
+        tay
+        jsr $ffba               ; SETLFS
+        jsr c64_open
+        tax
+        bne @fail
+        ldx #15
+        jsr $ffc6               ; CHKIN
+        lda c64_dos_status__args+1
+        sta zp_p2
+        lda c64_dos_status__args+2
+        sta zp_p2+1
+        lda c64_dos_status__args+3
+        ldx c64_dos_status__args+4
+        beq @room
+        lda #255
+@room:  sta rt_t
+        lda #0
+        sta rt_t+1
+@loop:  jsr $ffcf               ; CHRIN
+        sta zp_p1
+        jsr $ffb7               ; READST
+        sta zp_p1+1
+        lda zp_p1
+        cmp #13
+        beq @end
+        bit zp_p1+1
+        bmi @end                ; the drive is gone
+        ldy rt_t+1
+        cpy rt_t
+        bcs @full
+        sta (zp_p2),y
+        inc rt_t+1
+@full:  lda zp_p1+1
+        beq @loop
+@end:   jsr $ffcc               ; CLRCHN
+        lda #15
+        jsr $ffc3               ; CLOSE
+        ldx #0
+        lda rt_t+1
+        cmp #2
+        bcc @ret
+        ldy #0                  ; the first digit times ten, and the second
+        lda (zp_p2),y
+        sec
+        sbc #$30
+        asl
+        sta zp_p1
+        asl
+        asl
+        clc
+        adc zp_p1
+        sta zp_p1
+        iny
+        lda (zp_p2),y
+        sec
+        sbc #$30
+        clc
+        adc zp_p1
+        tax
+@ret:   lda rt_t+1
+        ldy #1
+        rts
+@fail:  lda #15
+        jsr $ffc3               ; CLOSE
+        ldy #0
+        rts

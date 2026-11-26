@@ -29,8 +29,8 @@ fn band_off() {
 fn main() {
     text::colors(Color::Black, Color::Black);
     text::clear();
-    text::put_str(11, 1, "rust64 sprite demo", Color::White);
-    text::put_str(8, 23, "joystick 2 - fire: colour", Color::Grey);
+    text::put_codes(11, 1, c64::s!("rust64 sprite demo"), Color::White);
+    text::put_codes(8, 23, c64::s!("joystick 2 - fire: colour"), Color::Grey);
 
     sprite::load(13, &BALL);
     let ball = Sprite(0);

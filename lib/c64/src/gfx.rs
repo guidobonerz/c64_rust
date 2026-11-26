@@ -23,7 +23,7 @@
 //! ```
 //!
 //! Drawing is then faster (most for pixels and circles) and the program
-//! smaller (`examples/drawing`: 2275 instead of 2663 bytes, 2.5% faster),
+//! smaller (`examples/drawing`: 1677 instead of 1963 bytes, 2.6% faster),
 //! but **every pixel must be on the screen**: one
 //! outside is written to other memory, which can destroy the program. Empty
 //! rectangles (`w` or `h` not positive) still draw nothing, and
@@ -74,21 +74,107 @@ fn matrix() -> *mut u8 {
 static HIRES_MASK: [u8; 8] = [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01];
 
 /// A bitmap mode.
-pub trait Mode {
+pub trait Mode: Sized {
     /// Width in pixels.
     const WIDTH: i16;
-    /// What the drawing routines get as the mode: 0, or `0x80` for two bits
-    /// per pixel.
+    /// Whether a pixel has two bits (for the stand-ins on the host).
     #[doc(hidden)]
-    const MC: u8;
+    const MC: bool;
     /// The byte a cell row has when all its pixels are drawn with `pen`.
     #[doc(hidden)]
     fn pattern(pen: u8) -> u8;
     /// Sets pixel (x, y) (inside the screen) with `pen`.
     #[inline]
     fn put(x: u16, y: u8, pen: u8) {
-        put(x as i16, y as i16, Self::pattern(pen), Self::MC);
+        put::<Self>(x as i16, y as i16, Self::pattern(pen));
     }
+    // The assembly routines of the mode (rat/gfx_hires.rat, rat/gfx_mc.rat).
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_put(x: i16, y: i16, pattern: u8);
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_fline(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_hline(x0: i16, x1: i16, y: i16, pattern: u8);
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_vline(x: i16, y0: i16, y1: i16, pattern: u8);
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_rect(x: i16, y: i16, r: i16, b: i16, pattern: u8);
+    #[cfg(target_os = "c64")]
+    #[doc(hidden)]
+    fn asm_circle(cx: i16, cy: i16, r: i16, pattern: u8);
+}
+
+// Declared here (not inside the methods): the backend defines the argument
+// areas of the assembly functions it finds in the modules, and the routines
+// pass their arguments on to each other.
+#[cfg(target_os = "c64")]
+unsafe extern "C" {
+    fn c64_gfh_put(x: i16, y: i16, pattern: u8);
+    fn c64_gfh_line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    fn c64_gfh_fline(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    fn c64_gfh_hline(x0: i16, x1: i16, y: i16, pattern: u8);
+    fn c64_gfh_vline(x: i16, y0: i16, y1: i16, pattern: u8);
+    fn c64_gfh_area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    fn c64_gfh_rect(x: i16, y: i16, r: i16, b: i16, pattern: u8);
+    fn c64_gfh_circle(cx: i16, cy: i16, r: i16, pattern: u8);
+    fn c64_gfm_put(x: i16, y: i16, pattern: u8);
+    fn c64_gfm_line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    fn c64_gfm_fline(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    fn c64_gfm_hline(x0: i16, x1: i16, y: i16, pattern: u8);
+    fn c64_gfm_vline(x: i16, y0: i16, y1: i16, pattern: u8);
+    fn c64_gfm_area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
+    fn c64_gfm_rect(x: i16, y: i16, r: i16, b: i16, pattern: u8);
+    fn c64_gfm_circle(cx: i16, cy: i16, r: i16, pattern: u8);
+}
+
+/// The methods of [`Mode`] that call the assembly routines of a mode.
+#[cfg(target_os = "c64")]
+macro_rules! asm_routines {
+    ($put:ident, $line:ident, $fline:ident, $hline:ident, $vline:ident, $area:ident, $rect:ident, $circle:ident) => {
+        #[inline(always)]
+        fn asm_put(x: i16, y: i16, pattern: u8) {
+            unsafe { $put(x, y, pattern) }
+        }
+        #[inline(always)]
+        fn asm_line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8) {
+            unsafe { $line(x0, y0, x1, y1, pattern) }
+        }
+        #[inline(always)]
+        fn asm_fline(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8) {
+            unsafe { $fline(x0, y0, x1, y1, pattern) }
+        }
+        #[inline(always)]
+        fn asm_hline(x0: i16, x1: i16, y: i16, pattern: u8) {
+            unsafe { $hline(x0, x1, y, pattern) }
+        }
+        #[inline(always)]
+        fn asm_vline(x: i16, y0: i16, y1: i16, pattern: u8) {
+            unsafe { $vline(x, y0, y1, pattern) }
+        }
+        #[inline(always)]
+        fn asm_area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8) {
+            unsafe { $area(x0, y0, x1, y1, pattern) }
+        }
+        #[inline(always)]
+        fn asm_rect(x: i16, y: i16, r: i16, b: i16, pattern: u8) {
+            unsafe { $rect(x, y, r, b, pattern) }
+        }
+        #[inline(always)]
+        fn asm_circle(cx: i16, cy: i16, r: i16, pattern: u8) {
+            unsafe { $circle(cx, cy, r, pattern) }
+        }
+    };
 }
 
 /// 320x200, pen 1 sets and 0 clears pixels.
@@ -98,90 +184,86 @@ pub struct Multicolor;
 
 impl Mode for Hires {
     const WIDTH: i16 = 320;
-    const MC: u8 = 0;
+    const MC: bool = false;
     #[inline]
     fn pattern(pen: u8) -> u8 {
         if pen != 0 { 0xff } else { 0 }
     }
+    #[cfg(target_os = "c64")]
+    asm_routines!(
+        c64_gfh_put,
+        c64_gfh_line,
+        c64_gfh_fline,
+        c64_gfh_hline,
+        c64_gfh_vline,
+        c64_gfh_area,
+        c64_gfh_rect,
+        c64_gfh_circle
+    );
 }
 
 impl Mode for Multicolor {
     const WIDTH: i16 = 160;
-    const MC: u8 = 0x80;
+    const MC: bool = true;
     #[inline]
     fn pattern(pen: u8) -> u8 {
         (pen & 3) * 0x55
     }
+    #[cfg(target_os = "c64")]
+    asm_routines!(
+        c64_gfm_put,
+        c64_gfm_line,
+        c64_gfm_fline,
+        c64_gfm_hline,
+        c64_gfm_vline,
+        c64_gfm_area,
+        c64_gfm_rect,
+        c64_gfm_circle
+    );
 }
 
-// The drawing routines. They are not generic: both modes share them, with
-// the pattern and the mode (`Mode::MC`) as arguments. On the C64 they are
-// assembly (rat/gfx.rat), which is much smaller and faster than compiled
-// 16-bit arithmetic; the Rust versions here are what the host uses, and
-// they draw the same pixels.
-
-#[cfg(all(target_os = "c64", not(feature = "gfx-unclipped")))]
-crate::rat_source!(GFX_RAT, "rat/gfx.rat");
-
-// The feature `gfx-unclipped`: the same assembly behind the definition
-// that switches its checks off (see rat/gfx.rat).
-#[cfg(all(target_os = "c64", feature = "gfx-unclipped"))]
-mod unclipped {
-    const DEFINE: &[u8] = b"C64_GFX_UNCLIPPED = 1\n";
-    const SOURCE: &[u8] = include_bytes!("rat/gfx.rat");
-
-    const fn joined() -> [u8; DEFINE.len() + SOURCE.len()] {
-        let mut out = [0; DEFINE.len() + SOURCE.len()];
-        let mut i = 0;
-        while i < DEFINE.len() {
-            out[i] = DEFINE[i];
-            i += 1;
-        }
-        while i < out.len() {
-            out[i] = SOURCE[i - DEFINE.len()];
-            i += 1;
-        }
-        out
-    }
-
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    #[unsafe(link_section = "rat")]
-    pub static GFX_RAT: [u8; DEFINE.len() + SOURCE.len()] = joined();
-}
+// The drawing routines. On the C64 they are assembly, which is much
+// smaller and faster than compiled 16-bit arithmetic: one set of routines
+// per mode (rat/gfx_hires.rat: `c64_gfh_...`, rat/gfx_mc.rat:
+// `c64_gfm_...`), so that a program only carries the routines of the
+// modes it draws in, and no routine asks for the mode at run time. The
+// Rust versions here are what the host uses, and they draw the same
+// pixels.
 
 #[cfg(target_os = "c64")]
-unsafe extern "C" {
-    fn c64_gfx_put(x: i16, y: i16, pattern: u8, mode: u8);
-    fn c64_gfx_line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mode: u8);
-    fn c64_gfx_fline(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mode: u8);
-    fn c64_gfx_hline(x0: i16, x1: i16, y: i16, pattern: u8, mode: u8);
-    fn c64_gfx_vline(x: i16, y0: i16, y1: i16, pattern: u8, mode: u8);
-    fn c64_gfx_area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mode: u8);
-    fn c64_gfx_rect(x: i16, y: i16, r: i16, b: i16, pattern: u8, mode: u8);
-    fn c64_gfx_circle(cx: i16, cy: i16, r: i16, pattern: u8, mode: u8);
-}
+crate::rat_source!(GFX_HIRES_RAT, "rat/gfx_hires.rat");
+#[cfg(target_os = "c64")]
+crate::rat_source!(GFX_MC_RAT, "rat/gfx_mc.rat");
+#[cfg(target_os = "c64")]
+crate::rat_source!(GFX_TAB_RAT, "rat/gfxtab.rat");
+
+// The feature `gfx-unclipped`: the definition that switches the checks of
+// the assembly off (see rat/gfx_hires.rat).
+#[cfg(all(target_os = "c64", feature = "gfx-unclipped"))]
+#[doc(hidden)]
+#[allow(dead_code)]
+#[unsafe(link_section = "rat")]
+static GFX_UNCLIPPED_RAT: [u8; 22] = *b"C64_GFX_UNCLIPPED = 1\n";
 
 /// The width of the screen in pixels of the mode.
 #[cfg(not(target_os = "c64"))]
-fn width(mc: u8) -> i16 {
-    if mc != 0 { 160 } else { 320 }
+fn width(mc: bool) -> i16 {
+    if mc { 160 } else { 320 }
 }
 
 /// One pixel; nothing outside the screen.
 #[inline(always)]
-fn put(x: i16, y: i16, pattern: u8, mc: u8) {
+fn put<M: Mode>(x: i16, y: i16, pattern: u8) {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_gfx_put(x, y, pattern, mc)
-    }
+    M::asm_put(x, y, pattern);
     #[cfg(not(target_os = "c64"))]
     {
+        let mc = M::MC;
         if x < 0 || y < 0 || y >= 200 || x >= width(mc) {
             return;
         }
         // The position in bits, and the bits of the pixel.
-        let (bit, mask) = if mc != 0 {
+        let (bit, mask) = if mc {
             let bit = x as u16 * 2;
             (bit, 0xc0u8 >> (bit & 7))
         } else {
@@ -197,18 +279,16 @@ fn put(x: i16, y: i16, pattern: u8, mc: u8) {
 
 /// A line (Bresenham), both ends included.
 #[inline(always)]
-fn line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mc: u8) {
+fn line<M: Mode>(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8) {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_gfx_line(x0, y0, x1, y1, pattern, mc)
-    }
+    M::asm_line(x0, y0, x1, y1, pattern);
     #[cfg(not(target_os = "c64"))]
     {
         // Horizontal and vertical lines are areas one pixel high or wide.
         if y0 == y1 || x0 == x1 {
             let (l, r) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
             let (t, b) = if y0 < y1 { (y0, y1) } else { (y1, y0) };
-            area(l, t, r, b, pattern, mc);
+            area::<M>(l, t, r, b, pattern);
             return;
         }
         let (mut x0, mut y0) = (x0, y0);
@@ -218,7 +298,7 @@ fn line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mc: u8) {
         let sy = if y0 < y1 { 1 } else { -1 };
         let mut err = dx + dy;
         loop {
-            put(x0, y0, pattern, mc);
+            put::<M>(x0, y0, pattern);
             if x0 == x1 && y0 == y1 {
                 return;
             }
@@ -238,20 +318,19 @@ fn line(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mc: u8) {
 /// All pixels from (x0, y0) to (x1, y1), both included, cut to the screen;
 /// nothing if x1 < x0 or y1 < y0.
 #[inline(always)]
-fn area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mc: u8) {
+fn area<M: Mode>(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8) {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_gfx_area(x0, y0, x1, y1, pattern, mc)
-    }
+    M::asm_area(x0, y0, x1, y1, pattern);
     #[cfg(not(target_os = "c64"))]
     {
+        let mc = M::MC;
         let x0 = if x0 < 0 { 0 } else { x0 };
         let y0 = if y0 < 0 { 0 } else { y0 };
         let x1 = if x1 >= width(mc) { width(mc) - 1 } else { x1 };
         let y1 = if y1 >= 200 { 199 } else { y1 };
         for j in y0..=y1 {
             for i in x0..=x1 {
-                put(i, j, pattern, mc);
+                put::<M>(i, j, pattern);
             }
         }
     }
@@ -260,43 +339,39 @@ fn area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8, mc: u8) {
 /// The outline of the rectangle with the corners (x, y) and (r, b);
 /// nothing if r < x or b < y.
 #[inline(always)]
-fn rect(x: i16, y: i16, r: i16, b: i16, pattern: u8, mc: u8) {
+fn rect<M: Mode>(x: i16, y: i16, r: i16, b: i16, pattern: u8) {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_gfx_rect(x, y, r, b, pattern, mc)
-    }
+    M::asm_rect(x, y, r, b, pattern);
     #[cfg(not(target_os = "c64"))]
     {
         if r < x || b < y {
             return;
         }
-        area(x, y, r, y, pattern, mc);
-        area(x, b, r, b, pattern, mc);
-        area(x, y, x, b, pattern, mc);
-        area(r, y, r, b, pattern, mc);
+        area::<M>(x, y, r, y, pattern);
+        area::<M>(x, b, r, b, pattern);
+        area::<M>(x, y, x, b, pattern);
+        area::<M>(r, y, r, b, pattern);
     }
 }
 
 /// A circle (midpoint algorithm).
 #[inline(always)]
-fn circle(cx: i16, cy: i16, r: i16, pattern: u8, mc: u8) {
+fn circle<M: Mode>(cx: i16, cy: i16, r: i16, pattern: u8) {
     #[cfg(target_os = "c64")]
-    unsafe {
-        c64_gfx_circle(cx, cy, r, pattern, mc)
-    }
+    M::asm_circle(cx, cy, r, pattern);
     #[cfg(not(target_os = "c64"))]
     {
         let (mut x, mut y) = (r, 0i16);
         let mut err = 1 - r;
         while x >= y {
-            put(cx + x, cy + y, pattern, mc);
-            put(cx + y, cy + x, pattern, mc);
-            put(cx - y, cy + x, pattern, mc);
-            put(cx - x, cy + y, pattern, mc);
-            put(cx - x, cy - y, pattern, mc);
-            put(cx - y, cy - x, pattern, mc);
-            put(cx + y, cy - x, pattern, mc);
-            put(cx + x, cy - y, pattern, mc);
+            put::<M>(cx + x, cy + y, pattern);
+            put::<M>(cx + y, cy + x, pattern);
+            put::<M>(cx - y, cy + x, pattern);
+            put::<M>(cx - x, cy + y, pattern);
+            put::<M>(cx - x, cy - y, pattern);
+            put::<M>(cx - y, cy - x, pattern);
+            put::<M>(cx + y, cy - x, pattern);
+            put::<M>(cx + x, cy - y, pattern);
             y += 1;
             if err < 0 {
                 err += 2 * y + 1;
@@ -397,13 +472,13 @@ impl<M: Mode> Bitmap<M> {
     /// Sets a pixel with the pen; pixels outside the screen are ignored.
     #[inline]
     pub fn plot(&self, x: i16, y: i16) {
-        put(x, y, M::pattern(self.pen), M::MC);
+        put::<M>(x, y, M::pattern(self.pen));
     }
 
     /// Draws a line (Bresenham); the parts outside the screen are left
     /// out. Horizontal and vertical lines are the fastest.
     pub fn line(&self, x0: i16, y0: i16, x1: i16, y1: i16) {
-        line(x0, y0, x1, y1, M::pattern(self.pen), M::MC);
+        line::<M>(x0, y0, x1, y1, M::pattern(self.pen));
     }
 
     /// Draws the same line as [`Bitmap::line`], the fast way: a flat line
@@ -413,24 +488,20 @@ impl<M: Mode> Bitmap<M> {
     /// program.
     pub fn fline(&self, x0: i16, y0: i16, x1: i16, y1: i16) {
         #[cfg(target_os = "c64")]
-        unsafe {
-            c64_gfx_fline(x0, y0, x1, y1, M::pattern(self.pen), M::MC)
-        }
+        M::asm_fline(x0, y0, x1, y1, M::pattern(self.pen));
         #[cfg(not(target_os = "c64"))]
-        line(x0, y0, x1, y1, M::pattern(self.pen), M::MC);
+        line::<M>(x0, y0, x1, y1, M::pattern(self.pen));
     }
 
     /// Draws the horizontal line from `x0` to `x1` (in any order) at `y`:
     /// whole bytes at a time, and without the code of [`Bitmap::line`].
     pub fn hline(&self, x0: i16, x1: i16, y: i16) {
         #[cfg(target_os = "c64")]
-        unsafe {
-            c64_gfx_hline(x0, x1, y, M::pattern(self.pen), M::MC)
-        }
+        M::asm_hline(x0, x1, y, M::pattern(self.pen));
         #[cfg(not(target_os = "c64"))]
         {
             let (l, r) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
-            area(l, y, r, y, M::pattern(self.pen), M::MC);
+            area::<M>(l, y, r, y, M::pattern(self.pen));
         }
     }
 
@@ -438,30 +509,28 @@ impl<M: Mode> Bitmap<M> {
     /// going down one column, and without the code of [`Bitmap::line`].
     pub fn vline(&self, x: i16, y0: i16, y1: i16) {
         #[cfg(target_os = "c64")]
-        unsafe {
-            c64_gfx_vline(x, y0, y1, M::pattern(self.pen), M::MC)
-        }
+        M::asm_vline(x, y0, y1, M::pattern(self.pen));
         #[cfg(not(target_os = "c64"))]
         {
             let (t, b) = if y0 < y1 { (y0, y1) } else { (y1, y0) };
-            area(x, t, x, b, M::pattern(self.pen), M::MC);
+            area::<M>(x, t, x, b, M::pattern(self.pen));
         }
     }
 
     /// Draws the outline of a rectangle (nothing if `w` or `h` is not
     /// positive).
     pub fn rect(&self, x: i16, y: i16, w: i16, h: i16) {
-        rect(x, y, x + w - 1, y + h - 1, M::pattern(self.pen), M::MC);
+        rect::<M>(x, y, x + w - 1, y + h - 1, M::pattern(self.pen));
     }
 
     /// Fills a rectangle.
     pub fn fill_rect(&self, x: i16, y: i16, w: i16, h: i16) {
-        area(x, y, x + w - 1, y + h - 1, M::pattern(self.pen), M::MC);
+        area::<M>(x, y, x + w - 1, y + h - 1, M::pattern(self.pen));
     }
 
     /// Draws a circle (midpoint algorithm).
     pub fn circle(&self, cx: i16, cy: i16, r: i16) {
-        circle(cx, cy, r, M::pattern(self.pen), M::MC);
+        circle::<M>(cx, cy, r, M::pattern(self.pen));
     }
 }
 

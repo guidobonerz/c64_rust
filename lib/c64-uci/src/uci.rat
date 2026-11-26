@@ -174,3 +174,69 @@ c64_uci_code:
         jmp @rest
 @done:  lda rt_t
         rts
+
+; c64_uci_run(out: *mut u8, max: u16) -> { n: u16, err: u8 }: runs the
+; command (c64_uci_push) and collects its answer (c64_uci_finish); err is
+; 255 if the interface did not take the command.
+c64_uci_run:
+        ldx #3
+@copy:  lda c64_uci_run__args,x
+        sta c64_uci_finish__args,x
+        dex
+        bpl @copy
+        jsr c64_uci_push
+        and #$08
+        beq c64_uci_finish
+        lda #0
+        tax
+        ldy #255
+        rts
+
+; c64_uci_finish(out: *mut u8, max: u16) -> { n: u16, err: u8 }: after
+; c64_uci_push, collects the data of all packets in out (what does not fit
+; is dropped); n is its length and err the first status number that is
+; not 0.
+;
+; rt_t+2: n (2 bytes), rt_t+4: err. The arguments move on with the data.
+c64_uci_finish:
+        lda #0
+        sta rt_t+2
+        sta rt_t+3
+        sta rt_t+4
+@pack:  ldx #3
+@args:  lda c64_uci_finish__args,x
+        sta c64_uci_read__args,x
+        dex
+        bpl @args
+        jsr c64_uci_read        ; A/X: the bytes of this packet
+        pha
+        clc
+        adc rt_t+2
+        sta rt_t+2
+        txa
+        adc rt_t+3
+        sta rt_t+3
+        pla
+        clc                     ; out += bytes, max -= bytes
+        adc c64_uci_finish__args
+        sta c64_uci_finish__args
+        txa
+        adc c64_uci_finish__args+1
+        sta c64_uci_finish__args+1
+        sec
+        lda c64_uci_finish__args+2
+        sbc rt_t
+        sta c64_uci_finish__args+2
+        lda c64_uci_finish__args+3
+        sbc rt_t+1
+        sta c64_uci_finish__args+3
+        jsr c64_uci_code
+        ldx rt_t+4
+        bne @have
+        sta rt_t+4
+@have:  jsr c64_uci_accept
+        bne @pack
+        lda rt_t+2
+        ldx rt_t+3
+        ldy rt_t+4
+        rts

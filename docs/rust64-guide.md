@@ -339,6 +339,10 @@ its own screen codes:
   `text::print_petscii`.
 * `text::put_str` writes screen codes directly into screen memory (with a
   colour, no cursor), `text::screen_code` converts one character.
+* `c64::s!("SCORE")` converts at compile time to a `&'static [u8; N]` of
+  screen codes for the upper case set, `c64::sm!` for the lower/upper case
+  set. `text::put_codes` writes them: the program then carries no
+  conversion and spends no time on it.
 * `b'A'` and `b"..."` stay ASCII bytes.
 
 ---
@@ -553,6 +557,17 @@ tunes that load below `$0801`.
 kernal::setnam(c64::p!("HIGHSCORE"));
 text::print_petscii(c64::pm!("Mixed Case"));
 ```
+
+### `c64::s!` / `c64::sm!` — screen code literals
+
+```rust
+text::put_codes(11, 1, c64::s!("rust64 sprite demo"), Color::White);
+static MESSAGE: &[u8] = c64::s!("hello from rust64 ... ");
+```
+
+The text is converted at compile time. `text::put_str` converts every
+character when the program runs, and brings the conversion routines
+(83 bytes) into the program.
 
 ### `c64::rat_source!` — include assembly
 
@@ -783,6 +798,7 @@ Constants: `RETURN`, `CLEAR`, `HOME`, `UP`, `DOWN`, `LEFT`, `RIGHT`,
 | `lowercase()`, `uppercase()` | switch the character set |
 | `put_char(col, row, code, color)` | write a screen code directly |
 | `put_str(col, row, s, color)` | write a string directly (no cursor) |
+| `put_codes(col, row, codes, color)` | the same for screen codes (a `c64::s!` literal): no conversion |
 | `fill(code, color)`, `fill_rect(col, row, w, h, code, color)` | fill the screen or a rectangle |
 | `scroll_up(code, color)` | move everything up one line |
 | `set_screen_addr(addr)`, `set_charset(addr)` | another screen / character set |
@@ -864,12 +880,14 @@ gfx::text();
 Coordinates are `i16`; pixels outside the screen are skipped. The mode is
 part of the type, so `point` only exists for hires bitmaps.
 
-The drawing itself is assembly (`lib/c64/src/rat/gfx.rat`), shared by both
-modes, and a program contains just the routines it uses:
+The drawing itself is assembly, one set of routines for each mode
+(`lib/c64/src/rat/gfx_hires.rat` and `gfx_mc.rat`; the tables both use
+are in `gfxtab.rat`). No routine asks for the mode when it runs, and a
+program contains just the routines it uses, of the modes it draws in:
 
 * `plot`: one pixel, about 150 cycles.
 * `line`: with both ends on the screen, a mask and a pointer move from
-  pixel to pixel instead of a new address for each one (about 60-100
+  pixel to pixel instead of a new address for each one (about 50
   cycles per pixel). A line that leaves the screen is stepped pixel by
   pixel through the pixel routine; it draws the same pixels.
 * `fline` draws the same line as `line`, and flat ones (at least 8
@@ -984,7 +1002,7 @@ for e in dos::Dir::open(2, 8)? { ... }
 | `load(name, dev, addr)`, `load_abs(name, dev)` | load to `addr` / to the file's address; returns the end |
 | `save(name, dev, start, end)` | save `start..end` |
 | `command(dev, cmd)`, `command_arg(dev, cmd, arg)`, `scratch(dev, name)`, `rename(dev, from, to)` | DOS commands (`command_arg`: a command and what it applies to, `"S0:"` and a name) |
-| `status(dev, buf) -> Option<(len, code)>` | the drive status (`00, OK,00,00`) |
+| `status(dev, buf) -> Option<(len, code)>` | the drive status (`00, OK,00,00`), at most 255 bytes of it |
 | `File::open(lfn, dev, sa, name)` | `get()`, `read(buf)`, `eof()`, `write(bytes)`, `write_str(s)`; closed on drop |
 | `Dir::open(lfn, dev)` | an `Iterator<Item = DirEntry>`; `header`, `free()` |
 | `DirEntry` | `blocks`, `name()` (PETSCII), `kind` (`PRG`, `SEQ`, ...) |
@@ -1173,8 +1191,8 @@ fn band_off() {
 fn main() {
     text::colors(Color::Black, Color::Black);
     text::clear();
-    text::put_str(11, 1, "rust64 sprite demo", Color::White);
-    text::put_str(8, 23, "joystick 2 - fire: colour", Color::Grey);
+    text::put_codes(11, 1, c64::s!("rust64 sprite demo"), Color::White);
+    text::put_codes(8, 23, c64::s!("joystick 2 - fire: colour"), Color::Grey);
 
     sprite::load(13, &BALL);
     let ball = Sprite(0);
@@ -2113,13 +2131,13 @@ rust64 follows the phases in `PLAN.md`:
 | 7. Extensions: recursion on a software stack, `alloc`, `dyn Trait`, `f32`, cartridges | |
 
 Code quality: the passes of chapter 10 make the release builds of the
-examples 24% smaller in total than the code generator alone gives
-(`RUST64_NO_OPT=1`; `diagonal`: 1823 to 1265 bytes, `sd2iec`: 3902 to
-2497, `wic64`: 2665 to 1741). Compared with oscar64 `-Os`, an optimizing
+examples 20% smaller in total than the code generator alone gives
+(`RUST64_NO_OPT=1`; `diagonal`: 1823 to 1265 bytes, `sd2iec`: 3175 to
+2225, `wic64`: 2389 to 1698). Compared with oscar64 `-Os`, an optimizing
 C compiler for the 6502, the fifteen examples that have a C port are
-0.4% larger in total (six smaller, nine larger; from 86% smaller to 79%
+4% smaller in total (eight smaller, seven larger; from 86% smaller to 79%
 larger, where the library brings more than the program needs), and
-every program that is timed needs fewer cycles (0.5% to 41%); against
+every program that is timed needs fewer cycles (0.5% to 45%); against
 `-O2` and `-O3` one of them needs 6 to 9% more. The README has the
 numbers.
 There is one level of optimization: the backend does the same for every

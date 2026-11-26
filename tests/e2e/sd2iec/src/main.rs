@@ -79,6 +79,50 @@ fn main() {
     // deletes nothing (01), renaming one is "file not found" (62)
     check(dos::scratch(DEV, "nofile").is_ok() && sd::check(DEV) == Ok(1));
     check(dos::rename(DEV, "nofile", "other").is_ok() && sd::check(DEV) == Err(62));
+    // 13-14: the directory of the root: at least two entries, TOP among them
+    {
+        let mut entries = 0u8;
+        let mut top = false;
+        if let Ok(mut d) = dos::Dir::open(2, DEV) {
+            for e in &mut d {
+                entries += 1;
+                if e.name() == b"TOP" {
+                    top = true;
+                }
+            }
+        }
+        check(entries >= 2);
+        check(top);
+    }
+    // 15: a sequential file, written as text (converted to PETSCII) and as
+    // bytes
+    let wrote = match dos::File::open(2, DEV, 2, "note,s,w") {
+        Ok(mut f) => f.write_str("abc").is_ok() && f.write(b"XY").is_ok(),
+        Err(_) => false,
+    };
+    check(wrote && sd::check(DEV) == Ok(0));
+    // 16: read back in one piece: five bytes, and the end of the file
+    let mut b = [0u8; 8];
+    let read = match dos::File::open(2, DEV, 2, "note,s,r") {
+        Ok(mut f) => f.read(&mut b) == 5 && f.eof(),
+        Err(_) => false,
+    };
+    check(read && &b[..5] == b"ABCXY");
+    // 17: read back byte by byte, and nothing after the last one
+    let bytes = match dos::File::open(2, DEV, 2, "note,s,r") {
+        Ok(mut f) => {
+            f.get() == Some(b'A')
+                && f.get() == Some(b'B')
+                && f.get() == Some(b'C')
+                && f.get() == Some(b'X')
+                && f.get() == Some(b'Y')
+                && f.get().is_none()
+        }
+        Err(_) => false,
+    };
+    check(bytes);
+    // 18: and deleted again
+    check(dos::scratch(DEV, "note").is_ok() && sd::check(DEV) == Ok(1));
     unsafe {
         hw::vic().border.write(if FAILS == 0 { Color::Green } else { Color::Red });
     }

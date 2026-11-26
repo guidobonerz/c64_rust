@@ -75,6 +75,7 @@ unsafe extern "C" {
     fn c64_wic64_request(command: u8, payload: *const u8, len: u16, wait: u8) -> u8;
     fn c64_wic64_read(buf: *mut u8, max: u16) -> u16;
     fn c64_wic64_remaining() -> u16;
+    fn c64_wic64_read_text(buf: *mut u8, max: u16) -> u16;
 }
 
 /// Sets how long this crate waits for a response, in seconds (the default
@@ -136,8 +137,16 @@ pub fn command(command: u8, payload: &[u8], out: &mut [u8]) -> Result<usize, Err
 /// Like [`command`], for responses that are text ending with a zero byte:
 /// the length is that of the text.
 fn text(c: u8, payload: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-    let n = command(c, payload, out)?;
-    Ok(if n > 0 && out[n - 1] == 0 { n - 1 } else { n })
+    #[cfg(target_os = "c64")]
+    {
+        request(c, payload)?;
+        Ok((unsafe { c64_wic64_read_text(out.as_mut_ptr(), out.len() as u16) }) as usize)
+    }
+    #[cfg(not(target_os = "c64"))]
+    {
+        let n = command(c, payload, out)?;
+        Ok(if n > 0 && out[n - 1] == 0 { n - 1 } else { n })
+    }
 }
 
 /// Whether a WiC64 answers. Waits about a second if there is none.

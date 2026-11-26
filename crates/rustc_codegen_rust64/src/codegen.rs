@@ -5664,6 +5664,28 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         (v, layout)
     }
 
+    /// Whether `op` is a constant without a value (`MaybeUninit::uninit()`):
+    /// storing it is nothing.
+    fn uninit_const(&mut self, op: &Operand<'tcx>) -> bool {
+        let Operand::Constant(c) = op else { return false };
+        let cv = self.monomorphize(c.const_);
+        let size = self.layout(cv.ty()).size;
+        if size.bytes() == 0 {
+            return false;
+        }
+        let Ok(ConstValue::Indirect { alloc_id, offset }) =
+            cv.eval(self.tcx(), TypingEnv::fully_monomorphized(), c.span)
+        else {
+            return false;
+        };
+        let GlobalAlloc::Memory(alloc) = self.tcx().global_alloc(alloc_id) else { return false };
+        alloc
+            .inner()
+            .init_mask()
+            .range_as_init_chunks(alloc_range(offset, size))
+            .all(|c| matches!(c, InitChunk::Uninit(_)))
+    }
+
     /// The location a pointer value points to.
     fn deref_val(&mut self, v: &Val) -> Addr {
         match v {
@@ -5754,6 +5776,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let size = dl.size.bytes();
         match rv {
             Rvalue::Use(op, _) | Rvalue::WrapUnsafeBinder(op, _) => {
+                if self.uninit_const(op) {
+                    return;
+                }
                 let (v, _) = self.operand(op);
                 self.a().copy(&dst, &v, size);
             }
@@ -6731,6 +6756,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     self.a().copy(&dst.offset(off), &v, l.size.bytes());
                 } else {
                     for (i, op) in ops.iter_enumerated() {
+                        if self.uninit_const(op) {
+                            continue;
+                        }
                         let (v, l) = self.operand(op);
                         let off = vl.fields.offset(i.as_usize()).bytes();
                         self.a().copy(&dst.offset(off), &v, l.size.bytes());

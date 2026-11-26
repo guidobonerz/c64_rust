@@ -16,7 +16,7 @@ fn main() {
     text::clear();
     c64::println!("joystick 2 moves the ball, keys are");
     c64::println!("shown, run/stop ends.");
-    text::put_str(0, 3, "key:", Color::LightBlue);
+    text::put_codes(0, 3, c64::s!("key:"), Color::LightBlue);
     let (mut x, mut y) = (20u8, 14u8);
     let mut frame = 0u8;
     loop {

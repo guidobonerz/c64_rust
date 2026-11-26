@@ -15,21 +15,21 @@ fn main() {
     ui::titled_frame(0, 0, 40, 25, Border::Round, Color::Blue, " C64-UI ");
 
     ui::frame(2, 2, 17, 7, Border::Square, Color::White);
-    text::put_str(4, 4, "SQUARE", Color::LightGrey);
+    text::put_codes(4, 4, c64::s!("SQUARE"), Color::LightGrey);
 
     ui::frame(21, 2, 17, 7, Border::Round, Color::Yellow);
-    text::put_str(23, 4, "ROUND", Color::LightGrey);
+    text::put_codes(23, 4, c64::s!("ROUND"), Color::LightGrey);
 
     ui::titled_frame(2, 10, 17, 7, Border::Square, Color::Cyan, " FILES ");
-    text::put_str(4, 12, "HELLO.PRG", Color::LightGrey);
-    text::put_str(4, 13, "NOTES.SEQ", Color::LightGrey);
+    text::put_codes(4, 12, c64::s!("HELLO.PRG"), Color::LightGrey);
+    text::put_codes(4, 13, c64::s!("NOTES.SEQ"), Color::LightGrey);
 
     ui::titled_frame(21, 10, 17, 7, Border::Round, Color::Green, " STATUS ");
-    text::put_str(23, 12, "ALL IS WELL", Color::LightGrey);
+    text::put_codes(23, 12, c64::s!("ALL IS WELL"), Color::LightGrey);
 
     // A panel clears what is under it.
     ui::titled_panel(11, 15, 18, 6, Border::Round, Color::LightRed, " QUIT? ");
-    text::put_str(14, 17, "YES     NO", Color::White);
+    text::put_codes(14, 17, c64::s!("YES     NO"), Color::White);
 
     loop {}
 }

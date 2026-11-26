@@ -76,3 +76,22 @@ c64_irq_uninstall:
         sta $dc0d
         cli
         rts
+
+; c64_irq_add(line: u8, f: fn()): one more handler (irq.rs: at most 8),
+; and the dispatcher installed.
+c64_irq_add:
+        ldx c64_irq_count
+        cpx #8
+        bcs @full
+        sei
+        sta c64_irq_lines,x
+        txa
+        asl
+        tax
+        lda c64_irq_add__args+1
+        sta c64_irq_handlers,x
+        tya
+        sta c64_irq_handlers+1,x
+        inc c64_irq_count
+        jmp c64_irq_install
+@full:  rts

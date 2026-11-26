@@ -38,10 +38,10 @@ const NORMAL: u8 = 0xc8;
 /// $D016 for the scroller: 38 columns (bit 3 clear), plus the shift.
 const SCROLLING: u8 = 0xc0;
 
-static MESSAGE: &[u8] = b"hello from rust64 on the commodore 64 ... \
+static MESSAGE: &[u8] = c64::s!("hello from rust64 on the commodore 64 ... \
     this text moves with the vic's xscroll register, set in a raster \
     interrupt for this one row ... written in rust, compiled to 6510 code \
-    ... press run/stop to end ...          ";
+    ... press run/stop to end ...          ");
 
 /// The colours of the scroller's columns.
 static RAINBOW: [Color; 8] = [
@@ -127,8 +127,8 @@ fn timed_work() -> u32 {
 fn main() {
     text::colors(Color::Black, Color::Black);
     text::clear();
-    text::put_str(11, 4, "rust64 soft scroller", Color::White);
-    text::put_str(9, 20, "press run/stop to end", Color::Grey);
+    text::put_codes(11, 4, c64::s!("rust64 soft scroller"), Color::White);
+    text::put_codes(9, 20, c64::s!("press run/stop to end"), Color::Grey);
 
     // The scroller's row: empty, in rainbow colours.
     let row = text::screen_addr() + text::offset(0, ROW);
@@ -152,7 +152,7 @@ fn main() {
         } else {
             // One column to the left, a new character at the right edge.
             mem::copy(row, row + 1, text::WIDTH as u16 - 1);
-            mem::poke(row + text::WIDTH as u16 - 1, text::screen_code(MESSAGE[next]));
+            mem::poke(row + text::WIDTH as u16 - 1, MESSAGE[next]);
             next += 1;
             if next == MESSAGE.len() {
                 next = 0;

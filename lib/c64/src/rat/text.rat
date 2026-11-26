@@ -151,6 +151,33 @@ c64_text_put_str:
         bne @loop
 @done:  rts
 
+; c64_text_put_codes(col: u8, row: u8, s: *const u8, len: u16, color: u8):
+; screen codes as they are, with their colour.
+c64_text_put_codes:
+        jsr c64_text_cell
+        lda c64_text_put_codes__args+2
+        sta zp_p0
+        lda c64_text_put_codes__args+3
+        sta zp_p0+1
+        ldy #0
+@loop:  lda c64_text_put_codes__args+4
+        bne @count
+        lda c64_text_put_codes__args+5
+        beq @done
+        dec c64_text_put_codes__args+5
+@count: dec c64_text_put_codes__args+4
+        lda (zp_p0),y
+        sta (zp_p1),y
+        lda c64_text_put_codes__args+6
+        sta (zp_p2),y
+        iny
+        bne @loop
+        inc zp_p0+1
+        inc zp_p1+1
+        inc zp_p2+1
+        bne @loop
+@done:  rts
+
 ; c64_fmt_dec(n: u32) -> u8: n in decimal (1-10 digits) at rt_b (which
 ; runs on into rt_r), returns the number of digits. Powers of ten are
 ; subtracted until the number goes below zero; that counts the digit.
@@ -257,3 +284,22 @@ c64_fmt_dec16:
         rts
 @pow10: .word 10, 100, 1000, 10000
 }
+
+; c64_text_dec16(n: u16): prints n in decimal at the cursor.
+; c64_text_digits(len: u8): prints the len digits that c64_fmt_dec16 or
+; c64_fmt_dec left at rt_b.
+c64_text_dec16:
+        sta c64_fmt_dec16__args
+        stx c64_fmt_dec16__args+1
+        jsr c64_fmt_dec16
+c64_text_digits:
+        sta rt_t
+        lda #0
+        sta rt_t+1
+@loop:  ldy rt_t+1
+        lda rt_b,y
+        jsr $ffd2
+        inc rt_t+1
+        dec rt_t
+        bne @loop
+        rts

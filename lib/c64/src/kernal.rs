@@ -34,7 +34,7 @@ impl Error {
     pub const ILLEGAL_DEVICE: Error = Error(9);
 }
 
-fn result(err: u8) -> Result<(), Error> {
+pub(crate) fn result(err: u8) -> Result<(), Error> {
     if err == 0 { Ok(()) } else { Err(Error(err)) }
 }
 

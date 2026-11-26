@@ -14,6 +14,8 @@
 //! KERNAL errors ([`Error`]); drive errors (file not found on the disk,
 //! disk full, ...) are read with [`status`].
 
+use core::mem::MaybeUninit;
+
 use crate::kernal::{self, Error};
 
 /// The logical file and secondary address of the drive's command channel.
@@ -24,31 +26,74 @@ pub const STATUS_EOF: u8 = 0x40;
 pub const STATUS_TIMEOUT: u8 = 0x02;
 pub const STATUS_MISSING: u8 = 0x80;
 
-/// A file name or command converted to PETSCII.
+// On the C64 the work of this module is assembly (rat/dos.rat): the names,
+// the bytes of a file, the lines of the directory and the drive status.
+// The Rust versions are what the host uses.
+#[cfg(target_os = "c64")]
+crate::rat_source!(DOS_RAT, "rat/dos.rat");
+
+#[cfg(target_os = "c64")]
+unsafe extern "C" {
+    fn c64_dos_push(n: *mut Name, s: *const u8, len: u16);
+    fn c64_dos_cmd(dev: u8) -> u8;
+    fn c64_dos_get(f: *mut File) -> Got;
+    fn c64_dos_read(f: *mut File, buf: *mut u8, max: u16) -> u16;
+    fn c64_dos_write(f: *mut File, data: *const u8, len: u16) -> u8;
+    fn c64_dos_write_str(f: *mut File, data: *const u8, len: u16) -> u8;
+    fn c64_dos_line(d: *mut Dir) -> u8;
+    fn c64_dos_status(dev: u8, buf: *mut u8, max: u16) -> Status;
+}
+
+/// What `c64_dos_get` returns.
+#[cfg(target_os = "c64")]
+#[repr(C)]
+struct Got {
+    ok: u8,
+    byte: u8,
+}
+
+/// What `c64_dos_status` returns.
+#[cfg(target_os = "c64")]
+#[repr(C)]
+struct Status {
+    n: u8,
+    code: u8,
+    ok: u8,
+}
+
+/// A file name or command converted to PETSCII (rat/dos.rat knows the
+/// layout).
+#[repr(C)]
 struct Name {
-    buf: [u8; 40],
     len: u8,
+    buf: MaybeUninit<[u8; 40]>,
 }
 
 impl Name {
     fn new(s: &str) -> Name {
-        let mut n = Name { buf: [0; 40], len: 0 };
+        let mut n = Name { len: 0, buf: MaybeUninit::uninit() };
         n.push(s);
         n
     }
 
     /// Appends `s`; what does not fit is left out.
     fn push(&mut self, s: &str) {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_dos_push(self, s.as_ptr(), s.len() as u16)
+        }
+        #[cfg(not(target_os = "c64"))]
         for &c in s.as_bytes() {
-            if let Some(b) = self.buf.get_mut(self.len as usize) {
-                *b = if c.is_ascii_lowercase() { c - 0x20 } else { c };
+            if (self.len as usize) < 40 {
+                let b = if c.is_ascii_lowercase() { c - 0x20 } else { c };
+                unsafe { self.buf.as_mut_ptr().cast::<u8>().add(self.len as usize).write(b) };
                 self.len += 1;
             }
         }
     }
 
     fn set(&self) {
-        kernal::setnam_len(self.buf.as_ptr(), self.len);
+        kernal::setnam_len(self.buf.as_ptr().cast::<u8>(), self.len);
     }
 }
 
@@ -78,10 +123,17 @@ pub fn save(name: &str, dev: u8, start: u16, end: u16) -> Result<(), Error> {
 
 fn command_name(dev: u8, n: &Name) -> Result<(), Error> {
     n.set();
-    kernal::setlfs(COMMAND_CHANNEL, dev, COMMAND_CHANNEL);
-    let r = kernal::open();
-    kernal::close(COMMAND_CHANNEL);
-    r
+    #[cfg(target_os = "c64")]
+    {
+        kernal::result(unsafe { c64_dos_cmd(dev) })
+    }
+    #[cfg(not(target_os = "c64"))]
+    {
+        kernal::setlfs(COMMAND_CHANNEL, dev, COMMAND_CHANNEL);
+        let r = kernal::open();
+        kernal::close(COMMAND_CHANNEL);
+        r
+    }
 }
 
 /// Sends a DOS command (`"S0:NAME"`, `"R0:NEW=OLD"`, `"I0"`, `"V0"`,
@@ -113,8 +165,21 @@ pub fn rename(dev: u8, from: &str, to: &str) -> Result<(), Error> {
 
 /// Reads the drive status (`"00, OK,00,00"`) into `buf` and returns the
 /// number of bytes and the two-digit error number (0 = ok, 62 = file not
-/// found, ...). `None` if the drive does not answer.
+/// found, ...). `None` if the drive does not answer. At most 255 bytes are
+/// read.
+#[cfg(target_os = "c64")]
 pub fn status(dev: u8, buf: &mut [u8]) -> Option<(usize, u8)> {
+    let s = unsafe { c64_dos_status(dev, buf.as_mut_ptr(), buf.len() as u16) };
+    if s.ok != 0 { Some((s.n as usize, s.code)) } else { None }
+}
+
+/// Reads the drive status (`"00, OK,00,00"`) into `buf` and returns the
+/// number of bytes and the two-digit error number (0 = ok, 62 = file not
+/// found, ...). `None` if the drive does not answer. At most 255 bytes are
+/// read.
+#[cfg(not(target_os = "c64"))]
+pub fn status(dev: u8, buf: &mut [u8]) -> Option<(usize, u8)> {
+    let max = if buf.len() > 255 { 255 } else { buf.len() };
     kernal::setnam(&[]);
     kernal::setlfs(COMMAND_CHANNEL, dev, COMMAND_CHANNEL);
     if kernal::open().is_err() {
@@ -129,7 +194,7 @@ pub fn status(dev: u8, buf: &mut [u8]) -> Option<(usize, u8)> {
         if c == kernal::RETURN || st & STATUS_MISSING != 0 {
             break;
         }
-        if n < buf.len() {
+        if n < max {
             buf[n] = c;
             n += 1;
         }
@@ -148,6 +213,7 @@ pub fn status(dev: u8, buf: &mut [u8]) -> Option<(usize, u8)> {
 }
 
 /// An open logical file; dropping it closes it.
+#[repr(C)]
 pub struct File {
     lfn: u8,
     eof: bool,
@@ -165,6 +231,14 @@ impl File {
     }
 
     /// Reads one byte; `None` at the end of the file or on an error.
+    #[cfg(target_os = "c64")]
+    pub fn get(&mut self) -> Option<u8> {
+        let g = unsafe { c64_dos_get(self) };
+        if g.ok != 0 { Some(g.byte) } else { None }
+    }
+
+    /// Reads one byte; `None` at the end of the file or on an error.
+    #[cfg(not(target_os = "c64"))]
     pub fn get(&mut self) -> Option<u8> {
         if self.eof || kernal::chkin(self.lfn).is_err() {
             return None;
@@ -183,6 +257,13 @@ impl File {
     }
 
     /// Reads up to `buf.len()` bytes and returns how many it read.
+    #[cfg(target_os = "c64")]
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        unsafe { c64_dos_read(self, buf.as_mut_ptr(), buf.len() as u16) as usize }
+    }
+
+    /// Reads up to `buf.len()` bytes and returns how many it read.
+    #[cfg(not(target_os = "c64"))]
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         if self.eof || kernal::chkin(self.lfn).is_err() {
             return 0;
@@ -212,6 +293,13 @@ impl File {
     }
 
     /// Writes bytes as they are.
+    #[cfg(target_os = "c64")]
+    pub fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        kernal::result(unsafe { c64_dos_write(self, data.as_ptr(), data.len() as u16) })
+    }
+
+    /// Writes bytes as they are.
+    #[cfg(not(target_os = "c64"))]
     pub fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         kernal::chkout(self.lfn)?;
         for &b in data {
@@ -222,6 +310,13 @@ impl File {
     }
 
     /// Writes an ASCII string converted to PETSCII.
+    #[cfg(target_os = "c64")]
+    pub fn write_str(&mut self, s: &str) -> Result<(), Error> {
+        kernal::result(unsafe { c64_dos_write_str(self, s.as_ptr(), s.len() as u16) })
+    }
+
+    /// Writes an ASCII string converted to PETSCII.
+    #[cfg(not(target_os = "c64"))]
     pub fn write_str(&mut self, s: &str) -> Result<(), Error> {
         kernal::chkout(self.lfn)?;
         for &b in s.as_bytes() {
@@ -238,8 +333,9 @@ impl Drop for File {
     }
 }
 
-/// One line of the directory.
+/// One line of the directory (rat/dos.rat knows the layout).
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct DirEntry {
     /// Size in blocks.
     pub blocks: u16,
@@ -251,6 +347,7 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
+    #[cfg(not(target_os = "c64"))]
     const EMPTY: DirEntry = DirEntry { blocks: 0, name: [0; 16], name_len: 0, kind: [b' '; 3] };
 
     /// The file name (PETSCII, see [`crate::text::print_petscii`]).
@@ -261,8 +358,11 @@ impl DirEntry {
 
 /// The directory of a drive, as an iterator over its files. After the last
 /// one, [`Dir::free`] is the number of free blocks.
+#[repr(C)]
 pub struct Dir {
     f: File,
+    /// The line that was read last (rat/dos.rat writes it).
+    entry: DirEntry,
     /// The disk name (`name`) and id (`kind`).
     pub header: DirEntry,
     free: u16,
@@ -273,15 +373,36 @@ impl Dir {
     /// Opens the directory (`"$"`) on logical file `lfn` and reads the
     /// header line.
     pub fn open(lfn: u8, dev: u8) -> Result<Dir, Error> {
-        let f = File::open(lfn, dev, 0, "$")?;
-        let mut d = Dir { f, header: DirEntry::EMPTY, free: 0, done: false };
-        d.f.get(); // load address
-        d.f.get();
-        match d.line() {
-            Some(h) => d.header = h,
-            None => d.done = true,
+        kernal::setnam(b"$");
+        kernal::setlfs(lfn, dev, 0);
+        kernal::open()?;
+        // The assembly fills in the entry, so nothing is stored twice.
+        #[cfg(target_os = "c64")]
+        unsafe {
+            let mut d = MaybeUninit::<Dir>::uninit();
+            let p = d.as_mut_ptr();
+            (&raw mut (*p).f).write(File { lfn, eof: false });
+            (&raw mut (*p).free).write(0);
+            c64_dos_get(&raw mut (*p).f); // load address
+            c64_dos_get(&raw mut (*p).f);
+            let found = c64_dos_line(p) != 0;
+            core::ptr::copy_nonoverlapping(&raw const (*p).entry, &raw mut (*p).header, 1);
+            (&raw mut (*p).done).write(!found);
+            Ok(d.assume_init())
         }
-        Ok(d)
+        #[cfg(not(target_os = "c64"))]
+        {
+            let f = File { lfn, eof: false };
+            let mut d = Dir { f, entry: DirEntry::EMPTY, header: DirEntry::EMPTY, free: 0, done: false };
+            d.f.get(); // load address
+            d.f.get();
+            if d.read_line() {
+                d.header = d.entry;
+            } else {
+                d.done = true;
+            }
+            Ok(d)
+        }
     }
 
     /// Free blocks (known after the last entry).
@@ -289,8 +410,28 @@ impl Dir {
         self.free
     }
 
-    /// Parses one BASIC line of the directory listing.
-    fn line(&mut self) -> Option<DirEntry> {
+    /// Parses one BASIC line of the directory listing into `entry`, which
+    /// is empty where the line says nothing; `false` at the end.
+    fn read_line(&mut self) -> bool {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_dos_line(self) != 0
+        }
+        #[cfg(not(target_os = "c64"))]
+        match self.parse_line() {
+            Some(e) => {
+                self.entry = e;
+                true
+            }
+            None => {
+                self.entry = DirEntry::EMPTY;
+                false
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "c64"))]
+    fn parse_line(&mut self) -> Option<DirEntry> {
         let mut e = DirEntry::EMPTY;
         let lo = self.f.get()?;
         let hi = self.f.get()?;
@@ -329,16 +470,12 @@ impl Iterator for Dir {
         if self.done {
             return None;
         }
-        let Some(e) = self.line() else {
-            self.done = true;
-            return None;
-        };
-        if e.name_len == 0 {
-            // "BLOCKS FREE."
-            self.free = e.blocks;
+        if !self.read_line() || self.entry.name_len == 0 {
+            // the end, or "BLOCKS FREE."
+            self.free = self.entry.blocks;
             self.done = true;
             return None;
         }
-        Some(e)
+        Some(self.entry)
     }
 }

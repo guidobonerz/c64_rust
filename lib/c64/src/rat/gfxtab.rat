@@ -1,0 +1,13 @@
+; c64::gfx: the tables that the routines of both modes use (gfx_hires.rat,
+; gfx_mc.rat).
+
+; The address of each cell row of the bitmap.
+c64_gft_rowlo:
+        .fill 25, <($6000 + i * 320)
+c64_gft_rowhi:
+        .fill 25, >($6000 + i * 320)
+; The bits from x & 7 to the right end of a byte, and up to x & 7.
+c64_gft_left:
+        .byte $ff, $7f, $3f, $1f, $0f, $07, $03, $01
+c64_gft_right:
+        .byte $80, $c0, $e0, $f0, $f8, $fc, $fe, $ff

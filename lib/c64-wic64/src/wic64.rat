@@ -164,3 +164,29 @@ c64_wic64_remaining:
         lda c64_wic64_left
         ldx c64_wic64_left+1
         rts
+
+; c64_wic64_read_text(buf: *mut u8, max: u16) -> u16: c64_wic64_read for a
+; response that is text ending with a zero byte, which does not count.
+c64_wic64_read_text:
+        ldx #3
+@copy:  lda c64_wic64_read_text__args,x
+        sta c64_wic64_read__args,x
+        dex
+        bpl @copy
+        jsr c64_wic64_read      ; rt_t+3: the bytes; zp_p1 is behind the last
+        ora rt_t+4
+        beq @len
+        lda zp_p1
+        bne @low
+        dec zp_p1+1
+@low:   dec zp_p1
+        ldy #0
+        lda (zp_p1),y
+        bne @len
+        lda rt_t+3
+        bne @less
+        dec rt_t+4
+@less:  dec rt_t+3
+@len:   lda rt_t+3
+        ldx rt_t+4
+        rts

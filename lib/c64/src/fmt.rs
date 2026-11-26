@@ -19,6 +19,23 @@ pub trait Write {
     fn write_str(&mut self, s: &str) {
         self.write_bytes(s.as_bytes());
     }
+
+    /// Writes `n` in decimal ([`write_u16`]; a sink can have a shorter
+    /// way).
+    fn write_u16(&mut self, n: u16)
+    where
+        Self: Sized,
+    {
+        write_u16(self, n)
+    }
+
+    /// Writes `n` in decimal ([`write_u32`]).
+    fn write_u32(&mut self, n: u32)
+    where
+        Self: Sized,
+    {
+        write_u32(self, n)
+    }
 }
 
 /// A value that can be written to a [`Write`].
@@ -78,7 +95,7 @@ const POW10_32: [u32; 9] = [
 // program that prints no wide numbers does not carry the large one.
 #[cfg(target_os = "c64")]
 unsafe extern "C" {
-    fn c64_fmt_dec(n: u32) -> u8;
+    pub(crate) fn c64_fmt_dec(n: u32) -> u8;
     fn c64_fmt_dec16(n: u16) -> u8;
 }
 
@@ -156,7 +173,7 @@ macro_rules! unsigned {
     ($($t:ty => $f:ident),*) => {$(
         impl Display for $t {
             fn fmt<W: Write>(&self, w: &mut W) {
-                $f(w, *self as _)
+                w.$f(*self as _)
             }
         }
     )*};

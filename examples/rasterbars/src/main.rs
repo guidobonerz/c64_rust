@@ -57,10 +57,10 @@ static SINE: [u8; 64] = [
 fn main() {
     text::colors(Color::Black, Color::Black);
     text::clear();
-    text::put_str(10, 2, "rust64 raster bars", Color::White);
-    text::put_str(4, 11, "one colour per raster line, with", Color::White);
-    text::put_str(4, 13, "a stable raster interrupt", Color::White);
-    text::put_str(9, 22, "press run/stop to end", Color::Grey);
+    text::put_codes(10, 2, c64::s!("rust64 raster bars"), Color::White);
+    text::put_codes(4, 11, c64::s!("one colour per raster line, with"), Color::White);
+    text::put_codes(4, 13, c64::s!("a stable raster interrupt"), Color::White);
+    text::put_codes(9, 22, c64::s!("press run/stop to end"), Color::Grey);
 
     let table = unsafe { raster_colors() };
     unsafe { raster_start() };

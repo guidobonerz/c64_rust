@@ -31,15 +31,18 @@ static mut CUR: u8 = 0;
 /// Installs `f` at raster line `line` (0-255). Ignored when
 /// [`MAX_HANDLERS`] are installed.
 pub fn add(line: u8, f: fn()) {
+    #[cfg(target_os = "c64")]
+    unsafe {
+        c64_irq_add(line, f)
+    }
+    #[cfg(not(target_os = "c64"))]
     unsafe {
         if COUNT as usize == MAX_HANDLERS {
             return;
         }
-        crate::sys::sei();
         LINES[COUNT as usize] = line;
         HANDLERS[COUNT as usize] = Some(f);
         COUNT += 1;
-        install();
     }
 }
 
@@ -67,13 +70,6 @@ pub fn critical_section<R>(f: impl FnOnce() -> R) -> R {
     crate::sys::without_interrupts(f)
 }
 
-fn install() {
-    #[cfg(target_os = "c64")]
-    unsafe {
-        c64_irq_install()
-    }
-}
-
 fn uninstall() {
     #[cfg(target_os = "c64")]
     unsafe {
@@ -85,7 +81,9 @@ fn uninstall() {
 crate::rat_source!(IRQ_RAT, "rat/irq.rat");
 
 #[cfg(target_os = "c64")]
+// (a Rust function pointer: the assembly stores it for the dispatcher)
+#[allow(improper_ctypes)]
 unsafe extern "C" {
-    fn c64_irq_install();
+    fn c64_irq_add(line: u8, f: fn());
     fn c64_irq_uninstall();
 }
