@@ -1,0 +1,399 @@
+; c64::g3d: the lines of the edges (see g3d.rat; calling convention: see
+; c64::rat_source!).
+
+; The line of an edge, from the arguments of c64_gfh_line. The usual case
+; has loops of its own, which only set pixels (the pattern is not 0) or
+; take the line away: both ends on the screen, neither horizontal nor
+; vertical, less than 256 pixels wide. Every other line is c64_gfh_line.
+; Taking away clears the bytes the line runs through, with the pixels
+; next to it in them: what else is drawn there has to be drawn again.
+;
+; As there: zp_p0 is the byte column of the cell, Y the line in it and
+; zp_p1 the mask of the pixel. rt_b: dx, +2: dy, +3: the shorter side
+; less one, +7: 0 down, $fe up. zp_p2: err, which starts with half the
+; longer side. X: the pixels left.
+c64_g3d_slow:
+        jmp c64_gfh_line
+c64_g3d_line:
+        ldx #4
+@on:    lda c64_gfh_line__args+3,x
+        bne c64_g3d_slow
+        lda c64_gfh_line__args+2,x
+        cmp #200
+        bcs c64_g3d_slow
+        lda c64_gfh_line__args+1,x
+        beq @ok
+        cmp #1
+        bne c64_g3d_slow
+        lda c64_gfh_line__args,x
+        cmp #64
+        bcs c64_g3d_slow
+@ok:    dex
+        dex
+        dex
+        dex
+        bpl @on
+        lda c64_gfh_line__args+4               ; from left to right
+        cmp c64_gfh_line__args
+        lda c64_gfh_line__args+5
+        sbc c64_gfh_line__args+1
+        bcs @order
+        ldx #3
+@swap:  lda c64_gfh_line__args,x
+        ldy c64_gfh_line__args+4,x
+        sta c64_gfh_line__args+4,x
+        sty c64_gfh_line__args,x
+        dex
+        bpl @swap
+@order: sec
+        lda c64_gfh_line__args+4
+        sbc c64_gfh_line__args
+        sta rt_b
+        beq c64_g3d_slow               ; vertical (or 256 wide)
+        lda c64_gfh_line__args+5
+        sbc c64_gfh_line__args+1
+        bne c64_g3d_slow
+        ldx #0
+        sec
+        lda c64_gfh_line__args+6
+        sbc c64_gfh_line__args+2
+        beq c64_g3d_slow               ; horizontal
+        bcs @down
+        eor #$ff
+        adc #1
+        ldx #$fe
+@down:  sta rt_b+2
+        stx rt_b+7
+        lda c64_gfh_line__args
+        sta rt_a
+        lda c64_gfh_line__args+1
+        sta rt_a+1
+        lda c64_gfh_line__args+2
+        sta rt_a+2
+        jsr c64_gfh_addr
+        lda rt_b
+        cmp rt_b+2
+        bcc @steep
+        lsr                     ; dx >= dy: one pixel per column
+        sta zp_p2
+        ldx rt_b+2
+        dex
+        stx rt_b+3
+        ldx rt_b
+        inx
+        clc
+        lda c64_gfh_line__args+8
+        bne @flat
+        jmp @xc
+@flat:  jmp @xs
+@steep: lda rt_b+2              ; dy > dx: one pixel per line
+        lsr
+        sta zp_p2
+        ldx rt_b
+        dex
+        stx rt_b+3
+        ldx rt_b+2
+        inx
+        sec
+        lda c64_gfh_line__args+8
+        bne @high
+        jmp @yc
+@high:  jmp @ys
+.ifndef C64_G3D_FAST {
+@xs:    lda zp_p1
+        ora (zp_p0),y
+        sta (zp_p0),y
+        dex
+        beq @done
+        lda zp_p2               ; err -= dy (the carry is clear: one more)
+        sbc rt_b+3
+        sta zp_p2
+        bcs @xsr
+        adc rt_b                ; err < 0: err += dx, one line up or down
+        sta zp_p2
+        jsr @ystep
+@xsr:   lsr zp_p1               ; one pixel to the right
+        bcc @xs
+        ror zp_p1               ; the next byte: the mask is $80 again
+        lda zp_p0               ; (the carry is clear)
+        adc #8
+        sta zp_p0
+        bcc @xs
+        inc zp_p0+1
+        clc
+        bcc @xs
+} .else {
+; With C64_G3D_FAST (the crate's feature `g3d-fast`): a piece of code for
+; each of the eight bits of a byte, with the mask in it, so that no mask
+; is shifted and tested: 29 cycles a pixel in place of 38, for 180 bytes.
+; The carry is set where a piece starts (err -= dy takes dy as it is).
+; rt_b+4: the pixels, while X finds the piece of the first pixel.
+@xs:    stx rt_b+4
+        lda rt_a
+        and #7
+        tax
+        lda @uhi,x
+        pha
+        lda @ulo,x
+        pha
+        ldx rt_b+4
+        sec
+        rts
+@uhi:   .byte >(@u0-1), >(@u1-1), >(@u2-1), >(@u3-1), >(@u4-1), >(@u5-1), >(@u6-1), >(@u7-1)
+@ulo:   .byte <(@u0-1), <(@u1-1), <(@u2-1), <(@u3-1), <(@u4-1), <(@u5-1), <(@u6-1), <(@u7-1)
+@udone: rts
+@u0:    lda (zp_p0),y
+        ora #$80
+        sta (zp_p0),y
+        dex
+        beq @udone
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @u1
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+        sec
+@u1:    lda (zp_p0),y
+        ora #$40
+        sta (zp_p0),y
+        dex
+        beq @udone
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @u2
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+        sec
+@u2:    lda (zp_p0),y
+        ora #$20
+        sta (zp_p0),y
+        dex
+        beq @udone
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @u3
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+        sec
+@u3:    lda (zp_p0),y
+        ora #$10
+        sta (zp_p0),y
+        dex
+        beq @udone
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @u4
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+        sec
+@u4:    lda (zp_p0),y
+        ora #$08
+        sta (zp_p0),y
+        dex
+        beq @uend
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @u5
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+        sec
+@u5:    lda (zp_p0),y
+        ora #$04
+        sta (zp_p0),y
+        dex
+        beq @uend
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @u6
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+        sec
+@u6:    lda (zp_p0),y
+        ora #$02
+        sta (zp_p0),y
+        dex
+        beq @uend
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @u7
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+        sec
+@u7:    lda (zp_p0),y
+        ora #$01
+        sta (zp_p0),y
+        dex
+        beq @uend
+        lda zp_p2
+        sbc rt_b+2
+        sta zp_p2
+        bcs @ubyte
+        adc rt_b
+        sta zp_p2
+        jsr @ystep
+@ubyte: clc                     ; the next byte
+        lda zp_p0
+        adc #8
+        sta zp_p0
+        bcc @uhere
+        inc zp_p0+1
+@uhere: sec
+        jmp @u0
+@uend:  rts
+}
+; Taking a flat line away: the whole byte is cleared, once for every byte
+; and line the line runs through (a pixel in the same byte of the same
+; line needs nothing).
+@xc:    lda #0
+        sta (zp_p0),y
+@xcn:   dex
+        beq @done
+        lda zp_p2               ; err -= dy (the carry is clear: one more)
+        sbc rt_b+3
+        sta zp_p2
+        bcs @xcs
+        adc rt_b                ; err < 0: err += dx, one line up or down
+        sta zp_p2
+        jsr @ystep
+        lsr zp_p1               ; one pixel to the right, in a new line
+        bcc @xc
+        bcs @xcb
+@xcs:   lsr zp_p1               ; one pixel to the right
+        bcc @xcn
+@xcb:   ror zp_p1               ; the next byte: the mask is $80 again
+        lda zp_p0               ; (the carry is clear)
+        adc #8
+        sta zp_p0
+        bcc @xc
+        inc zp_p0+1
+        clc
+        bcc @xc
+@done:  rts
+; Drawing a steep line has a loop for each direction, so that the next
+; line is one step of Y. Down: the carry is clear after the test of Y,
+; and err -= dx takes one more; up: the carry is set where the loop
+; starts.
+@ys:    bit rt_b+7
+        bmi @yu
+@yd:    lda zp_p1
+        ora (zp_p0),y
+        sta (zp_p0),y
+        dex
+        beq @ydone
+        iny                     ; one line down
+        cpy #8
+        bcc @yde
+        jsr @ynext
+@yde:   lda zp_p2               ; err -= dx
+        sbc rt_b+3
+        sta zp_p2
+        bcs @yd
+        adc rt_b+2              ; err < 0: err += dy, one pixel to the right
+        sta zp_p2
+        lsr zp_p1
+        bcc @yd
+        ror zp_p1
+        lda zp_p0               ; (the carry is clear)
+        adc #8
+        sta zp_p0
+        bcc @yd
+        inc zp_p0+1
+        bne @yd
+@ydone: rts
+@yu:    lda zp_p1
+        ora (zp_p0),y
+        sta (zp_p0),y
+        dex
+        beq @ydone
+        dey                     ; one line up
+        bpl @yue
+        jsr @yprev
+        sec
+@yue:   lda zp_p2               ; err -= dx
+        sbc rt_b
+        sta zp_p2
+        bcs @yu
+        adc rt_b+2              ; err < 0: err += dy, one pixel to the right
+        sta zp_p2
+        lsr zp_p1
+        bcc @yus
+        ror zp_p1
+        lda zp_p0               ; (the carry is clear)
+        adc #8
+        sta zp_p0
+        bcc @yus
+        inc zp_p0+1
+@yus:   sec
+        bcs @yu
+@yc:    lda #0                  ; taking a steep line away: the byte
+        sta (zp_p0),y
+        dex
+        beq @done
+        tya                     ; one line down or up (the carry is set)
+        adc rt_b+7
+        tay
+        cpy #8
+        bcc @yce
+        jsr @ycell
+        clc
+@yce:   lda zp_p2               ; err -= dx (the carry is clear: one more)
+        sbc rt_b+3
+        sta zp_p2
+        bcs @yc
+        adc rt_b+2              ; err < 0: err += dy, one pixel to the right
+        sta zp_p2
+        lsr zp_p1
+        bcc @ycc
+        ror zp_p1
+        lda zp_p0               ; (the carry is clear)
+        adc #8
+        sta zp_p0
+        bcc @ycc
+        inc zp_p0+1
+@ycc:   sec
+        bcs @yc
+
+; one line down or up
+@ystep: bit rt_b+7
+        bmi @up
+        iny
+        cpy #8
+        bne @step
+@ynext: ldy #0
+        clc
+        lda zp_p0
+        adc #$40
+        sta zp_p0
+        lda zp_p0+1
+        adc #1
+        sta zp_p0+1
+        rts
+; Y = 8: the first line of the next cell row; $ff: the last of the one before
+@ycell: tya
+        bpl @ynext
+        bmi @yprev
+@up:    dey
+        bpl @step
+@yprev: ldy #7
+        sec
+        lda zp_p0
+        sbc #$40
+        sta zp_p0
+        lda zp_p0+1
+        sbc #1
+        sta zp_p0+1
+@step:  rts

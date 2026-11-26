@@ -12,6 +12,22 @@
 //! gfx::text();
 //! ```
 //!
+//! # Double buffering
+//!
+//! [`Bitmap::double_buffer`] gives a second bitmap (at `$A000`, VIC bank
+//! 2): everything is drawn into the bitmap that is not on the screen, and
+//! [`Double::flip`] shows it.
+//!
+//! ```ignore
+//! let mut d = gfx::hires(Color::White, Color::Black).double_buffer();
+//! loop {
+//!     d.clear();
+//!     d.line(0, 0, x, 199);
+//!     hw::wait_frame();
+//!     d.flip();
+//! }
+//! ```
+//!
 //! # Clipping
 //!
 //! The drawing methods leave out what is outside the screen: a line may
@@ -71,6 +87,7 @@ fn matrix() -> *mut u8 {
     mem::addr(MATRIX)
 }
 
+#[cfg(not(target_os = "c64"))]
 static HIRES_MASK: [u8; 8] = [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01];
 
 /// A bitmap mode.
@@ -136,6 +153,13 @@ unsafe extern "C" {
     fn c64_gfm_area(x0: i16, y0: i16, x1: i16, y1: i16, pattern: u8);
     fn c64_gfm_rect(x: i16, y: i16, r: i16, b: i16, pattern: u8);
     fn c64_gfm_circle(cx: i16, cy: i16, r: i16, pattern: u8);
+    fn c64_gfh_point(x: u16, y: u8) -> u8;
+    // double buffering (rat/gfxtab.rat)
+    fn c64_gft_double();
+    fn c64_gft_single();
+    fn c64_gft_flip();
+    fn c64_gft_clear();
+    fn c64_gft_colors(value: u8);
 }
 
 /// The methods of [`Mode`] that call the assembly routines of a mode.
@@ -540,8 +564,15 @@ impl Bitmap<Hires> {
         if x >= 320 || y >= 200 {
             return false;
         }
-        let off = (y >> 3) as u16 * 320 + (x & !7) + (y & 7) as u16;
-        unsafe { *bitmap().add(off as usize) & HIRES_MASK[(x & 7) as usize] != 0 }
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_gfh_point(x, y) != 0
+        }
+        #[cfg(not(target_os = "c64"))]
+        {
+            let off = (y >> 3) as u16 * 320 + (x & !7) + (y & 7) as u16;
+            unsafe { *bitmap().add(off as usize) & HIRES_MASK[(x & 7) as usize] != 0 }
+        }
     }
 
     /// Sets the colours of all cells.
@@ -553,6 +584,128 @@ impl Bitmap<Hires> {
     pub fn set_cell_colors(&self, col: u8, row: u8, fg: Color, bg: Color) {
         let off = row as u16 * 40 + col as u16;
         unsafe { *matrix().add(off as usize) = (fg as u8) << 4 | bg as u8 };
+    }
+}
+
+/// Address of the second bitmap of a [`Double`] (RAM under the BASIC ROM,
+/// which is switched off while there are two bitmaps).
+pub const BITMAP2: u16 = 0xa000;
+/// Address of its colour matrix.
+pub const MATRIX2: u16 = 0x8000;
+
+impl<M: Mode> Bitmap<M> {
+    /// Starts double buffering: there are two bitmaps now, the one on the
+    /// screen and a hidden one, and everything is drawn into the hidden
+    /// one until [`Double::flip`] shows it. A picture that moves is then
+    /// never seen half drawn.
+    ///
+    /// The second bitmap is at `$A000` with its colour matrix at `$8000`
+    /// (VIC bank 2); it starts cleared, with the colours of the first.
+    /// `$A000` is under the BASIC ROM, which is switched off until the
+    /// double buffering ends (the program does not need it; the KERNAL
+    /// stays). Sprites need their pointers in both matrices (`$43F8`,
+    /// `$83F8`).
+    pub fn double_buffer(self) -> Double<M> {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_gft_double()
+        }
+        Double { g: self }
+    }
+}
+
+/// A [`Bitmap`] with double buffering ([`Bitmap::double_buffer`]): it
+/// draws like the bitmap (all its methods and the pen are there), into the
+/// hidden one of two. Dropping it shows the first bitmap and draws there
+/// again.
+///
+/// The two bitmaps take turns, so the hidden one holds the picture before
+/// the last: clear it for every picture ([`Double::clear`], five frames),
+/// or keep what was drawn into each of the two and take that away again
+/// (`examples/cube3d`).
+///
+/// On the host there is one bitmap, and `flip` does nothing.
+pub struct Double<M: Mode> {
+    g: Bitmap<M>,
+}
+
+impl<M: Mode> Double<M> {
+    /// Shows what was drawn; the bitmap that was on the screen is the one
+    /// that is drawn into now. It is one store to a register; call it
+    /// after [`hw::wait_frame`] for a change between two frames.
+    pub fn flip(&mut self) {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_gft_flip()
+        }
+    }
+
+    /// Clears the hidden bitmap.
+    pub fn clear(&self) {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_gft_clear()
+        }
+        #[cfg(not(target_os = "c64"))]
+        self.g.clear();
+    }
+
+    /// Ends double buffering: the first bitmap is on the screen and is
+    /// drawn into.
+    pub fn single_buffer(self) -> Bitmap<M> {
+        let g = Bitmap { pen: self.g.pen, _mode: PhantomData };
+        drop(self);
+        g
+    }
+}
+
+impl Double<Hires> {
+    /// Sets the colours of all cells of the hidden bitmap.
+    pub fn set_colors(&self, fg: Color, bg: Color) {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_gft_colors((fg as u8) << 4 | bg as u8)
+        }
+        #[cfg(not(target_os = "c64"))]
+        self.g.set_colors(fg, bg);
+    }
+
+    /// Sets the colours of one 8x8 cell (col 0-39, row 0-24) of the hidden
+    /// bitmap.
+    pub fn set_cell_colors(&self, col: u8, row: u8, fg: Color, bg: Color) {
+        #[cfg(target_os = "c64")]
+        {
+            // which of the two is drawn into (rat/gfxtab.rat)
+            let second: u8;
+            unsafe { crate::asm!("lda c64_gft_back", "sta {s}", s = out(reg) second) };
+            let matrix = if second != 0 { MATRIX2 } else { MATRIX };
+            mem::poke(matrix + row as u16 * 40 + col as u16, (fg as u8) << 4 | bg as u8);
+        }
+        #[cfg(not(target_os = "c64"))]
+        self.g.set_cell_colors(col, row, fg, bg);
+    }
+}
+
+impl<M: Mode> core::ops::Deref for Double<M> {
+    type Target = Bitmap<M>;
+
+    fn deref(&self) -> &Bitmap<M> {
+        &self.g
+    }
+}
+
+impl<M: Mode> core::ops::DerefMut for Double<M> {
+    fn deref_mut(&mut self) -> &mut Bitmap<M> {
+        &mut self.g
+    }
+}
+
+impl<M: Mode> Drop for Double<M> {
+    fn drop(&mut self) {
+        #[cfg(target_os = "c64")]
+        unsafe {
+            c64_gft_single()
+        }
     }
 }
 

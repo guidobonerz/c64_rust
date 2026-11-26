@@ -61,6 +61,17 @@ c64_gfh_set:
         sta (zp_p0),y
         rts
 
+; c64_gfh_point(x: u16, y: u8) -> u8: not 0 if the pixel is set (in the
+; bitmap that is drawn into); it must be on the screen.
+c64_gfh_point:
+        sta rt_a
+        stx rt_a+1
+        sty rt_a+2
+        jsr c64_gfh_addr
+        lda (zp_p0),y
+        and zp_p1
+        rts
+
 ; The byte and the mask of the pixel at rt_a.. (see above).
 c64_gfh_addr:
         lda rt_a+2

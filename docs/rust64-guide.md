@@ -188,15 +188,18 @@ and the border turns green. (Strings are ASCII in the source and are
 converted to PETSCII: in the C64's default character set both upper and
 lower case letters show as capitals.)
 
-The repository has more examples in `examples/`: `hello`, `sprites`,
-`drawing`, `music`, `dir` (the same as c64_go's), `joystick`, `scroller`
-(a horizontal soft scroll: `$D016` set by two raster interrupts for one
-text row), `rasterbars` (colour bars over the whole width of the screen: a
-stable raster interrupt in assembly, the colour table from Rust),
-`diagonal` (the whole screen scrolls diagonally over a pattern in
-a custom character set, with two screens that are swapped), `sd2iec`,
-`uci` and `wic64` (the extension crates of chapter 8) and `border`
-(the smallest program, without the library).
+The repository has more examples in `examples/`: `border` (the smallest
+program, without the library), `hello`, `joystick`, `ui` (boxes on the
+text screen), `music`, `sprites`, `drawing`, `rasterbars` (colour bars
+over the whole width of the screen: a stable raster interrupt in
+assembly, the colour table from Rust), `scroller` (a horizontal soft
+scroll: `$D016` set by two raster interrupts for one text row),
+`diagonal` (the whole screen scrolls diagonally over a pattern in a
+custom character set, with two screens that are swapped), `mandelbrot`,
+`julia` and `pi` (arithmetic), `cube3d` (a turning cube without its
+hidden edges, with double buffering), `perspective` (a turning bar with
+a vanishing point), `dir` (the same as c64_go's), and `sd2iec`, `uci`
+and `wic64` (the extension crates of chapter 8).
 
 ---
 
@@ -370,6 +373,20 @@ its own screen codes:
 placed static in RAM. Using `c64::gfx` places its colour matrix at
 `$4000`: then the program and its BSS must end below `$4000`.
 
+What the library takes above the program, when the program uses it:
+
+| Address | Used by | For |
+|---|---|---|
+| `$4000-$43E7` | `c64::gfx` | the colour matrix of the bitmap (VIC bank 1) |
+| `$6000-$7F3F` | `c64::gfx` | the bitmap |
+| `$8000-$83E7` | `Bitmap::double_buffer` | the colour matrix of the second bitmap (VIC bank 2) |
+| `$A000-$BF3F` | `Bitmap::double_buffer` | the second bitmap, under the BASIC ROM, which is switched off while there are two bitmaps |
+| `$9600-$9FFF` | `c64::g3d` | the table of squares, the work area of the corners, the table of the perspective |
+| `$F7`/`$F8` | `c64::g3d` | a fourth pointer in the zero page |
+
+Nothing checks the last three against what a program places there
+itself: keep them free.
+
 ### Start and exit
 
 The program starts like a BASIC program (`RUN`). The start code
@@ -478,7 +495,9 @@ shorter and faster (`pi`: 12% smaller, 15% fewer cycles). Where
 there is no room (many `#[c64::zp]` statics) they stay in the BSS. Machine code that you call (`sys::jsr`, a SID
 tune's player) must not use these addresses for its own data; `$FB-$FE`,
 the usual choice of such code, are the runtime's scratch pointers and may
-be overwritten by it between calls.
+be overwritten by it between calls. `c64::g3d` uses `$F7`/`$F8` as well
+(the KERNAL's pointer to the RS-232 input buffer, free while no RS-232
+channel is open).
 
 ---
 
@@ -513,6 +532,11 @@ static mut BUFFER: MaybeUninit<[u8; 1024]> = MaybeUninit::uninit();
   and its BSS grow into it:
   `rust64: the program overlaps BUFFER at $c000`.
 * Two placed statics must not overlap.
+
+`MaybeUninit::uninit()` is free everywhere: a local variable or a field
+that is set to it gets its room and no code (nothing is stored, and the
+program holds no bytes for it). The library uses it for buffers that an
+assembly routine fills, such as the name buffer of `c64::dos`.
 
 Hardware registers are better reached through `c64::hw` (it uses pointers
 to the fixed addresses), but `#[c64::at(0xd020)] static mut BORDER:
@@ -730,6 +754,13 @@ A KERNAL routine can be declared directly when its registers fit the
 convention (`c64_chrout = $ffd2` in the library's `kernal.rat`). Look at
 `lib/c64/src/rat/*.rat` for more examples.
 
+rat also assembles the stable undocumented opcodes of the 6510 (`lax`,
+`sax`, `dcp`, `isc`, `slo`, `sre`, `rla`, `rra`, `anc`, `alr`, `arr`,
+`sbx`). Use them in rat sources only: the pass that reads `c64::asm!`
+blocks does not know them. A rat source is one byte-array static, and no
+object can be larger than 32767 bytes on this target: split a longer
+source into two files (`g3d.rat` and `g3d_line.rat` in the library).
+
 ---
 
 ## 8. Library reference
@@ -875,6 +906,7 @@ gfx::text();
 | `text()` | back to the text screen |
 | `Bitmap<M>` | `pen`, `clear`, `plot(x, y)`, `line(x0, y0, x1, y1)`, `fline` (the same, fast), `hline(x0, x1, y)`, `vline(x, y0, y1)`, `rect`, `fill_rect`, `circle` |
 | `Bitmap<Hires>` | also `point(x, y)`, `set_colors`, `set_cell_colors(col, row, fg, bg)` |
+| `bitmap.double_buffer() -> Double<M>` | double buffering: draws like the bitmap, into the one of two that is not on the screen; `flip()` shows it, `clear()` clears the hidden one, `single_buffer()` (or dropping it) ends it |
 | `BITMAP`, `MATRIX` | `$6000`, `$4000` (VIC bank 1) |
 
 Coordinates are `i16`; pixels outside the screen are skipped. The mode is
@@ -904,6 +936,27 @@ program contains just the routines it uses, of the modes it draws in:
   column (about 35 cycles per pixel).
 * `circle`: eight pixels per step.
 
+**Double buffering.** `double_buffer()` adds a second bitmap at `$A000`
+with its colour matrix at `$8000` (VIC bank 2; the first is at `$6000`
+and `$4000` in bank 1). Everything is drawn into the bitmap that is not
+on the screen, and `flip()` shows it with one store to `$DD00`:
+
+```rust
+let mut d = gfx::hires(Color::White, Color::Black).double_buffer();
+loop {
+    d.clear();                  // the hidden bitmap: the picture before the last
+    d.line(0, 0, x, 199);
+    hw::wait_frame();
+    d.flip();
+}
+```
+
+`$A000` is under the BASIC ROM, which is switched off while there are two
+bitmaps (the KERNAL stays; leaving the program brings it back). The
+drawing routines need no test for it: they take every address from the
+table of cell rows, and `flip` changes that table. A program without
+double buffering has none of this code.
+
 **Without clipping.** All of this checks the coordinates against the
 screen. A program that never draws outside it can leave the checks out
 with the feature `gfx-unclipped` of the `c64` crate:
@@ -924,6 +977,142 @@ rectangles (`w` or `h` not positive) still draw nothing, and `point`
 still answers `false` outside the screen. On the host the stand-ins
 always clip.
 
+### c64::g3d — bodies in three dimensions
+
+```rust
+use c64::g3d::{self, Matrix, View};
+
+let mut g = gfx::hires(Color::White, Color::Black);
+let m = Matrix::rotation(20, 40, 0);      // angles: 256 is a full turn
+let mut view = View::<8, 6>::new();       // room for 8 corners and 6 faces
+view.project(&g3d::CUBE, &m, 160, 100);   // the corners on the screen
+view.draw(&g, &g3d::CUBE);                // the edges that are seen
+```
+
+| Item | Description |
+|---|---|
+| `Matrix` | a rotation, 9 signed bytes (127 is 1.0): `IDENTITY`, `rotation(ax, ay, az)`, `turn_x(a)`, `turn_y(a)`, `turn_z(a)`, `apply([x, y, z])` |
+| `sin(a)`, `cos(a)` | 127 * sine and cosine; 256 is a full turn |
+| `Shape { vertices, faces, edges }` | a body: corners `[x, y, z]`, faces (three corners each), edges (two corners and two faces each) |
+| `CUBE`, `PYRAMID` | two bodies |
+| `View::<V, F>::new()` | a body as it is seen: room for `V` corners (up to 64) and `F` faces (up to 127) |
+| `view.project(&shape, &m, cx, cy)` | turns the corners, puts them on the screen around (`cx`, `cy`), finds the faces that are seen |
+| `view.project_perspective(&shape, &m, cx, cy, depth)` | the same with a vanishing point: what is further away is smaller; `depth` 0 (none) to 127 |
+| `view.draw(&g, &shape)` | draws the edges that are seen with the pen of the hires bitmap `g` |
+| `view.points`, `view.is_seen(face)` | the corners on the screen; whether a face shows its front |
+| `NO_FACE` | for an edge without a (second) face |
+
+Coordinates are signed bytes: x to the right, y up, z towards the viewer.
+A corner must not be further than 120 from the origin. `project` is a
+parallel projection, one pixel for each unit, whatever the depth of a
+corner.
+
+**The vanishing point.** `project_perspective` draws what is further away
+smaller. `depth` says how much: the viewer is 256 * 128 / `depth` units in
+front of the origin (256 units for 127, 512 for 64), and what is at the
+origin keeps its size. A corner at depth `z` (towards the viewer) is
+drawn 256 / (256 - z * depth / 128) times as far from the centre, up to
+twice for the nearest corners; the picture of a body must stay less than
+256 pixels wide and high. Hidden edges work as before: a face is judged
+by its corners on the screen.
+
+```rust
+view.project_perspective(&g3d::CUBE, &m, 160, 100, 127);
+view.draw(&g, &g3d::CUBE);
+```
+
+`examples/perspective` turns a long bar (36 x 36 x 170) this way: the end
+that points to the viewer is large, the far end small. The fire button of
+joystick 2 shows the same bar as a parallel projection (`depth` 0).
+
+The size comes from a table (256 bytes, 32768 / n, filled when the
+routine is first used: 0.2 seconds, once). A corner then costs its depth
+(three more products), one multiplication for the depth and two for x
+and y: about 1000 cycles more than the parallel projection, 8000 a
+picture for the cube (`cargo c64 run --release --features perspective`
+in `examples/cube3d`: 101 000 cycles a picture, 9.8 pictures a second).
+A program that only calls `project` has none of this code.
+
+**Hidden edges.** A face is given by three of its corners,
+counter-clockwise when one looks at it from outside the body; it is seen
+when its front points to the viewer. An edge names the two faces it
+belongs to and is drawn when one of them is seen. For a convex body (a
+cube, a pyramid, a prism) these are exactly the visible edges. A body
+with dents shows the edges of all faces that point to the viewer, also
+where another part is in front of them. An edge with `NO_FACE` as its
+first face is always drawn, so a shape without faces is a wire model.
+
+```rust
+// a wedge: 6 corners, 5 faces, 9 edges
+static WEDGE: g3d::Shape = g3d::Shape {
+    vertices: &[[-50, -30, 40], [50, -30, 40], [50, -30, -40], [-50, -30, -40], [-50, 30, -40], [50, 30, -40]],
+    faces: &[[0, 3, 2], [0, 1, 5], [3, 4, 5], [0, 4, 3], [1, 2, 5]],
+    edges: &[
+        [0, 1, 0, 1], [1, 2, 0, 4], [2, 3, 0, 2], [3, 0, 0, 3], [4, 5, 1, 2],
+        [0, 4, 1, 3], [1, 5, 1, 4], [3, 4, 2, 3], [2, 5, 2, 4],
+    ],
+};
+```
+
+**Moving pictures.** Clearing the bitmap takes five frames. A body that
+moves is drawn again with pen 0 from the view it was drawn with, then
+the next view is drawn. `examples/cube3d` does that with double
+buffering (`gfx::hires(..).double_buffer()`), so that no picture is seen
+half drawn: each of the two bitmaps has its own view, the one that was
+drawn into it last. Make the matrix new from the angles for every
+picture; one that is turned on and on collects the rounding of every
+step.
+
+**Speed.** The cube of the example takes about 97 000 cycles a picture,
+10.2 pictures a second (the example does not wait for the frame before it
+changes the bitmaps, which is one store to a register; with
+`hw::wait_frame()` in front of `flip` it is about 7):
+
+| Part | Cycles a picture |
+|---|---:|
+| the lines: nine edges, taken away and drawn | 80 000 |
+| the corners on the screen and the faces | 11 000 |
+| the rotation matrix | 5 000 |
+
+All of it is assembly (`lib/c64/src/rat/g3d.rat`):
+
+* **The multiplication** of two signed bytes is two lookups in a table of
+  squares (`a * b = sq(|a + b|) - sq(|a - b|)`, with the signs as they
+  are: no factor is made positive first). A turn of the matrix is 12
+  multiplications (those by 0 are left out), a face 2.
+* **The corners** are taken entry by entry of the matrix: four pointers
+  are set once for an entry, and its product with the coordinate of every
+  corner is then two accesses with the coordinate as the index (64
+  cycles a product with its addition, 6 products a corner).
+* **Memory.** The table, the work area of the corners and the table of
+  the perspective are 2.5 KB of RAM at `$9600`-`$9FFF`, filled when the
+  first routine of the module runs,
+  and the corners use the zero-page bytes `$F7`/`$F8` (the KERNAL's for
+  RS-232) as a fourth pointer. Keep both free in a program that uses
+  `c64::g3d`, and do not call the module from an interrupt handler while
+  the main program is in it.
+* **The lines** of the edges have loops of their own, used by this module
+  only. Drawing sets pixels: 38 cycles a pixel for a flat line and 35 to
+  37 for a steep one, which has a loop for each direction (the general
+  line of `c64::gfx` writes any pattern through a mask and takes 47 and
+  50). Taking a picture away (pen 0) clears the
+  whole byte of the bitmap, once for every byte and line an edge runs
+  through: 24 cycles for a pixel that needs no new byte, 34 for a steep
+  line. **It takes the pixels next to an edge in the same byte with it**:
+  with several bodies, take all of them away first, then draw them all.
+  The loops draw the usual case: both ends on the screen, neither
+  horizontal nor vertical. Every other line goes to the line routine of
+  `c64::gfx`.
+* **The feature `g3d-fast`** of the `c64` crate draws flat lines with a
+  piece of code for each of the eight bits of a byte, with the mask in
+  it, so that no mask is shifted and tested: 29 cycles a pixel in place
+  of 38, for about 200 bytes more. The cube then takes 94 000 cycles
+  (10.5 pictures a second).
+
+  ```toml
+  c64 = { path = "../c64_rust/lib/c64", features = ["g3d-fast"] }
+  ```
+
 ### c64::sound — the SID
 
 ```rust
@@ -937,8 +1126,8 @@ v.note_off();
 
 | Item | Description |
 |---|---|
-| `Voice(n)` | `freq`, `pulse_width`, `adsr(a, d, s, r)`, `play(wave)`, `note_on(note, wave)`, `note_off()` |
-| `Note(n)` | 0 = C0 ... 95 = B7; `Note::new(octave, semitone)`, constants `C3`...`C5` (`CS4` = C#4), `freq()` (PAL) |
+| `Voice(n)` | `freq`, `pulse_width`, `adsr(a, d, s, r)`, `play(wave)`, `note_on(note, wave)`, `tone(freq, wave)`, `note_off()` |
+| `Note(n)` | 0 = C0 ... 95 = B7; `Note::new(octave, semitone)`, constants `C3`...`C5` (`CS4` = C#4), `freq()` (PAL; a `const fn`: in a constant or static it is computed at compile time) |
 | `reset()`, `volume(v)`, `filter(cutoff, resonance, voices, mode)` | |
 | waveforms | `TRIANGLE`, `SAWTOOTH`, `PULSE`, `NOISE`, bits `GATE`, `SYNC`, `RING`, `TEST` |
 | filter | `LOW_PASS`, `BAND_PASS`, `HIGH_PASS`, `VOICE3_OFF`, `FILTER_VOICE1..3` |
@@ -1300,22 +1489,112 @@ fn main() {
 }
 ```
 
+### A picture that moves: double buffering
+
+Drawing into the bitmap that is on the screen shows every picture half
+drawn. With two bitmaps the picture is drawn where it is not seen:
+
+```rust
+use c64::gfx;
+use c64::hw::{self, Color};
+use c64::kernal;
+
+#[c64::main]
+fn main() {
+    let mut d = gfx::hires(Color::White, Color::Black).double_buffer();
+    let mut x = 0i16;
+    while !kernal::stop() {
+        d.clear();                  // the hidden bitmap
+        d.line(x, 0, 319 - x, 199);
+        d.circle(160, 100, 40);
+        hw::wait_frame();           // change between two frames
+        d.flip();                   // show it; draw into the other one
+        x = (x + 4) % 320;
+    }
+    drop(d);                        // one bitmap again, BASIC ROM back
+    gfx::text();
+}
+```
+
+`clear` takes five frames. A program that knows what it drew takes that
+away instead (the next recipe).
+
+### A turning body
+
+`examples/cube3d`: a cube from `c64::g3d`, a new rotation matrix for every
+picture, hidden edges left out, two bitmaps. Each of the two bitmaps has
+the view that was drawn into it last; its edges are taken away with pen
+0, then the new view is drawn:
+
+```rust
+use c64::g3d::{self, Matrix, View};
+use c64::gfx;
+use c64::hw::Color;
+use c64::kernal;
+
+#[cfg(not(feature = "pyramid"))]
+use g3d::CUBE as BODY;
+#[cfg(feature = "pyramid")]
+use g3d::PYRAMID as BODY;
+
+#[c64::main]
+fn main() {
+    let mut g = gfx::hires(Color::LightGreen, Color::Black).double_buffer();
+    // what was drawn into each of the two bitmaps
+    let mut views = [View::<8, 6>::new(), View::<8, 6>::new()];
+    let mut hidden = 0;
+    let (mut ax, mut ay, mut az) = (0u8, 0u8, 0u8);
+    while !kernal::stop() {
+        let view = &mut views[hidden];
+        g.pen = 0;
+        view.draw(&g, &BODY);
+        #[cfg(not(feature = "perspective"))]
+        view.project(&BODY, &Matrix::rotation(ax, ay, az), 160, 100);
+        #[cfg(feature = "perspective")]
+        view.project_perspective(&BODY, &Matrix::rotation(ax, ay, az), 160, 100, 127);
+        g.pen = 1;
+        view.draw(&g, &BODY);
+        // (no wait for the frame: the change is one store to a register)
+        g.flip();
+        hidden ^= 1;
+        ax = ax.wrapping_add(3);
+        ay = ay.wrapping_add(5);
+        az = az.wrapping_add(1);
+    }
+    drop(g);
+    gfx::text();
+}
+```
+
+`examples/perspective` does the same with a body of its own (a `Shape` is
+three tables: corners, faces, edges) and `project_perspective`.
+
 ### Playing notes
 
 `examples/music` plays a melody on voice 1 and a bass on voice 2, timed
-with the jiffy clock:
+with the jiffy clock. The tune stores the frequencies of its notes, which
+are computed when the program is compiled (`Note::freq` is a `const fn`),
+and plays them with `tone`; `note_on(note, wave)` looks a note up when
+the program runs and brings the table of all 96 notes (192 bytes) into
+the program:
 
 ```rust
 use c64::hw::{self, Color};
 use c64::sound::{self, Note, Voice};
 use c64::{kernal, text};
 
-/// A note: pitch (`None` = rest) and length in jiffies.
+/// A note: its number (for the border colour), the SID's frequency value
+/// and the length in jiffies. The frequency is looked up when the program
+/// is compiled, so the program carries no table of all notes.
 #[derive(Clone, Copy)]
-struct Tone(Option<Note>, u8);
+struct Tone {
+    note: u8,
+    freq: u16,
+    len: u8,
+}
 
 const fn n(note: Note, len: u8) -> Tone {
-    Tone(Some(note), len)
+    Tone { note: note.0, freq: note.freq(), len }
 }
 
 static MELODY: [Tone; 26] = [
@@ -1329,7 +1608,7 @@ static MELODY: [Tone; 26] = [
     n(Note::C4, 60),
 ];
 
-static BASS: [Note; 4] = [Note::C3, Note::G3, Note::A3, Note::F3];
+static BASS: [u16; 4] = [Note::C3.freq(), Note::G3.freq(), Note::A3.freq(), Note::F3.freq()];
 
 fn wait(jiffies: u8) {
     let start = kernal::jiffies();
@@ -1349,13 +1628,11 @@ fn main() {
     bass.adsr(0, 4, 10, 6);
     for (i, t) in MELODY.iter().enumerate() {
         if i % 4 == 0 {
-            bass.note_on(BASS[(i / 4) % 4], sound::TRIANGLE);
+            bass.tone(BASS[(i / 4) % 4], sound::TRIANGLE);
         }
-        if let Some(note) = t.0 {
-            lead.note_on(note, sound::PULSE);
-            hw::vic().border.write(Color::from_u8(note.0));
-        }
-        wait(t.1 - 3);
+        lead.tone(t.freq, sound::PULSE);
+        hw::vic().border.write(Color::from_u8(t.note));
+        wait(t.len - 3);
         lead.note_off();
         wait(3);
     }
@@ -2009,6 +2286,9 @@ ok   gfx (debug)
 | `lib2` | function pointers, `at`/`zp` statics, exported statics, raster interrupts, SID tunes, sprites, sound, PETSCII literals |
 | `gfx` | hires and multicolour drawing, cell colours, bitmap mode |
 | `gfxu` | the same with the feature `gfx-unclipped`, everything on the screen |
+| `g3d` | `c64::g3d`: sine, rotation matrix, corners and faces against the numbers of the Rust version, edges on the bitmap |
+| `g3df` | the same with the feature `g3d-fast` |
+| `sd2iec` | `c64-sd2iec` and `c64::dos` against mimic's SD2IEC: directories, loading, the status, commands, the directory listing, a sequential file written and read back |
 
 A test program writes the number of the first failing check to the screen,
 so the snapshot (`rust64-e2e-<name>-<profile>.png` in the temp directory)
@@ -2125,17 +2405,17 @@ rust64 follows the phases in `PLAN.md`:
 | 1. Core backend: integers, control flow, calls, static frames | done |
 | 2. Language breadth: enums, structs, slices, closures, iterators, panics | done |
 | 3. Library I: `hw`, `mem`, `sys`, `kernal`, `text`, `fmt`, `input`, assembly, `at`/`zp`, PETSCII | done |
-| 4. Library II: `sprite`, `gfx`, `sound`, `irq`, `dos`, function pointers, D64 | done |
+| 4. Library II: `sprite`, `gfx` (with double buffering), `g3d`, `sound`, `irq`, `dos`, function pointers, D64 | done |
 | 5. Optimization: frame overlay, zero-page allocation, block layout, data-flow pass (values, ranges, liveness, copies, index registers, loop counters, steps and tests at the end of loops, invariant code out of loops), arguments in registers, inlining of small functions, pruning | done |
 | 6. Tooling: `cargo c64 new/test`, Rust source spans for rat errors, memory map, debugger labels, `c64::asm!` | |
 | 7. Extensions: recursion on a software stack, `alloc`, `dyn Trait`, `f32`, cartridges | |
 
 Code quality: the passes of chapter 10 make the release builds of the
-examples 20% smaller in total than the code generator alone gives
+examples 17% smaller in total than the code generator alone gives
 (`RUST64_NO_OPT=1`; `diagonal`: 1823 to 1265 bytes, `sd2iec`: 3175 to
 2225, `wic64`: 2389 to 1698). Compared with oscar64 `-Os`, an optimizing
 C compiler for the 6502, the fifteen examples that have a C port are
-4% smaller in total (eight smaller, seven larger; from 86% smaller to 79%
+5% smaller in total (eight smaller, seven larger; from 86% smaller to 51%
 larger, where the library brings more than the program needs), and
 every program that is timed needs fewer cycles (0.5% to 45%); against
 `-O2` and `-O3` one of them needs 6 to 9% more. The README has the

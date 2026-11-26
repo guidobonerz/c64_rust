@@ -176,7 +176,33 @@ fn main() {
             && mem::peek(gfx::BITMAP + 320) == 0x55
             && mem::peek(gfx::BITMAP + 328) == 0x40,
     );
-    // 18: the VIC is in bitmap mode, bank 1
+    // double buffering: what is drawn goes to the second bitmap ($A000)
+    // and is not on the screen; flip shows it (bank 2, matrix at $8000)
+    // and drawing goes to the first again; at the end the first is shown
+    {
+        let mut g = gfx::hires(Color::White, Color::Black);
+        g.plot(bb(0), 0);
+        let mut d = g.double_buffer();
+        check(mem::peek(gfx::BITMAP) == 0x80 && mem::peek(gfx::BITMAP2) == 0 && !d.point(0, 0));
+        d.line(bb(8), 0, 15, 0);
+        d.plot(bb(319), 199);
+        check(mem::peek(gfx::BITMAP2 + 8) == 0xff && mem::peek(gfx::BITMAP + 8) == 0 && d.point(319, 199));
+        check(mem::peek(gfx::BITMAP2 + 7999) == 0x01 && hw::vic().memory.read() & 0xfe == 0x08 && hw::cia2().pra.read() & 3 == 2);
+        d.flip();
+        check(hw::vic().memory.read() & 0xfe == 0x08 && hw::cia2().pra.read() & 3 == 1 && d.point(0, 0) && !d.point(319, 199));
+        d.plot(bb(1), 0);
+        d.clear();
+        check(mem::peek(gfx::BITMAP) == 0 && mem::peek(gfx::BITMAP2 + 8) == 0xff);
+        d.flip();
+        check(hw::vic().memory.read() & 0xfe == 0x08 && hw::cia2().pra.read() & 3 == 2 && d.point(8, 0));
+        d.flip();
+        let g = d.single_buffer();
+        g.plot(bb(2), 0);
+        check(hw::vic().memory.read() & 0xfe == 0x08 && hw::cia2().pra.read() & 3 == 2 && mem::peek(gfx::BITMAP) == 0x20);
+        // the BASIC ROM is back, and the colours went to both matrices
+        check(mem::peek(0x0001) & 7 == 7 && mem::peek(gfx::MATRIX2 + 999) == 0x10 && mem::peek(gfx::MATRIX + 999) == 0x10);
+    }
+    // the VIC is in bitmap mode, bank 1
     let v = hw::vic();
     check(v.control1.read() & 0x20 != 0 && hw::cia2().pra.read() & 3 == 2);
     gfx::text();

@@ -1,0 +1,1083 @@
+; c64::g3d: bodies of edges and faces on the hires bitmap: the rotation
+; matrix, the corners on the screen, which faces are seen, the edges
+; (calling convention: see c64::rat_source!).
+;
+; Numbers are signed bytes. In the matrix (9 bytes, row by row) and in the
+; sine table 127 is 1.0; the coordinates of a corner are -127 to 127, and a
+; corner must not be further than 120 from the origin. A product of two of
+; them has 16 bits; (sum + 64) / 128 brings a sum of products back to a
+; byte, rounded.
+;
+; rt_a: the factors of a product, rt_b: the sum of products (2 bytes; the
+; faces have a product of 3 bytes there). A multiplication uses X and Y.
+
+; The multiplication is two lookups in a table of squares:
+;   a * b = sq(a + b) - sq(|a - b|),  sq(n) = n * n / 4 (rounded down)
+; The table has sq(0) to sq(510), as two bytes each: the low bytes at
+; c64_g3d_sqlo, the high bytes at c64_g3d_sqhi. Below each of the two
+; there is sq(1) to sq(256) once more, going down: so the table can be
+; read at sums from -256 on, and sq(|n|) is one access for a signed n.
+; With the work area of the corners and the table of the perspective this
+; is 2.5 KB of RAM at $9600-$9FFF, filled when the first routine here runs
+; (c64_g3d_tables; the perspective's table when it is first used).
+c64_g3d_sqlo = $9700
+c64_g3d_sqhi = $9a00
+; The corners: a column of them (three times), the sums of the products
+; for up to three rows (64 corners each: low bytes, high bytes), and the
+; matrix.
+c64_g3d_vb = $9c00
+c64_g3d_acl = $9cc0
+c64_g3d_ach = $9d80
+c64_g3d_mx = $9e40
+; The perspective: for a depth z of -128 to 127 (at z + 128) the size of
+; what is there, 128 for 1.0: 32768 / (256 - z).
+c64_g3d_ptab = $9f00
+; a fourth pointer in the zero page, next to zp_p0 to zp_p2 (the KERNAL
+; has it for RS-232, which these programs do not use)
+c64_g3d_p3 = $f7
+
+; rt_a * rt_a+1 (two unsigned bytes): A (high byte) and rt_a+1 (low byte).
+c64_g3d_umul:
+        sec
+        lda rt_a
+        sbc rt_a+1
+        bcs @diff
+        eor #$ff
+        adc #1
+@diff:  tay                     ; |a - b|
+        clc
+        lda rt_a
+        adc rt_a+1
+        tax                     ; a + b, with the carry
+        bcs @big
+        sec
+        lda c64_g3d_sqlo,x
+        sbc c64_g3d_sqlo,y
+        sta rt_a+1
+        lda c64_g3d_sqhi,x
+        sbc c64_g3d_sqhi,y
+        rts
+@big:   lda c64_g3d_sqlo+256,x
+        sbc c64_g3d_sqlo,y
+        sta rt_a+1
+        lda c64_g3d_sqhi+256,x
+        sbc c64_g3d_sqhi,y
+        rts
+
+; Fills the table of squares, once. Leaves A, X and Y alone.
+;
+; sq(n + 1) = sq(n) + (n + 1) / 2. rt_b: sq (2 bytes), +2: the high bit
+; of n (the low byte is in X).
+c64_g3d_tables:
+        bit c64_g3d_ready
+        bmi @done
+        pha
+        txa
+        pha
+        tya
+        pha
+        lda #0
+        sta rt_b
+        sta rt_b+1
+        sta rt_b+2
+        tax
+@fill:  lda rt_b+2
+        bne @upper
+        lda rt_b
+        sta c64_g3d_sqlo,x
+        lda rt_b+1
+        sta c64_g3d_sqhi,x
+        jmp @next
+@upper: lda rt_b
+        sta c64_g3d_sqlo+256,x
+        lda rt_b+1
+        sta c64_g3d_sqhi+256,x
+@next:  inx
+        bne @half
+        inc rt_b+2
+@half:  lda rt_b+2
+        lsr
+        txa
+        ror                     ; (n + 1) / 2
+        clc
+        adc rt_b
+        sta rt_b
+        bcc @same
+        inc rt_b+1
+@same:  lda rt_b+2
+        cmp #2
+        bne @fill
+        ldx #0                  ; sq(1) to sq(256) below the tables
+        ldy #$ff
+@below: lda c64_g3d_sqlo+1,x
+        sta c64_g3d_sqlo-256,y
+        lda c64_g3d_sqhi+1,x
+        sta c64_g3d_sqhi-256,y
+        inx
+        dey
+        cpy #$ff
+        bne @below
+        dec c64_g3d_ready
+        lda #0
+        sta rt_b
+        sta rt_b+1
+        pla
+        tay
+        pla
+        tax
+        pla
+@done:  rts
+c64_g3d_ready:
+        .byte 0
+
+; Adds A * X (two signed bytes, -127 to 127) to the sum in rt_b. The table
+; of squares serves signed numbers as they are:
+;   a * b = sq(|a + b|) - sq(|a - b|)
+; A sum or difference of two signed bytes has nine bits: its sign is bit 7
+; of the low byte, turned around if the addition overflowed.
+c64_g3d_term:
+        sta rt_a
+        stx rt_a+1
+        tay
+        beq @none               ; times 0: nothing to add (the matrix
+        txa                     ; has many zeros before it is turned)
+        beq @none
+        clc
+        adc rt_a                ; a + b
+        bvs @sover
+        bpl @sidx
+        bmi @sneg
+@sover: bmi @sidx
+@sneg:  eor #$ff                ; negative: 0 - A
+        tax
+        inx
+        bne @diff               ; (never 0)
+@sidx:  tax
+@diff:  sec
+        lda rt_a
+        sbc rt_a+1              ; a - b
+        bvs @dover
+        bpl @didx
+        bmi @dneg
+@dover: bmi @didx
+@dneg:  eor #$ff
+        tay
+        iny
+        bne @sum
+@didx:  tay
+@sum:   clc
+        lda rt_b
+        adc c64_g3d_sqlo,x
+        sta rt_b
+        lda rt_b+1
+        adc c64_g3d_sqhi,x
+        sta rt_b+1
+        sec
+        lda rt_b
+        sbc c64_g3d_sqlo,y
+        sta rt_b
+        lda rt_b+1
+        sbc c64_g3d_sqhi,y
+        sta rt_b+1
+@none:  rts
+
+; A = (the sum in rt_b + 64) / 128; the sum is 0 again.
+c64_g3d_round:
+        clc
+        lda rt_b
+        adc #$40
+        tax
+        lda rt_b+1
+        adc #0
+        sta rt_b+1
+        txa
+        asl                     ; its bit 7 is bit 0 of the result
+        lda rt_b+1
+        rol
+        ldx #0
+        stx rt_b
+        stx rt_b+1
+        rts
+
+; c64_g3d_sin(angle: u8) -> i8: 127 * the sine of the angle, where 256 is
+; the full circle. The table (c64_g3d_quarter, a static of g3d.rs) has the
+; first quarter, 0 to 64. c64_g3d_cos(angle: u8) -> i8: the cosine.
+c64_g3d_cos:
+        clc
+        adc #$40
+c64_g3d_sin:
+        tay
+        and #$7f                ; the place in the half wave
+        cmp #$41
+        bcc @up
+        eor #$7f                ; the second quarter: 128 - place
+        adc #0                  ; (the carry is set)
+@up:    tax
+        lda c64_g3d_quarter,x
+        cpy #$80
+        bcc @done
+        eor #$ff                ; the second half: negative
+        adc #0                  ; (the carry is set)
+@done:  rts
+
+; c64_g3d_turn(m: *mut i8, axis: u8, angle: u8): turns what the matrix
+; does further, by the angle about the axis x (0), y (1) or z (2): two
+; rows i and j are replaced, for every column,
+;   m[i] = cos * m[i] - sin * m[j]
+;   m[j] = sin * m[i] + cos * m[j]
+;
+; rt_t: the offsets of the two rows (2 bytes), +2: sin, +3: cos, +4: -sin,
+; +5: columns left, +6/+7: the two numbers of a column.
+c64_g3d_turn:
+        jsr c64_g3d_tables
+        sta zp_p0
+        stx zp_p0+1
+        lda c64_g3d_turn__args+3
+; The same for the matrix at zp_p0, the axis in Y and the angle in A.
+c64_g3d_turn1:
+        pha
+        lda @rowi,y
+        sta rt_t
+        lda @rowj,y
+        sta rt_t+1
+        pla
+        pha
+        jsr c64_g3d_sin
+        sta rt_t+2
+        eor #$ff
+        clc
+        adc #1
+        sta rt_t+4
+        pla
+        jsr c64_g3d_cos
+        sta rt_t+3
+        lda #0
+        sta rt_b
+        sta rt_b+1
+        lda #3
+        sta rt_t+5
+@col:   ldy rt_t
+        lda (zp_p0),y
+        sta rt_t+6
+        ldy rt_t+1
+        lda (zp_p0),y
+        sta rt_t+7
+        lda rt_t+6
+        ldx rt_t+3
+        jsr c64_g3d_term
+        lda rt_t+7
+        ldx rt_t+4
+        jsr c64_g3d_term
+        jsr c64_g3d_round
+        ldy rt_t
+        sta (zp_p0),y
+        lda rt_t+6
+        ldx rt_t+2
+        jsr c64_g3d_term
+        lda rt_t+7
+        ldx rt_t+3
+        jsr c64_g3d_term
+        jsr c64_g3d_round
+        ldy rt_t+1
+        sta (zp_p0),y
+        inc rt_t
+        inc rt_t+1
+        dec rt_t+5
+        bne @col
+        rts
+@rowi:  .byte 3, 6, 0
+@rowj:  .byte 6, 0, 3
+
+; c64_g3d_rotation(m: *mut i8, ax: u8, ay: u8, az: u8): the matrix of the
+; turn by ax about the x axis, then ay about y, then az about z.
+c64_g3d_rotation:
+        jsr c64_g3d_tables
+        sta zp_p0
+        stx zp_p0+1
+        ldy #8
+@one:   lda @unit,y
+        sta (zp_p0),y
+        dey
+        bpl @one
+        iny
+@axis:  lda c64_g3d_rotation__args+2,y
+        beq @none               ; no turn
+        sty rt_r+7
+        jsr c64_g3d_turn1
+        ldy rt_r+7
+@none:  iny
+        cpy #3
+        bne @axis
+        rts
+@unit:  .byte 127, 0, 0, 0, 127, 0, 0, 0, 127
+
+; A = the row of the matrix (zp_p0) at offset Y times the corner in rt_t
+; (3 bytes); Y is at the next row then. rt_t+6: the index in the corner,
+; rt_t+7: Y.
+c64_g3d_row:
+        lda #0
+        sta rt_b
+        sta rt_b+1
+        sta rt_t+6
+@part:  ldx rt_t+6
+        lda rt_t,x
+        tax
+        lda (zp_p0),y
+        sty rt_t+7              ; (the multiplication uses Y)
+        jsr c64_g3d_term
+        ldy rt_t+7
+        iny
+        inc rt_t+6
+        lda rt_t+6
+        cmp #3
+        bne @part
+        jmp c64_g3d_round
+
+; c64_g3d_apply(m: *const i8, v: *const i8, out: *mut i8): the corner v
+; (x, y, z) turned by the matrix. rt_t+4: the row.
+c64_g3d_apply:
+        jsr c64_g3d_tables
+        sta zp_p0
+        stx zp_p0+1
+        lda c64_g3d_apply__args+2
+        sta zp_p1
+        lda c64_g3d_apply__args+3
+        sta zp_p1+1
+        lda c64_g3d_apply__args+4
+        sta zp_p2
+        lda c64_g3d_apply__args+5
+        sta zp_p2+1
+        ldy #2
+@load:  lda (zp_p1),y
+        sta rt_t,y
+        dey
+        bpl @load
+        iny
+        sty rt_t+4
+@rows:  lda rt_t+4
+        asl
+        adc rt_t+4              ; (the carry is clear)
+        tay
+        jsr c64_g3d_row
+        ldy rt_t+4
+        sta (zp_p2),y
+        iny
+        sty rt_t+4
+        cpy #3
+        bne @rows
+        rts
+
+; The corners through the matrix: for every corner (the arguments of
+; c64_g3d_project: c64_g3d_project__args+2 the corners, +4 their number, at most
+; 64) the sums row * corner + 64 for the first X rows of the matrix at
+; zp_p0 (2, or 3 with the depth), in c64_g3d_acl/ach: row 0 from 0, row 1
+; from 64, row 2 from 128.
+;
+; The products are taken entry by entry of the matrix: for an entry m,
+; four pointers are set once (the table of squares at m and at -m, low
+; and high bytes), and then m * c for the coordinate c of every corner is
+; two accesses with c as the index:
+;   m * c = sq(|m + c|) - sq(|m - c|)
+; The pointers start 128 below, and the index is c with its sign bit
+; turned (c + 128), so that both are bytes without a sign.
+;
+; rt_t+6: the column, +7: the rows. rt_a: the low byte of a product, +2:
+; m, +3: where the sums of a row end.
+c64_g3d_sums:
+        stx rt_t+7
+        ldy #8
+@rows:  lda (zp_p0),y
+        sta c64_g3d_mx,y
+        dey
+        bpl @rows
+        ldx c64_g3d_project__args+4
+        bne @some
+        rts
+@some:  lda #$40                ; the sums start with the 64 that rounds
+        sta c64_g3d_acl-1,x
+        sta c64_g3d_acl+63,x
+        sta c64_g3d_acl+127,x
+        lda #0
+        sta c64_g3d_ach-1,x
+        sta c64_g3d_ach+63,x
+        sta c64_g3d_ach+127,x
+        dex
+        bne @some
+        stx rt_t+6
+@col:   clc                     ; this column of the corners
+        lda c64_g3d_project__args+2
+        adc rt_t+6
+        sta zp_p1
+        lda c64_g3d_project__args+3
+        adc #0
+        sta zp_p1+1
+        ldx #0
+        ldy #0
+@copy:  lda (zp_p1),y
+        eor #$80
+        sta c64_g3d_vb,x
+        sta c64_g3d_vb+64,x
+        sta c64_g3d_vb+128,x
+        iny
+        iny
+        iny
+        inx
+        cpx c64_g3d_project__args+4
+        bne @copy
+        ldx rt_t+6
+        lda c64_g3d_mx,x
+        ldx #0
+        jsr @pass
+        ldx rt_t+6
+        lda c64_g3d_mx+3,x
+        ldx #64
+        jsr @pass
+        lda rt_t+7
+        cmp #3
+        bcc @next
+        ldx rt_t+6
+        lda c64_g3d_mx+6,x
+        ldx #128
+        jsr @pass
+@next:  inc rt_t+6
+        lda rt_t+6
+        cmp #3
+        bne @col
+        rts
+; Adds A (an entry of the matrix) times the column to the sums from X on.
+@pass:  sta rt_a+2
+        eor #$80                ; the table at m - 128 ...
+        sta zp_p0
+        sta zp_p2
+        sec
+        lda #$80                ; ... and at -m - 128
+        sbc rt_a+2
+        sta zp_p1
+        sta c64_g3d_p3
+        lda #>(c64_g3d_sqlo-128)
+        sta zp_p0+1
+        sta zp_p1+1
+        lda #>(c64_g3d_sqhi-128)
+        sta zp_p2+1
+        sta c64_g3d_p3+1
+        clc
+        txa
+        adc c64_g3d_project__args+4
+        sta rt_a+3
+@corner:
+        ldy c64_g3d_vb,x
+        sec
+        lda (zp_p0),y
+        sbc (zp_p1),y
+        sta rt_a
+        lda (zp_p2),y
+        sbc (c64_g3d_p3),y
+        tay
+        clc
+        lda rt_a
+        adc c64_g3d_acl,x
+        sta c64_g3d_acl,x
+        tya
+        adc c64_g3d_ach,x
+        sta c64_g3d_ach,x
+        inx
+        cpx rt_a+3
+        bne @corner
+        rts
+
+; c64_g3d_project(m: *const i8, corners: *const i8, n: u8, points: *mut
+; Point, cx: i16, cy: i16): the n corners (x, y, z; up to 64) through the
+; matrix and onto the screen, seen from the front (z towards the viewer),
+; every corner at its place whatever its depth: a point is x and y as two
+; 16-bit numbers,
+;   x = cx + row 0 * corner,  y = cy - row 1 * corner
+c64_g3d_project:
+        jsr c64_g3d_tables
+        sta zp_p0
+        stx zp_p0+1
+        ldx #2
+        jsr c64_g3d_sums
+        ldx c64_g3d_project__args+4
+        bne @some
+        rts
+@some:  lda c64_g3d_project__args+5
+        sta zp_p2
+        lda c64_g3d_project__args+6
+        sta zp_p2+1
+        ldx #0
+@point: lda c64_g3d_acl,x       ; x = cx + sum / 128
+        asl
+        lda c64_g3d_ach,x
+        rol
+        ldy #0
+        cmp #$80
+        bcc @xpos
+        dey
+@xpos:  sty rt_a+1
+        clc
+        adc c64_g3d_project__args+7
+        ldy #0
+        sta (zp_p2),y
+        lda rt_a+1
+        adc c64_g3d_project__args+8
+        iny
+        sta (zp_p2),y
+        lda c64_g3d_acl+64,x    ; y = cy - sum / 128
+        asl
+        lda c64_g3d_ach+64,x
+        rol
+        sta rt_a
+        ldy #0
+        cmp #$80
+        bcc @ypos
+        dey
+@ypos:  sty rt_a+1
+        sec
+        lda c64_g3d_project__args+9
+        sbc rt_a
+        ldy #2
+        sta (zp_p2),y
+        lda c64_g3d_project__args+10
+        sbc rt_a+1
+        iny
+        sta (zp_p2),y
+        clc
+        lda zp_p2
+        adc #4
+        sta zp_p2
+        bcc @same
+        inc zp_p2+1
+@same:  inx
+        cpx c64_g3d_project__args+4
+        bne @point
+        rts
+
+; The same with a vanishing point (the arguments of c64_g3d_project, the
+; matrix in A/X; rt_r+7: how deep the picture is, 0 to 127): what is
+; further away is smaller. With z the depth of a corner (row 2 * corner),
+;   size = 256 / (256 - z * depth / 128)        (from c64_g3d_ptab)
+;   x = cx + row 0 * corner * size,  y = cy - row 1 * corner * size
+; so the viewer is 256 * 128 / depth in front of the origin, and what is at
+; the origin has its size. With depth 0 it is c64_g3d_project.
+;
+; rt_t+4: the size (128 is 1.0), +5: the corner. rt_r+5: the offset in the
+; point, +6: the sign of a number.
+c64_g3d_pproject:
+        jsr c64_g3d_tables
+        jsr c64_g3d_ptabs
+        sta zp_p0
+        stx zp_p0+1
+        ldx #3
+        jsr c64_g3d_sums
+        lda c64_g3d_project__args+4
+        bne @some
+        rts
+@some:  lda c64_g3d_project__args+5
+        sta zp_p2
+        lda c64_g3d_project__args+6
+        sta zp_p2+1
+        lda #0
+        sta rt_b
+        sta rt_b+1
+        tax
+@point: stx rt_t+5
+        lda c64_g3d_acl+128,x   ; z
+        asl
+        lda c64_g3d_ach+128,x
+        rol
+        ldx rt_r+7
+        jsr c64_g3d_term
+        jsr c64_g3d_round       ; z * depth / 128
+        eor #$80
+        tay
+        lda c64_g3d_ptab,y
+        sta rt_t+4
+        ldx rt_t+5
+        lda c64_g3d_acl,x
+        asl
+        lda c64_g3d_ach,x
+        rol
+        ldy #0
+        jsr @place
+        ldx rt_t+5
+        lda c64_g3d_acl+64,x
+        asl
+        lda c64_g3d_ach+64,x
+        rol
+        eor #$ff                ; y goes down on the screen
+        clc
+        adc #1
+        ldy #2
+        jsr @place
+        clc
+        lda zp_p2
+        adc #4
+        sta zp_p2
+        bcc @same
+        inc zp_p2+1
+@same:  ldx rt_t+5
+        inx
+        cpx c64_g3d_project__args+4
+        bne @point
+        rts
+; The number of the point at offset Y (0: x, 2: y) = its centre + A * size
+@place: sty rt_r+5
+        sta rt_r+6
+        tax                     ; (its sign)
+        bpl @plus
+        eor #$ff
+        clc
+        adc #1
+@plus:  sta rt_a
+        lda rt_t+4
+        sta rt_a+1
+        jsr c64_g3d_umul        ; A: high, rt_a+1: low
+        tax
+        clc
+        lda rt_a+1
+        adc #$40
+        sta rt_a+1
+        txa
+        adc #0
+        asl rt_a+1
+        rol                     ; (product + 64) / 128: up to 253
+        ldy rt_r+5
+        bit rt_r+6
+        bmi @less
+        clc
+        adc c64_g3d_project__args+7,y
+        sta (zp_p2),y
+        lda c64_g3d_project__args+8,y
+        adc #0
+        iny
+        sta (zp_p2),y
+        rts
+@less:  sta rt_a
+        sec
+        lda c64_g3d_project__args+7,y
+        sbc rt_a
+        sta (zp_p2),y
+        lda c64_g3d_project__args+8,y
+        sbc #0
+        iny
+        sta (zp_p2),y
+        rts
+
+; Fills the table of the perspective, once: 32768 / n for n = 384 down to
+; 129, a division of 16 bits each. Leaves A and X alone.
+;
+; rt_b: n (2 bytes), +2: the number that is divided, then the result (2
+; bytes), +4: the rest (2 bytes).
+c64_g3d_ptabs:
+        bit c64_g3d_pready
+        bmi @done
+        pha
+        txa
+        pha
+        lda #<384
+        sta rt_b
+        lda #>384
+        sta rt_b+1
+        ldy #0
+@entry: lda #0
+        sta rt_b+2
+        sta rt_b+4
+        sta rt_b+5
+        lda #$80
+        sta rt_b+3
+        ldx #16
+@bit:   asl rt_b+2
+        rol rt_b+3
+        rol rt_b+4
+        rol rt_b+5
+        sec
+        lda rt_b+4
+        sbc rt_b
+        pha
+        lda rt_b+5
+        sbc rt_b+1
+        bcc @small
+        sta rt_b+5
+        pla
+        sta rt_b+4
+        inc rt_b+2
+        bne @count              ; (always)
+@small: pla
+@count: dex
+        bne @bit
+        lda rt_b+2
+        sta c64_g3d_ptab,y
+        lda rt_b                ; the next n is one less
+        bne @low
+        dec rt_b+1
+@low:   dec rt_b
+        iny
+        bne @entry
+        dec c64_g3d_pready
+        lda #0
+        sta rt_b
+        sta rt_b+1
+        pla
+        tax
+        pla
+@done:  rts
+c64_g3d_pready:
+        .byte 0
+
+; c64_g3d_faces(points: *const Point, faces: *const [u8; 3], n: u8,
+; seen: *mut u8): for each of the n faces 1 if its front is seen, else 0.
+; A face is three of its corners (their numbers), counter-clockwise when
+; one looks at its front; on the screen, where y goes down, they are then
+; clockwise:
+;   (bx - ax) * (cy - ay) < (by - ay) * (cx - ax)
+; The corners of a face must be less than 256 pixels apart, and there can
+; be 64 corners.
+;
+; rt_r: the first corner (4 bytes), +4: the left product (3 bytes).
+; rt_t: the sides from it to the second (x, y) and the third corner, as
+; 16-bit numbers. rt_b: a product, 3 bytes with its sign.
+c64_g3d_faces:
+        jsr c64_g3d_tables
+        sta zp_p0
+        stx zp_p0+1
+        lda c64_g3d_faces__args+2
+        sta zp_p1
+        lda c64_g3d_faces__args+3
+        sta zp_p1+1
+        lda c64_g3d_faces__args+5
+        sta zp_p2
+        lda c64_g3d_faces__args+6
+        sta zp_p2+1
+@face:  lda c64_g3d_faces__args+4
+        bne @some
+        rts
+@some:  dec c64_g3d_faces__args+4
+        ldy #0
+        lda (zp_p1),y
+        asl
+        asl
+        tay
+        ldx #0
+@first: lda (zp_p0),y
+        sta rt_r,x
+        iny
+        inx
+        cpx #4
+        bne @first
+        ldx #0
+        ldy #1
+@side:  sty rt_a+2
+        lda (zp_p1),y
+        asl
+        asl
+        tay
+        sec
+        lda (zp_p0),y
+        sbc rt_r
+        sta rt_t,x
+        iny
+        lda (zp_p0),y
+        sbc rt_r+1
+        sta rt_t+1,x
+        iny
+        sec
+        lda (zp_p0),y
+        sbc rt_r+2
+        sta rt_t+2,x
+        iny
+        lda (zp_p0),y
+        sbc rt_r+3
+        sta rt_t+3,x
+        ldy rt_a+2
+        iny
+        inx
+        inx
+        inx
+        inx
+        cpx #8
+        bne @side
+        ldx #0
+        ldy #6
+        jsr @prod
+        ldx #2
+@keep:  lda rt_b,x
+        sta rt_r+4,x
+        dex
+        bpl @keep
+        ldx #2
+        ldy #4
+        jsr @prod
+        lda rt_r+4              ; the left product less the right one
+        cmp rt_b
+        lda rt_r+5
+        sbc rt_b+1
+        lda rt_r+6
+        sbc rt_b+2
+        asl
+        lda #0
+        rol                     ; 1 if it is negative
+        ldy #0
+        sta (zp_p2),y
+        inc zp_p2
+        bne @vis
+        inc zp_p2+1
+@vis:   clc
+        lda zp_p1
+        adc #3
+        sta zp_p1
+        bcc @more
+        inc zp_p1+1
+@more:  jmp @face
+; rt_b (3 bytes, signed) = the 16-bit numbers at rt_t,x times rt_t,y
+@prod:  lda rt_t+1,x
+        eor rt_t+1,y
+        sta rt_a+3
+        lda rt_t+1,x
+        bpl @xplus
+        sec
+        lda #0
+        sbc rt_t,x
+        bcc @xset               ; (always, but for 0)
+@xplus: lda rt_t,x
+@xset:  sta rt_a
+        lda rt_t+1,y
+        bpl @yplus
+        sec
+        lda #0
+        sbc rt_t,y
+        bcc @yset
+@yplus: lda rt_t,y
+@yset:  sta rt_a+1
+        jsr c64_g3d_umul
+        sta rt_b+1
+        lda rt_a+1
+        sta rt_b
+        lda #0
+        sta rt_b+2
+        bit rt_a+3
+        bpl @plus
+        sec
+        lda #0
+        sbc rt_b
+        sta rt_b
+        lda #0
+        sbc rt_b+1
+        sta rt_b+1
+        lda #0
+        sbc #0
+        sta rt_b+2
+@plus:  rts
+
+; c64_g3d_edges(points: *const Point, edges: *const [u8; 4], n: u8,
+; seen: *const u8, pattern: u8): draws the edges that are seen, as hires
+; lines with the pattern (c64_g3d_line). An edge is its two corners and the two faces it
+; belongs to ($ff: no face); it is drawn if one of the faces is seen, or
+; if it has no first face.
+;
+; The arguments move on with the edges: the line routine uses the
+; registers.
+c64_g3d_edges:
+@edge:  lda c64_g3d_edges__args+4
+        bne @some
+        rts
+@some:  dec c64_g3d_edges__args+4
+        lda c64_g3d_edges__args+2
+        sta zp_p0
+        lda c64_g3d_edges__args+3
+        sta zp_p0+1
+        lda c64_g3d_edges__args+5
+        sta zp_p1
+        lda c64_g3d_edges__args+6
+        sta zp_p1+1
+        ldy #2
+        lda (zp_p0),y
+        bmi @draw
+        tay
+        lda (zp_p1),y
+        bne @draw
+        ldy #3
+        lda (zp_p0),y
+        bmi @skip
+        tay
+        lda (zp_p1),y
+        beq @skip
+@draw:  lda c64_g3d_edges__args
+        sta zp_p1
+        lda c64_g3d_edges__args+1
+        sta zp_p1+1
+        ldy #1
+        lda (zp_p0),y
+        asl
+        asl
+        pha
+        dey
+        lda (zp_p0),y
+        asl
+        asl
+        tay
+        ldx #0
+@from:  lda (zp_p1),y
+        sta c64_gfh_line__args,x
+        iny
+        inx
+        cpx #4
+        bne @from
+        pla
+        tay
+@to:    lda (zp_p1),y
+        sta c64_gfh_line__args,x
+        iny
+        inx
+        cpx #8
+        bne @to
+        lda c64_g3d_edges__args+7
+        sta c64_gfh_line__args+8
+        jsr c64_g3d_line
+@skip:  clc
+        lda c64_g3d_edges__args+2
+        adc #4
+        sta c64_g3d_edges__args+2
+        bcc @edge
+        inc c64_g3d_edges__args+3
+        jmp @edge
+
+; A view (g3d.rs: View) is the room it has for corners and for faces (one
+; byte each), then the points of the corners (4 bytes each), then one byte
+; for each face. A shape (Shape) is three slices, each a pointer and a
+; length of two bytes: the corners, the faces, the edges.
+
+; c64_g3d_view(view: *mut View, shape: *const Shape, m: *const i8,
+; cx: i16, cy: i16): the corners of the shape on the screen
+; (c64_g3d_project) and its faces that are seen (c64_g3d_faces), as far as
+; the view has room.
+;
+; c64_g3d_viewp (the same arguments, and depth: u8): the same with a
+; vanishing point (c64_g3d_pproject); it is only in programs that call it.
+c64_g3d_viewp:
+        ldx #9
+@copy:  lda c64_g3d_viewp__args,x
+        sta c64_g3d_view__args,x
+        dex
+        bpl @copy
+        lda c64_g3d_viewp__args+10
+        sta rt_r+7
+        lda c64_g3d_view__args
+        ldx c64_g3d_view__args+1
+        jsr c64_g3d_vset
+        lda c64_g3d_project__args
+        ldx c64_g3d_project__args+1
+        jsr c64_g3d_pproject
+        lda c64_g3d_faces__args
+        ldx c64_g3d_faces__args+1
+        jmp c64_g3d_faces
+c64_g3d_view:
+        jsr c64_g3d_vset
+        lda c64_g3d_project__args
+        ldx c64_g3d_project__args+1
+        jsr c64_g3d_project
+        lda c64_g3d_faces__args
+        ldx c64_g3d_faces__args+1
+        jmp c64_g3d_faces
+; The arguments of c64_g3d_project and c64_g3d_faces from those of
+; c64_g3d_view (the view in A/X).
+c64_g3d_vset:
+        sta zp_p0
+        stx zp_p0+1
+        lda c64_g3d_view__args+2
+        sta zp_p1
+        lda c64_g3d_view__args+3
+        sta zp_p1+1
+        lda c64_g3d_view__args+4
+        sta c64_g3d_project__args
+        lda c64_g3d_view__args+5
+        sta c64_g3d_project__args+1
+        ldy #0
+        lda (zp_p1),y
+        sta c64_g3d_project__args+2
+        iny
+        lda (zp_p1),y
+        sta c64_g3d_project__args+3
+        iny
+        lda (zp_p1),y           ; the corners of the shape,
+        ldy #0
+        cmp (zp_p0),y
+        bcc @corners
+        lda (zp_p0),y           ; or as many as there is room for
+@corners:
+        sta c64_g3d_project__args+4
+        clc
+        lda zp_p0
+        adc #2
+        sta c64_g3d_project__args+5
+        sta c64_g3d_faces__args
+        lda zp_p0+1
+        adc #0
+        sta c64_g3d_project__args+6
+        sta c64_g3d_faces__args+1
+        ldx #3
+@centre:
+        lda c64_g3d_view__args+6,x
+        sta c64_g3d_project__args+7,x
+        dex
+        bpl @centre
+        ldy #4
+        lda (zp_p1),y
+        sta c64_g3d_faces__args+2
+        iny
+        lda (zp_p1),y
+        sta c64_g3d_faces__args+3
+        iny
+        lda (zp_p1),y
+        ldy #1
+        cmp (zp_p0),y
+        bcc @faces
+        lda (zp_p0),y
+@faces: sta c64_g3d_faces__args+4
+        dey
+        lda (zp_p0),y           ; the faces are behind the points
+        asl
+        asl
+        adc c64_g3d_faces__args ; (the carry is clear)
+        sta c64_g3d_faces__args+5
+        lda c64_g3d_faces__args+1
+        adc #0
+        sta c64_g3d_faces__args+6
+        rts
+
+; c64_g3d_draw(view: *const View, shape: *const Shape, pattern: u8): the
+; edges of the shape that are seen in the view (c64_g3d_edges).
+c64_g3d_draw:
+        sta zp_p0
+        stx zp_p0+1
+        lda c64_g3d_draw__args+2
+        sta zp_p1
+        lda c64_g3d_draw__args+3
+        sta zp_p1+1
+        clc
+        lda zp_p0
+        adc #2
+        sta c64_g3d_edges__args
+        lda zp_p0+1
+        adc #0
+        sta c64_g3d_edges__args+1
+        ldy #8
+        lda (zp_p1),y
+        sta c64_g3d_edges__args+2
+        iny
+        lda (zp_p1),y
+        sta c64_g3d_edges__args+3
+        iny
+        lda (zp_p1),y
+        sta c64_g3d_edges__args+4
+        ldy #0
+        lda (zp_p0),y
+        asl
+        asl
+        adc c64_g3d_edges__args ; (the carry is clear)
+        sta c64_g3d_edges__args+5
+        lda c64_g3d_edges__args+1
+        adc #0
+        sta c64_g3d_edges__args+6
+        lda c64_g3d_draw__args+4
+        sta c64_g3d_edges__args+7
+        jmp c64_g3d_edges

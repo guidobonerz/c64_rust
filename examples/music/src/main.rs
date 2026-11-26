@@ -7,12 +7,18 @@ use c64::hw::{self, Color};
 use c64::sound::{self, Note, Voice};
 use c64::{kernal, text};
 
-/// A note: pitch (`None` = rest) and length in jiffies.
+/// A note: its number (for the border colour), the SID's frequency value
+/// and the length in jiffies. The frequency is looked up when the program
+/// is compiled, so the program carries no table of all notes.
 #[derive(Clone, Copy)]
-struct Tone(Option<Note>, u8);
+struct Tone {
+    note: u8,
+    freq: u16,
+    len: u8,
+}
 
 const fn n(note: Note, len: u8) -> Tone {
-    Tone(Some(note), len)
+    Tone { note: note.0, freq: note.freq(), len }
 }
 
 static MELODY: [Tone; 26] = [
@@ -26,7 +32,7 @@ static MELODY: [Tone; 26] = [
     n(Note::C4, 60),
 ];
 
-static BASS: [Note; 4] = [Note::C3, Note::G3, Note::A3, Note::F3];
+static BASS: [u16; 4] = [Note::C3.freq(), Note::G3.freq(), Note::A3.freq(), Note::F3.freq()];
 
 fn wait(jiffies: u8) {
     let start = kernal::jiffies();
@@ -46,13 +52,11 @@ fn main() {
     bass.adsr(0, 4, 10, 6);
     for (i, t) in MELODY.iter().enumerate() {
         if i % 4 == 0 {
-            bass.note_on(BASS[(i / 4) % 4], sound::TRIANGLE);
+            bass.tone(BASS[(i / 4) % 4], sound::TRIANGLE);
         }
-        if let Some(note) = t.0 {
-            lead.note_on(note, sound::PULSE);
-            hw::vic().border.write(Color::from_u8(note.0));
-        }
-        wait(t.1 - 3);
+        lead.tone(t.freq, sound::PULSE);
+        hw::vic().border.write(Color::from_u8(t.note));
+        wait(t.len - 3);
         lead.note_off();
         wait(3);
     }

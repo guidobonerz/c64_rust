@@ -193,7 +193,8 @@ Every program depends on it: `c64 = { path = ".../lib/c64" }`.
 | `c64::fmt` | formatting | `print!`/`println!`/`write!` without `core::fmt`: decimal, `Hex`, `Bin`, a fixed `Buf` |
 | `c64::ui` | boxes on the text screen | `frame`, `panel`, `titled_frame`, `titled_panel`; square or round corners |
 | `c64::sprite` | hardware sprites | images, position (9-bit X), colours, multicolour, expansion, collisions |
-| `c64::gfx` | bitmap graphics | hires and multicolour: `plot`, `line`, `fline`, `hline`, `vline`, `rect`, `fill_rect`, `circle`, cell colours, Koala pictures |
+| `c64::g3d` | bodies in three dimensions | corners, faces and edges on the hires bitmap: rotation matrix, hidden edges, parallel projection or a vanishing point; a cube and a pyramid |
+| `c64::gfx` | bitmap graphics | hires and multicolour: `plot`, `line`, `fline`, `hline`, `vline`, `rect`, `fill_rect`, `circle`, cell colours, Koala pictures, double buffering |
 | `c64::sound` | the SID | voices, ADSR, notes, filter; playing PSID tunes (`c64::sid!`) |
 | `c64::irq` | raster interrupts | Rust functions as handlers, up to eight per frame |
 | `c64::input` | joystick and keyboard | joysticks, keyboard buffer, key matrix |
@@ -217,6 +218,7 @@ Every program depends on it: `c64 = { path = ".../lib/c64" }`.
 | Cargo feature | Effect |
 |---|---|
 | `gfx-unclipped` | `c64::gfx` draws without checking the coordinates against the screen: smaller and faster, but every pixel must be on the screen |
+| `g3d-fast` | `c64::g3d` draws flat lines with a piece of code for each bit of a byte: faster, about 200 bytes more |
 
 ### Extension crates
 
@@ -249,11 +251,13 @@ c64-uci = { path = "../c64_rust/lib/c64-uci" }
 | `hello` | printing, a loop, the border colour | `hw`, `fmt` | 362 |
 | `joystick` | reading the joystick | `input` | 761 |
 | `ui` | boxes on the text screen | `ui`, `text` | 1050 |
-| `music` | notes and a SID tune | `sound` | 1000 |
+| `music` | notes and a SID tune | `sound` | 844 |
 | `sprites` | a moving sprite | `sprite` | 1043 |
 | `rasterbars` | a stable raster interrupt in assembly, colours from Rust | `rat_source!`, `mem` | 1204 |
 | `scroller` | a horizontal soft scroll with two raster interrupts | `irq`, `mem` | 1247 |
 | `drawing` | lines, a rectangle and circles on the hires bitmap | `gfx` | 1963 |
+| `cube3d` | a turning cube without its hidden edges, with double buffering | `g3d`, `gfx` | 3694 |
+| `perspective` | a turning bar with a vanishing point; fire shows it without | `g3d`, `gfx`, `input` | 4020 |
 | `diagonal` | the whole screen scrolling diagonally, custom character set | `hw`, `mem` | 1265 |
 | `mandelbrot` | the Mandelbrot set in fixed point: PETSCII, or the multicolour bitmap with `--features multicolor` | `text`, `gfx` | 819 |
 | `julia` | a Julia set, in the same two ways | `text`, `gfx` | 827 |
@@ -295,8 +299,10 @@ All ten pass in both builds (20 runs):
 | `lib2` | function pointers, `at`/`zp` statics, raster interrupts, SID tunes, sprites, sound, PETSCII literals | ok | ok |
 | `gfx` | `c64::gfx`, hires and multicolour | ok | ok |
 | `gfxu` | `c64::gfx` with `gfx-unclipped` | ok | ok |
+| `g3d` | `c64::g3d`: matrix, corners, faces, edges | ok | ok |
+| `g3df` | `c64::g3d` with `g3d-fast` | ok | ok |
 | `ui` | `c64::ui` | ok | ok |
-| `sd2iec` | `c64-sd2iec` against mimic's SD2IEC | ok | ok |
+| `sd2iec` | `c64-sd2iec` and `c64::dos` against mimic's SD2IEC (directory, sequential files) | ok | ok |
 | `uci` | `c64-uci` against mimic's command interface (no network) | ok | ok |
 | `wic64` | `c64-wic64` against mimic's WiC64 (no network) | ok | ok |
 | `uaudio` | `c64-uaudio`, as far as possible without the hardware | ok | ok |
@@ -587,7 +593,7 @@ of the table above (`pwsh bench/examples.ps1`).
 | hello | **362** | 553 | 538 | 557 | 35% smaller |
 | joystick | **761** | 732 | 698 | 709 | 4% larger |
 | ui | **1050** | 954 | 948 | 1488 | 10% larger |
-| music | **1000** | 559 | 617 | 617 | 79% larger |
+| music | **844** | 559 | 617 | 617 | 51% larger |
 | sprites | **1043** | 1132 | 1123 | 1088 | 8% smaller |
 | rasterbars | **1204** | 1096 | 1136 | 1151 | 10% larger |
 | scroller | **1247** | 1355 | 1498 | 1498 | 8% smaller |
@@ -598,17 +604,19 @@ of the table above (`pwsh bench/examples.ps1`).
 | pi | **1380** | 1250 | 1239 | 1239 | 10% larger |
 | dir | **1213** | 1320 | 1251 | 2673 | 8% smaller |
 | sd2iec | **2225** | 1886 | 1867 | 3782 | 18% larger |
-| **total** | **16 379** | 17 139 | 17 311 | 21 654 | 4% smaller |
+| **total** | **16 223** | 17 139 | 17 311 | 21 654 | 5% smaller |
 
 * **rust64 is smaller in eight of the fifteen and larger in seven; over
-  all of them it is 4% smaller than `-Os`, without `sd2iec` 7% smaller.**
+  all of them it is 5% smaller than `-Os`, without `sd2iec` 8% smaller.**
 * **The small programs go to rust64 because of the start code:** oscar64's
   smallest program is 142 bytes. Its text goes through `puts` and `utoa`
   here; with `printf` hello is 4211 bytes.
-* **music is 79% larger** because `c64::sound` brings its table of 96
-  notes (192 bytes) and routines for any voice with copies of the control
-  registers, where the C program has the six frequencies it plays as
-  constants and stores to the registers directly.
+* **music is 51% larger.** Both programs have the frequencies of their
+  notes as constants (`Note::C4.freq()` is computed when the program is
+  compiled, like `NOTE_C(4)` in C), so neither carries a table of all
+  notes. What is left is `c64::sound`: routines for any voice, with
+  copies of the control registers, where the C program stores to the
+  registers of the two voices directly.
 * **joystick, ui and sprites** write text to the screen, as screen codes
   that are in the file on both sides (`c64::s!("...")`, `s"..."`). sprites
   is 8% smaller. joystick also prints through the KERNAL, which takes the
@@ -698,7 +706,7 @@ back out of the emulator's screenshot, `bench/drawing/screen.js`).
 | 1. Core backend: integers, control flow, calls, static frames | done |
 | 2. Language breadth: enums, structs, slices, closures, iterators, panics | done |
 | 3. Library I: `hw`, `mem`, `sys`, `kernal`, `text`, `fmt`, `input`, assembly, `at`/`zp`, PETSCII | done |
-| 4. Library II: `sprite`, `gfx`, `sound`, `irq`, `dos`, function pointers, D64 | done |
+| 4. Library II: `sprite`, `gfx` (with double buffering), `g3d`, `sound`, `irq`, `dos`, function pointers, D64 | done |
 | 5. Optimization: frame overlay, zero-page allocation, block layout, data-flow pass (values, ranges, liveness, copies, index registers, loops, arguments in registers), inlining of small functions, pruning | done |
 | 6. Tooling: `cargo c64 new/test`, Rust spans for assembler errors, memory map, debugger labels | open |
 | 7. Extensions: recursion on a software stack, `alloc`, `dyn Trait`, `f32`, cartridges | open |

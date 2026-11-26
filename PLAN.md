@@ -184,6 +184,7 @@ The same scope as go64, with Rust idioms: newtypes, enums, RAII, no
 | `c64::fmt` | `uWrite`/`uDisplay`, number output dec/hex/bin with no division in the loop (BCD) |
 | `c64::sprite` | `Sprite(u8)` with `load`, `set_image`, `show`, `hide`, `move_to` (9-bit X), `x`, `y`, `set_color`, `set_multicolor`, `expand`, `behind`; `shared_colors`, `collisions`, `bg_collisions`, `hit` |
 | `c64::gfx` | `Hires`/`Multicolor` modes as types (`gfx::hires() -> Bitmap<Hires>`), `clear`, `set_colors`, `plot`, `point`, `line` (Bresenham), `rect`, `fill_rect`, `circle`, `show_koala`, `Pen` |
+| `c64::g3d` | bodies of corners, faces and edges on the hires bitmap: `Matrix` (rotation), `Shape`, `View` (`project`, `project_perspective`, `draw` without the hidden edges); `Bitmap::double_buffer` in `c64::gfx` |
 | `c64::sound` | `Voice(u8)`: `freq`, `pulse_width`, `adsr`, `play`, `note_on/off`; `filter`, `volume`, `reset`; `Note` enum + PAL table; `Tune::start/stop` (PSID) |
 | `c64::irq` | `irq::add(line, handler: fn())` (up to 8, chained), `on_frame`, `stop`, `critical_section(|| …)` |
 | `c64::input` | `joy(Port) -> Joy` (bitflags: up/down/left/right/fire), `key`, `wait_key`, `pressed(row, col)` |

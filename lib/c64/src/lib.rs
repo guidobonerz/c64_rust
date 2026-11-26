@@ -26,6 +26,7 @@
 
 pub mod dos;
 pub mod fmt;
+pub mod g3d;
 pub mod gfx;
 pub mod hw;
 pub mod input;

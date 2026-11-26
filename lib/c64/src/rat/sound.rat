@@ -88,6 +88,20 @@ c64_sound_note_on:
         sta $d404,x
         rts
 
+; c64_sound_tone(voice: u8, wave: u8, freq: u16): a frequency, then the
+; waveform with the gate on
+c64_sound_tone:
+        jsr c64_sound_voice
+        lda c64_sound_tone__args+2
+        sta $d400,x
+        lda c64_sound_tone__args+3
+        sta $d401,x
+        lda c64_sound_tone__args+1
+        ora #1
+        sta c64_sound_shadow,y
+        sta $d404,x
+        rts
+
 ; c64_sound_reset(): silence
 c64_sound_reset:
         lda #0

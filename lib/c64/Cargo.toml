@@ -12,6 +12,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("c64"))'
 # c64::gfx draws without checking the coordinates against the screen:
 # smaller and faster, but every pixel must be on the screen.
 gfx-unclipped = []
+# c64::g3d draws flat lines with a piece of code for each bit of a byte:
+# about a quarter faster for them, 180 bytes more.
+g3d-fast = []
 
 [dependencies]
 c64-macros = { path = "../c64-macros" }

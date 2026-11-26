@@ -71,15 +71,22 @@ impl Note {
     pub const B4: Note = Note(59);
     pub const C5: Note = Note(60);
 
-    /// The SID frequency (PAL).
-    pub fn freq(self) -> u16 {
-        NOTE_FREQ[self.0.min(95) as usize]
+    /// The SID frequency (PAL). In a constant or a static it is computed
+    /// when the program is compiled: a tune that stores frequencies and
+    /// plays them with [`Voice::tone`] needs no table of notes at run
+    /// time.
+    pub const fn freq(self) -> u16 {
+        FREQ[if self.0 > 95 { 95 } else { self.0 as usize }]
     }
 }
 
-/// Frequencies (PAL register values) of the notes C0..B7.
+/// Frequencies (PAL register values) of the notes C0..B7, for the assembly
+/// routines: only in programs that look notes up at run time
+/// ([`Voice::note_on`]).
 #[unsafe(export_name = "c64_sound_freq")]
-static NOTE_FREQ: [u16; 96] = [
+static NOTE_FREQ: [u16; 96] = FREQ;
+
+const FREQ: [u16; 96] = [
     278, 295, 313, 331, 351, 372, 394, 417, 442, 468, 496, 526, 557, 590, 625, 662, 702, 743, 788,
     834, 884, 937, 992, 1051, 1114, 1180, 1250, 1325, 1403, 1487, 1575, 1669, 1768, 1873, 1985,
     2103, 2228, 2360, 2500, 2649, 2807, 2973, 3150, 3338, 3536, 3746, 3969, 4205, 4455, 4720,
@@ -105,6 +112,7 @@ unsafe extern "C" {
     fn c64_sound_reg16(voice: u8, reg: u8, value: u16);
     fn c64_sound_adsr(voice: u8, attack: u8, decay: u8, sustain: u8, release: u8);
     fn c64_sound_note_on(voice: u8, note: u8, wave: u8);
+    fn c64_sound_tone(voice: u8, wave: u8, freq: u16);
     fn c64_sound_reset();
 }
 
@@ -137,6 +145,12 @@ impl Voice {
     /// Plays a note with a waveform.
     pub fn note_on(self, note: Note, wave: u8) {
         unsafe { c64_sound_note_on(self.0, note.0, wave) }
+    }
+
+    /// Plays a frequency with a waveform: [`Voice::note_on`] for a
+    /// frequency that is known already (`Note::C4.freq()` in a constant).
+    pub fn tone(self, freq: u16, wave: u8) {
+        unsafe { c64_sound_tone(self.0, wave, freq) }
     }
 
     /// Starts the release.
@@ -190,7 +204,13 @@ impl Voice {
 
     /// Plays a note with a waveform.
     pub fn note_on(self, note: Note, wave: u8) {
-        self.freq(note.freq());
+        self.tone(note.freq(), wave);
+    }
+
+    /// Plays a frequency with a waveform: [`Voice::note_on`] for a
+    /// frequency that is known already (`Note::C4.freq()` in a constant).
+    pub fn tone(self, freq: u16, wave: u8) {
+        self.freq(freq);
         self.play(wave);
     }
 

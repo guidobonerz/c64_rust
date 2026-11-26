@@ -1,7 +1,8 @@
 ; c64::gfx: the tables that the routines of both modes use (gfx_hires.rat,
 ; gfx_mc.rat).
 
-; The address of each cell row of the bitmap.
+; The address of each cell row of the bitmap that is drawn into: the one
+; at $6000, or with double buffering (below) the one at $A000 too.
 c64_gft_rowlo:
         .fill 25, <($6000 + i * 320)
 c64_gft_rowhi:
@@ -11,3 +12,111 @@ c64_gft_left:
         .byte $ff, $7f, $3f, $1f, $0f, $07, $03, $01
 c64_gft_right:
         .byte $80, $c0, $e0, $f0, $f8, $fc, $fe, $ff
+
+; Double buffering (gfx.rs: Double): two bitmaps, one on the screen and
+; one that is drawn into.
+;
+;   first:  bitmap $6000, colour matrix $4000 (VIC bank 1)
+;   second: bitmap $A000, colour matrix $8000 (VIC bank 2)
+;
+; Both have the bitmap in the upper half of their bank, so $D018 stays and
+; one store to $DD00 changes the picture. (In bank 2 the VIC sees the
+; character ROM at $9000, so the bitmap cannot be at $8000.) $A000 is
+; under the BASIC ROM, which is switched off while there are two bitmaps:
+; the drawing routines read what they change. The drawing routines take
+; every address from c64_gft_rowhi, so changing that table changes where
+; they draw.
+
+; c64_gft_double(): starts double buffering: the second bitmap gets the
+; colours of the first one, is cleared and is the one that is drawn into.
+c64_gft_double:
+        lda #$36                ; RAM at $A000
+        sta $01
+        lda #0
+        sta zp_p0
+        sta zp_p1
+        lda #$40
+        sta zp_p0+1
+        asl
+        sta zp_p1+1
+        lda #<1000
+        sta rt_n
+        lda #>1000
+        sta rt_n+1
+        jsr rt_memcpy
+        jsr c64_gft_swap
+; c64_gft_clear(): clears the bitmap that is drawn into.
+c64_gft_clear:
+        lda #$60
+        ldx #<8000
+        ldy #>8000
+; Fills X/Y bytes of the bitmap that is drawn into (A = $60) or of its
+; colour matrix (A = $40) with 0, or c64_gft_fill: with the value in
+; rt_n+2.
+        pha
+        lda #0
+        sta rt_n+2
+        pla
+c64_gft_fill:
+        stx rt_n
+        sty rt_n+1
+        clc
+        adc c64_gft_back
+        sta zp_p1+1
+        lda #0
+        sta zp_p1
+        lda rt_n+2
+        jmp rt_memset
+
+; c64_gft_colors(value: u8): fills the colour matrix of the bitmap that is
+; drawn into.
+c64_gft_colors:
+        sta rt_n+2
+        lda #$40
+        ldx #<1000
+        ldy #>1000
+        bne c64_gft_fill
+
+; c64_gft_single(): ends double buffering: the first bitmap is shown and
+; drawn into, and the BASIC ROM is back.
+c64_gft_single:
+        lda c64_gft_back
+        beq @first
+        jsr c64_gft_swap
+@first: lda #$37
+        sta $01
+        ldy #2
+; Shows the bitmap of the VIC bank with the bits Y of $DD00.
+c64_gft_show:
+        tya
+        eor $dd00
+        and #$03
+        eor $dd00
+        sta $dd00
+        rts
+
+; c64_gft_flip(): shows the bitmap that was drawn into; the other one is
+; drawn into from now on.
+c64_gft_flip:
+        ldy #2
+        lda c64_gft_back
+        beq @show
+        dey
+@show:  jsr c64_gft_show
+; The other bitmap is the one that is drawn into.
+c64_gft_swap:
+        lda c64_gft_back
+        eor #$40
+        sta c64_gft_back
+        ldx #24
+@row:   lda c64_gft_rowhi,x
+        eor #$c0                ; $60-$7f and $a0-$bf
+        sta c64_gft_rowhi,x
+        dex
+        bpl @row
+        rts
+
+; The bitmap that is drawn into: 0 = the first, $40 = the second (what is
+; added to the high bytes of $6000 and $4000).
+c64_gft_back:
+        .byte 0
